@@ -1,0 +1,197 @@
+# ---------------------------------------------------------------------
+# Copyright (c) 2026 Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause
+# ---------------------------------------------------------------------
+"""Opt-in TurboQuant KV-cache codec configuration.
+
+A config is immutable and hashable, and ``config_hash()`` covers every field
+plus the digests of the frozen codebooks and FWHT signs it selects, so it can
+key model instance caches and artifact directories.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+from qai_hub_models.models.templates.llm.turboquant.constants import (
+    CODEBOOK_HEX,
+    CODEBOOK_SHA256,
+    FWHT_SIGNS,
+    FWHT_SIGNS_SHA256,
+    REFERENCE_COMMIT,
+)
+
+FORMAT_NAME = "qaihm-turboquant-kv"
+FORMAT_VERSION = 1
+
+# Reference KVCacheCompressor seed policy (K = seed, V = seed + 500).
+KEY_SEED = 42
+VALUE_SEED = 542
+
+
+class CodecKind(Enum):
+    # The repo's existing KV path (int8 affine on device). The codec leaves it untouched.
+    BASELINE = "baseline"
+    POLAR = "polar"
+
+
+class Rotation(Enum):
+    FWHT = "fwht"
+    # Haar QR rotation used by the reference PolarQuant class; oracle only.
+    DENSE_QR = "dense_qr"
+
+
+@dataclass(frozen=True)
+class KVCodecSpec:
+    """How one of K or V is stored."""
+
+    kind: CodecKind
+    bits: int = 0
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.kind == CodecKind.BASELINE:
+            if self.bits != 0 or self.seed != 0:
+                raise ValueError("BASELINE codec takes no bits or seed.")
+            return
+        if self.bits not in (3, 4):
+            raise ValueError(
+                f"PolarQuant bit width must be 3 or 4, got {self.bits}. "
+                "Other widths have no frozen codebook."
+            )
+
+    @property
+    def is_polar(self) -> bool:
+        return self.kind == CodecKind.POLAR
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
+
+
+BASELINE = KVCodecSpec(CodecKind.BASELINE)
+
+
+@dataclass(frozen=True)
+class TurboQuantConfig:
+    """QJL-off PolarQuant KV codec settings. See ``tutorials/llm/turboquant_design.md``."""
+
+    profile: str
+    key: KVCodecSpec
+    value: KVCodecSpec
+    block_size: int = 128
+    rotation: Rotation = Rotation.FWHT
+    norm_correction: bool = True
+    norm_dtype: str = "float16"
+    bit_order: str = "msb_first"
+    format_version: int = FORMAT_VERSION
+    reference_commit: str = field(default=REFERENCE_COMMIT)
+
+    def __post_init__(self) -> None:
+        if self.norm_dtype not in ("float16", "float32"):
+            raise ValueError(f"Unsupported norm dtype {self.norm_dtype}.")
+        if self.bit_order != "msb_first":
+            raise ValueError(f"Unsupported bit order {self.bit_order}.")
+        if self.format_version != FORMAT_VERSION:
+            raise ValueError(
+                f"Config format version {self.format_version} does not match "
+                f"this implementation ({FORMAT_VERSION})."
+            )
+        for spec in self.codecs:
+            if not spec.is_polar:
+                continue
+            if (spec.bits, self.block_size) not in CODEBOOK_HEX:
+                raise ValueError(
+                    f"No frozen {spec.bits}-bit codebook for block size "
+                    f"{self.block_size}; regenerate constants.py first."
+                )
+            if (spec.seed, self.block_size) not in FWHT_SIGNS:
+                raise ValueError(
+                    f"No frozen FWHT signs for seed {spec.seed}, block size "
+                    f"{self.block_size}; regenerate constants.py first."
+                )
+
+    @property
+    def codecs(self) -> tuple[KVCodecSpec, KVCodecSpec]:
+        return (self.key, self.value)
+
+    @property
+    def enabled(self) -> bool:
+        return self.key.is_polar or self.value.is_polar
+
+    def validate_for_model(
+        self, num_layers: int, num_kv_heads: int, head_dim: int
+    ) -> None:
+        """Reject model shapes this format version cannot store without truncation."""
+        if num_layers <= 0 or num_kv_heads <= 0:
+            raise ValueError("num_layers and num_kv_heads must be positive.")
+        if not self.enabled:
+            return
+        if head_dim & (head_dim - 1) or head_dim <= 0:
+            raise ValueError(
+                f"head_dim={head_dim} is not a power of two; FWHT padding is not "
+                "supported in format version 1."
+            )
+        if head_dim != self.block_size:
+            raise ValueError(
+                f"head_dim={head_dim} must equal block_size={self.block_size} "
+                "in format version 1 (one norm per head vector)."
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {
+            "format": FORMAT_NAME,
+            "format_version": self.format_version,
+            "profile": self.profile,
+            "key": self.key.to_dict(),
+            "value": self.value.to_dict(),
+            "block_size": self.block_size,
+            "rotation": self.rotation.value,
+            "norm_correction": self.norm_correction,
+            "norm_dtype": self.norm_dtype,
+            "bit_order": self.bit_order,
+            "qjl": False,
+            "reference_commit": self.reference_commit,
+        }
+        for name, spec in (("key", self.key), ("value", self.value)):
+            if spec.is_polar:
+                data[name]["codebook_sha256"] = CODEBOOK_SHA256[
+                    (spec.bits, self.block_size)
+                ]
+                data[name]["signs_sha256"] = FWHT_SIGNS_SHA256[
+                    (spec.seed, self.block_size)
+                ]
+        return data
+
+    def config_hash(self) -> str:
+        canonical = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _polar(bits: int, seed: int) -> KVCodecSpec:
+    return KVCodecSpec(CodecKind.POLAR, bits=bits, seed=seed)
+
+
+PROFILES: dict[str, TurboQuantConfig] = {
+    "baseline_int8": TurboQuantConfig("baseline_int8", BASELINE, BASELINE),
+    "k8_v4": TurboQuantConfig("k8_v4", BASELINE, _polar(4, VALUE_SEED)),
+    "k4_v4": TurboQuantConfig("k4_v4", _polar(4, KEY_SEED), _polar(4, VALUE_SEED)),
+    "k8_v3": TurboQuantConfig("k8_v3", BASELINE, _polar(3, VALUE_SEED)),
+    "k4_v3": TurboQuantConfig("k4_v3", _polar(4, KEY_SEED), _polar(3, VALUE_SEED)),
+}
+
+
+def get_profile(name: str) -> TurboQuantConfig:
+    if name == "qjl_reference":
+        raise NotImplementedError(
+            "qjl_reference is a research option outside the first milestone; "
+            "the default path is QJL-off PolarQuant."
+        )
+    if name not in PROFILES:
+        raise ValueError(
+            f"Unknown TurboQuant profile '{name}'. Choose from {sorted(PROFILES)}."
+        )
+    return PROFILES[name]
