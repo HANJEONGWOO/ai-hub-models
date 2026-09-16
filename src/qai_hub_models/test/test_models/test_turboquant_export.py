@@ -11,7 +11,10 @@ import onnx
 import onnxruntime as ort
 import pytest
 
-from qai_hub_models.models.templates.llm.turboquant.config import get_profile
+from qai_hub_models.models.templates.llm.turboquant.config import (
+    BASELINE,
+    get_profile,
+)
 from qai_hub_models.models.templates.llm.turboquant.export import (
     build_decode_model,
     build_encode_model,
@@ -160,4 +163,4 @@ def test_unsupported_bit_widths_raise() -> None:
     with pytest.raises(NotImplementedError, match="4-bit"):
         build_encode_model(get_profile("k4_v3"), get_profile("k4_v3").value, HEADS, 1)
     with pytest.raises(NotImplementedError, match="4-bit"):
-        build_decode_model(CONFIG, get_profile("k8_v4").key, HEADS, 1)
+        build_decode_model(CONFIG, BASELINE, HEADS, 1)

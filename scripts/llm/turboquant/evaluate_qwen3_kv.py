@@ -196,9 +196,7 @@ def kv_statistics(cache: Cache, config: TurboQuantConfig) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
-    parser.add_argument(
-        "--profiles", nargs="+", default=["k8_v4", "k4_v4", "k8_v3", "k4_v3"]
-    )
+    parser.add_argument("--profiles", nargs="+", default=["k4_v4", "k8_v3", "k4_v3"])
     parser.add_argument("--num-windows", type=int, default=4)
     parser.add_argument("--window", type=int, default=1024)
     parser.add_argument("--chunk", type=int, default=128)

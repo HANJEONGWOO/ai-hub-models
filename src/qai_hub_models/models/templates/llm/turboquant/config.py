@@ -36,6 +36,9 @@ VALUE_SEED = 542
 class CodecKind(Enum):
     # The repo's existing KV path (int8 affine on device). The codec leaves it untouched.
     BASELINE = "baseline"
+    # Cache and graph I/O keep the 16-bit integer grid of the K/V producers
+    # (no conversion, no codec). Uncompressed comparison group.
+    INT16 = "int16"
     POLAR = "polar"
 
 
@@ -47,18 +50,20 @@ class Rotation(Enum):
 
 @dataclass(frozen=True)
 class KVCodecSpec:
-    """How one of K or V is stored."""
+    """How one of K or V is stored.
+
+    INT16 and POLAR read the value before the KV-specific int8 encodings of
+    an exported w4a16 part (see ``graph_surgery``); BASELINE keeps that path.
+    """
 
     kind: CodecKind
     bits: int = 0
     seed: int = 0
 
     def __post_init__(self) -> None:
-        if self.kind == CodecKind.BASELINE:
-            if self.bits != 0 or self.seed != 0:
-                raise ValueError("BASELINE codec takes no bits or seed.")
-            return
-        if self.bits not in (3, 4):
+        if self.kind != CodecKind.POLAR and (self.bits != 0 or self.seed != 0):
+            raise ValueError(f"{self.kind.name} codec takes no bits or seed.")
+        if self.kind == CodecKind.POLAR and self.bits not in (3, 4):
             raise ValueError(
                 f"PolarQuant bit width must be 3 or 4, got {self.bits}. "
                 "Other widths have no frozen codebook."
@@ -68,11 +73,20 @@ class KVCodecSpec:
     def is_polar(self) -> bool:
         return self.kind == CodecKind.POLAR
 
+    @property
+    def is_int16(self) -> bool:
+        return self.kind == CodecKind.INT16
+
+    @property
+    def modifies_graph(self) -> bool:
+        return self.kind != CodecKind.BASELINE
+
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
 
 
 BASELINE = KVCodecSpec(CodecKind.BASELINE)
+INT16 = KVCodecSpec(CodecKind.INT16)
 
 
 @dataclass(frozen=True)
@@ -120,7 +134,13 @@ class TurboQuantConfig:
 
     @property
     def enabled(self) -> bool:
+        """True when at least one KV tensor is stored with a PolarQuant codec."""
         return self.key.is_polar or self.value.is_polar
+
+    @property
+    def modifies_graph(self) -> bool:
+        """True when the exported part needs surgery (codec or float16 KV)."""
+        return self.key.modifies_graph or self.value.modifies_graph
 
     def validate_for_model(
         self, num_layers: int, num_kv_heads: int, head_dim: int
@@ -175,9 +195,11 @@ def _polar(bits: int, seed: int) -> KVCodecSpec:
     return KVCodecSpec(CodecKind.POLAR, bits=bits, seed=seed)
 
 
+# "k8" names the repo's affine int8 K path, not an 8-bit TurboQuant codec.
+# 3-bit profiles have a host oracle only (no HTP graph).
 PROFILES: dict[str, TurboQuantConfig] = {
     "baseline_int8": TurboQuantConfig("baseline_int8", BASELINE, BASELINE),
-    "k8_v4": TurboQuantConfig("k8_v4", BASELINE, _polar(4, VALUE_SEED)),
+    "baseline_int16_kv": TurboQuantConfig("baseline_int16_kv", INT16, INT16),
     "k4_v4": TurboQuantConfig("k4_v4", _polar(4, KEY_SEED), _polar(4, VALUE_SEED)),
     "k8_v3": TurboQuantConfig("k8_v3", BASELINE, _polar(3, VALUE_SEED)),
     "k4_v3": TurboQuantConfig("k4_v3", _polar(4, KEY_SEED), _polar(3, VALUE_SEED)),

@@ -2,19 +2,20 @@
 
 작성일: 2026-09-15 · 작업 브랜치: `turboquant-kv-cache` (기준 commit `2a895603e`)
 
-작업 명세: [turboquant_npu_implementation_spec.md](turboquant_npu_implementation_spec.md). 이 문서는 명세 P0의 `design.md` 산출물이며, P1(참조 구현), P2(최소 HTP 실행 검증), P3(Qwen3-1.7B 실기기 통합, context 1024)의 실제 결과를 포함한다. P4의 체계적 벤치마크(여러 context, 응답 품질 평가, HTP 측 메모리 계측)와 P5(다른 모델 크기)는 수행하지 않았다.
+작업 명세: [turboquant_npu_implementation_spec.md](turboquant_npu_implementation_spec.md). 이 문서는 명세 P0의 `design.md` 산출물이며, P1(참조 구현), P2(최소 HTP 실행 검증), P3(Qwen3-1.7B 실기기 통합, context 1024)의 실제 결과를 포함한다. codec 입력 경계(KV 전용 int8 이전 값)의 정의·검증과 FP16 KV 비교군은 §11에 있다. P4의 체계적 벤치마크(여러 context, 응답 품질 평가, HTP 측 메모리 계측)와 P5(다른 모델 크기)는 수행하지 않았다.
 
 ## 1. 완료 상태 (명세 10.2 기준)
 
 | 상태 | 판정 | 근거 |
 |---|---|---|
-| 참조 구현 완료 | **완료** | 고정 commit 원본 대비 index 불일치 0, FWHT 복원 오차 0.0, packed byte 동일 (§4.4). 단위 테스트 138개 통과 |
+| 참조 구현 완료 | **완료** | 고정 commit 원본 대비 index 불일치 0, FWHT 복원 오차 0.0, packed byte 동일 (§4.4). 단위 테스트 144개 통과 |
 | 최소 codec HTP 실행 (P2) | **완료** | S26(SM8850) HTP에서 encode/decode 8개 그래프가 fp16 허용오차로 oracle과 일치, 모든 op이 accelerator 프로파일에 기록됨 (§6) |
-| NPU 기능 검증 완료 (1.7B 전체 생성 루프) | **완료, 단 메모리 경로 조건 미충족** | `k8_v4`·`k4_v4` 모두 S26에서 prefill + 128토큰 decode, EOS 처리, 세션 reset, context 경계(1024) 통과. codec encode/decode op이 28개 layer 전부 HTP detailed profile에 기록됨 (§8). KV는 호출 사이에 host에서 packed로 보관되지만, 그래프 안에서 과거 KV 전체를 매 스텝 복원하므로 명세 5.3의 "최종 메모리 경로"는 아님 |
-| 압축 효과 입증 | 부분 | host KV 저장소(56.0→28.9 MiB)와 프로세스 RSS(224.7→144.2 MiB) 감소를 측정. HTP 측 intermediate·scratch·shared memory는 측정하지 않음 |
+| NPU 기능 검증 완료 (1.7B 전체 생성 루프) | **완료, 단 메모리 경로 조건 미충족** | `k4_v4`가 S26에서 prefill + 128토큰 decode, EOS 처리, 세션 reset, context 경계(1024) 통과. codec encode/decode op이 28개 layer 전부 HTP detailed profile에 기록됨 (§11.5). KV는 호출 사이에 host에서 packed로 보관되지만, 그래프 안에서 과거 KV 전체를 매 스텝 복원하므로 명세 5.3의 "최종 메모리 경로"는 아님 |
+| 압축 효과 입증 | 부분 | host KV 저장소(56.0→28.9 MiB)와 프로세스 RSS(221.8→138.6 MiB, 1회 측정) 감소를 측정. HTP 측 intermediate·scratch·shared memory는 측정하지 않음 |
 | 품질 평가 완료 | 부분 | 실기기 WikiText teacher-forced PPL(4 window) 측정. 응답 품질 평가(Grace 등)와 retrieval 시험은 수행하지 않음 |
-| 성능 개선 입증 | **미달** | 동일 runner 반복 측정에서 decode가 baseline 대비 19–27배 느림 (§8.4) |
+| 성능 개선 입증 | **미달** | 동일 runner 측정에서 decode가 baseline 대비 약 29배 느림 (§11.5) |
 | 타 모델 검증 완료 | 미착수 | 0.6B/4B/8B는 config·shape 테스트만 통과 |
+| codec 입력 경계 검증 | **완료** | codec이 KV 전용 int8 양자화 이전의 16-bit 값을 읽음을 ONNX encodings·dlc-info·onnxruntime에서 확인(§11.4). 같은 16-bit 값을 변환 없이 그대로 저장하는 비압축 비교군 `baseline_int16_kv`를 별도 artifact로 생성·실행 |
 
 ## 2. 환경 manifest
 
@@ -33,7 +34,7 @@
 
 | 위치 | 내용 |
 |---|---|
-| `src/qai_hub_models/models/templates/llm/turboquant/config.py` | 프로파일(`baseline_int8`, `k8_v4`, `k4_v4`, `k8_v3`, `k4_v3`), format version, `config_hash()`, 모델 shape 검사 |
+| `src/qai_hub_models/models/templates/llm/turboquant/config.py` | 프로파일(`baseline_int8`, `baseline_int16_kv`, `k4_v4`, `k8_v3`, `k4_v3`), format version, `config_hash()`, 모델 shape 검사 |
 | `.../turboquant/constants.py` | 생성된 고정 상수: codebook(float64 hex), FWHT sign, sha256 |
 | `.../turboquant/reference.py` | float64 CPU oracle: `FWHTRotation`, `DenseQRRotation`, `PolarQuantReference` |
 | `.../turboquant/packing.py` | MSB-first bit packing, norm 저장 dtype 정책 |
@@ -45,12 +46,13 @@
 | `scripts/llm/turboquant/verify_reference.py` | oracle ↔ 고정 commit 원본 대조, golden fixture 생성 |
 | `scripts/llm/turboquant/evaluate_qwen3_kv.py` | PC 참조 평가(PPL/KL/KV 통계)와 실제 KV snapshot 저장 |
 | `scripts/llm/turboquant/htp_codec_validation.py` | P2: 변환 → context binary → adb 실행 → 비교·프로파일 증거 |
-| `.../turboquant/graph_surgery.py` | P3: split part ONNX의 `past_*_in`/`past_*_out`에 codec 서브그래프 삽입, encodings 재사용 |
+| `.../turboquant/graph_surgery.py` | P3: split part ONNX의 `past_*_in`/`past_*_out`에 codec 서브그래프 삽입, encodings 재사용. cache 분기 재구성(tap 재격자화, guard, 복제, §11.3)과 비압축 int16 KV 프로파일, encoding 편집 리포트 |
 | `src/qai_hub_models/test/test_models/test_turboquant_graph_surgery.py` | 합성 delta-KV part로 surgery 배선을 onnxruntime에서 검증 |
 | `scripts/llm/turboquant/split_checkpoint.py` | 배포 AIMET checkpoint를 repo split 코드로 part별 번들로 로컬 분할 |
 | `scripts/llm/turboquant/convert_parts.py` | part별 surgery(프로파일) → `qairt-converter --quantization_overrides` → `qairt-quantizer --enable_float_fallback` → prompt/token 그래프 weight-shared context binary |
 | `scripts/llm/turboquant/qnn_runner/` | 공개 QNN C API로 작성한 Android runner(`qnn-llm-runner`): 이름 기반 I/O 역할, pyref KV 배치, generate/score, 세션 반복, detailed profile, JSON 리포트 |
 | `scripts/llm/turboquant/run_device_llm.py` | RoPE 표·토큰 asset 생성, sha256 기반 push, 장치 실행과 리포트 수집 |
+| `scripts/llm/turboquant/verify_kv_boundary.py` | §11: 변환된 그래프의 `qairt-dlc-info` op 표에서 KV 양자화 경계(write chain dtype, codec 입력, packed/norm encoding 부재, attention Concat의 int8 변환 위치)를 검사하고 JSON 증거를 남김 |
 
 기존 모델, export 경로, 다른 LLM 코드는 수정하지 않았다. TurboQuant는 opt-in 스크립트 경로로만 적용되므로 기본 export 동작에는 영향이 없다.
 
@@ -128,7 +130,6 @@ Qwen3는 현재 delta-cache I/O(`genie_input_ids`)만 구현되어 있다. 그�
 | 프로파일 | packed payload | FP16 norm | host float32 K |
 |---|---:|---:|---:|
 | `k4_v4` | 112 MiB | 3.5 MiB | 0 |
-| `k8_v4` | 56 MiB (V만) | 1.75 MiB | 448 MiB(host float K. 배포 int8 K는 112 MiB) |
 
 이 값은 산술 검산이며 실측 allocation이 아니다. 정렬, QNN intermediate, scratch, host mirror는 P3/P4에서 따로 측정해야 한다.
 
@@ -192,7 +193,6 @@ Qwen3는 현재 delta-cache I/O(`genie_input_ids`)만 구현되어 있다. 그�
 | 프로파일 | PPL | float KV 대비 | 평균 KL | top-1 일치 |
 |---|---:|---:|---:|---:|
 | float KV (기준) | 18.556 | — | — | — |
-| `k8_v4` (K float) | 18.535 | −0.11% | 0.00096 | 99.0% |
 | `k8_v3` (K float) | 18.392 | −0.88% | 0.00370 | 97.8% |
 | `k4_v4` | 24.154 | **+30.2%** | 0.185 | 86.1% |
 | `k4_v3` | 23.945 | **+29.0%** | 0.192 | 86.0% |
@@ -211,7 +211,7 @@ Qwen3는 현재 delta-cache I/O(`genie_input_ids`)만 구현되어 있다. 그�
 - V는 4-bit와 3-bit 모두 이 규모의 측정에서 품질 저하가 드러나지 않았다.
 - K 4-bit는 벡터 복원 오차가 V와 비슷한데도 PPL이 약 30% 나빠졌다. Q·K 내적 오차가 softmax에서 증폭되는 것으로 보인다.
 - 참조 repo가 실사용 기본값으로 비대칭 K=q8_0 / V=turbo 구성을 두는 것과 방향이 같다.
-- 명세의 순서(`k8_v4` 먼저)대로 진행하는 것이 타당하다. `k4_v4` 채택 여부는 K outlier 처리나 K bit 상향 같은 추가 실험과 합의가 필요하다. 합격 임계값은 사용자가 정하지 않았으므로 판정하지 않는다.
+- `k4_v4` 채택 여부는 K outlier 처리나 K bit 상향 같은 추가 실험과 합의가 필요하다. 합격 임계값은 사용자가 정하지 않았으므로 판정하지 않는다.
 
 ## 8. P3: Qwen3-1.7B 실기기 통합 (context 1024)
 
@@ -221,7 +221,7 @@ Qwen3는 현재 delta-cache I/O(`genie_input_ids`)만 구현되어 있다. 그�
 - **ONNX surgery**(`graph_surgery.py`):
   - `past_{kind}_{L}_in`을 `tq_{kind}_{L}_{packed,norm}_in`으로 교체하고, 복원 서브그래프가 기존 Slice→Concat 소비자로 들어간다. K는 복원 뒤 token 축을 hub layout으로 되돌린다.
   - `past_{kind}_{L}_out`은 내부 텐서로 남기고, encode 서브그래프가 `tq_*_out`을 만든다.
-  - 제거한 `past_*_in` encodings만 삭제한다.
+  - codec 입력은 KV 전용 int8 양자화 이전의 값이다: tap encoding을 16-bit로 재격자화하고 cache 분기를 guard·복제로 다시 만든다(§11.3).
 - **로컬 변환**(`convert_parts.py`): `qairt-converter --quantization_overrides` 뒤 `qairt-quantizer --enable_float_fallback --float_bitwidth 16 --act_bitwidth 16`.
   - encodings가 없는 codec 서브그래프는 fp16으로 남는다. QAIRT가 int8↔fp16 경계에 `Convert` op을 자동으로 넣고, codec 상수(회전·경계·LUT)는 fp16으로 유지됨을 dlc-info로 확인했다.
   - 둘째 part부터 prompt(AR=128)와 token(AR=1) 그래프를 weight-sharing context binary 하나로 묶었다. 그래프 변환 1개당 약 2분이 걸렸다.
@@ -231,7 +231,7 @@ Qwen3는 현재 delta-cache I/O(`genie_input_ids`)만 구현되어 있다. 그�
   - KV 배치는 ai-hub-models `HubCompatibleGenerator`와 같은 pyref 방식(오른쪽 정렬 past, 앞쪽 pad)이다.
   - RoPE는 Python에서 만든 float32 표를 쓰고, 양자화 규칙은 Python과 같다(round-half-even).
   - host는 KV를 packed 상태로 보관하고, 매 스텝 그래프 입력 버퍼로 복사한다. RAW client buffer를 쓴다.
-- **이중 양자화 명시.** 배포 w4a16 그래프의 새 토큰 K/V는 이미 int8 activation이다. K는 R3 Hadamard 뒤 텐서다. 따라서 이번 codec은 **int8 activation을 입력으로 4-bit 압축**한다. PC 참조 평가(§7)는 float K/V를 압축했으므로 경로가 다르다.
+- **codec 입력.** 배포 w4a16 그래프에서 K/V를 만드는 연산(K: SpinQuant R3 MatMul, V: v_proj Conv)의 출력은 16-bit 정수 activation이고 그 뒤 Convert에서 KV 전용 int8이 시작한다. codec은 그 int8 이전 값을 압축한다(§11.2). PC 참조 평가(§7)는 HF float K/V를 압축했으므로 입력이 다르다.
 
 ### 8.2 baseline 재현 확인
 
@@ -242,46 +242,7 @@ Qwen3는 현재 delta-cache I/O(`genie_input_ids`)만 구현되어 있다. 그�
 
 같은 runner로 AI Hub 번들과 로컬 번들이 모두 동작했고, 로컬 변환이 baseline 품질을 재현했다. EOS 뒤 차이는 QAIRT 버전 간 수치 차이로 보이며, 원인은 검증하지 않았다.
 
-### 8.3 기능 검증
-
-모든 항목을 세 프로파일(`baseline_int8`, `k8_v4`, `k4_v4`)에서 같은 runner로 실행했다.
-
-| 검증 | 결과 |
-|---|---|
-| prefill + 128토큰 greedy decode | 세 프로파일 모두 첫 답변 동일, 128토큰 생성 완료 |
-| EOS 처리 | `--stop-on-eos`에서 EOS(`<\|im_end\|>`, 11번째 토큰)로 중단하고 리포트에 `stop_reason=eos` 기록 |
-| 세션 reset | 한 프로세스에서 reset 후 재실행한 세션의 생성 토큰이 첫 세션과 전부 동일(2–4세션) |
-| context 경계 | 897토큰 프롬프트 + 128토큰 생성으로 KV 1024/1024 채움. 2세션 동일, 생성 문장이 WikiText 문맥을 이어감 |
-| 초과 거부 | `P + N − 1 > C`이면 runner가 시작 전에 오류(host 검사) |
-| NPU 실행 증거 | QNN detailed profile에서 decode 1스텝 기준 `k8_v4`는 part당 V codec op 약 410개, `k4_v4`는 K+V op 약 820개가 모두 accelerator cycle로 기록됨. `k8_v4`는 prefill 청크 profile에서도 28개 layer의 encode·decode op이 기록됨(`k4_v4` prefill profile은 수집하지 않음). HTP 백엔드에는 CPU 분할 옵션이 없고 context는 `dspArch 81 / socModel 87` |
-
-### 8.4 동일 조건 측정 (S26, CL=1024, 35토큰 프롬프트, 128토큰 생성, warmup 1회 뒤 3회 median)
-
-| 지표 | `baseline_int8` | `k8_v4` | `k4_v4` |
-|---|---:|---:|---:|
-| TTFT | 48 ms | 596 ms | 740 ms |
-| prefill (35토큰 청크) | 730 tok/s | 58.8 tok/s | 47.4 tok/s |
-| decode | 38.97 tok/s (25.7 ms/tok) | 2.05 tok/s (486.7 ms/tok) | 1.42 tok/s (703.0 ms/tok) |
-| 반복 간 decode 편차 (min–max) | 38.95–39.00 | 2.053–2.061 | 1.421–1.425 |
-| host KV 저장소 (1024토큰 할당) | 56.0 MiB | 42.4 MiB | 28.9 MiB |
-| runner I/O 버퍼 | 151.2 MiB | 124.1 MiB | 96.9 MiB |
-| 프로세스 VmRSS (종료 시) | 224.7 MiB | 184.5 MiB | 144.2 MiB |
-| WikiText PPL (4 window, 4,092토큰 통합) | 19.903 | 19.933 (+0.15%) | 20.889 (+4.95%) |
-
-- 측정 범위:
-  - TTFT는 prefill 시작부터 첫 argmax까지이며 모델 로딩은 제외한다(로딩 0.5–1.1초는 리포트에 따로 기록).
-  - RSS는 host 프로세스 기준이며, HTP·DMA-BUF 측 메모리는 포함하지 않는다.
-  - runner는 RAW client buffer와 pyref 전체 복사를 쓰므로 baseline 수치도 Genie 수준의 최적 경로가 아니다.
-- decode가 느린 원인(detailed profile):
-  - 매 스텝 과거 1023토큰 전체를 복원하는 decode 서브그래프가 accelerator cycle의 약 81%(`k8_v4`), 약 85%(`k4_v4`)를 차지한다.
-  - 그중 LUT `Gather`(`dec_centroid_pairs`)가 codec cycle의 약 77%다.
-  - 새 토큰 encode는 layer당 약 40만 cycle로 작다.
-- 품질:
-  - `k8_v4`는 이 측정 범위에서 저하가 드러나지 않았다.
-  - `k4_v4`는 +4.95%로, PC 참조 평가(float K/V 압축, +30%)보다 훨씬 작다. 원인 후보는 두 가지이며 검증하지 않았다: 장치 경로의 K가 R3 Hadamard 회전 뒤 int8 activation이라는 점, 그리고 비교 baseline 자체가 int8 KV라는 점이다.
-  - PPL 개선이나 품질 동등을 주장하지 않는다(window 4개, 단일 실행). 응답 품질 평가는 수행하지 않았다.
-
-### 8.5 명세 대비 남은 조건과 다음 단계
+### 8.3 명세 대비 남은 조건과 다음 단계
 
 1. **메모리 경로(명세 5.3):** 복원이 그래프 안에서 전체 past에 대해 일어난다. 복원 결과(fp16)와 int8 변환 텐서가 HTP intermediate로 잡히므로, packed 저장만으로는 실제 peak 메모리 이득을 주장할 수 없다. tile 단위 복원이나 packed 소비형 attention 융합이 필요하다.
 2. **속도:** decode 경로의 LUT Gather가 병목이다. 후보는 세 가지이며 모두 실험 전이다.
@@ -328,7 +289,7 @@ P3 (context 1024; 번들 이름과 경로는 예시):
 HF_HUB_OFFLINE=1 PYTHONPATH=src python scripts/llm/turboquant/split_checkpoint.py \
     --model-id qwen3_1_7b --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split
 
-# 프로파일별 변환 (baseline_int8 | k8_v4 | k4_v4); part 한 그래프당 약 2분
+# 프로파일별 변환 (baseline_int8 | baseline_int16_kv | k4_v4); part 한 그래프당 약 2분
 PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
     --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
     --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_k4_v4_cl1024 --context-length 1024 --profile k4_v4
@@ -351,7 +312,27 @@ PYTHONPATH=src python scripts/llm/turboquant/run_device_llm.py run --name k4_v4_
 # 추가 옵션: --stop-on-eos, --tokens boundary_prompt_cl1024.bin, --profile-decode-step N, --profile-prefill
 ```
 
-이번 측정의 baseline과 `k8_v4` 번들은 그래프 이름 수정 전에 변환되어 `--graph-suffix _float`로 실행했다. 이후 변환부터는 접미사가 붙지 않는다.
+`baseline_int8` 번들은 그래프 이름 수정 전에 변환되어 `--graph-suffix _float`로 실행했다. 이후 변환부터는 접미사가 붙지 않는다.
+
+경계 검증과 push:
+
+```bash
+for p in baseline_int16_kv k4_v4; do
+  PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
+      --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
+      --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_${p}_cl1024 --context-length 1024 --profile $p
+  # KV 양자화 경계 검증 (dlc-info 기반, 위반 시 종료 코드 1)
+  PYTHONPATH=src python scripts/llm/turboquant/verify_kv_boundary.py \
+      --bundle ~/.qaihm/tmp/turboquant/qwen3_1_7b_${p}_cl1024 \
+      --baseline-bundle ~/.qaihm/tmp/turboquant/qwen3_1_7b_baseline_int8_cl1024 \
+      --report ~/.qaihm/tmp/turboquant/reports/boundary_${p}.json
+  PYTHONPATH=src python scripts/llm/turboquant/run_device_llm.py push \
+      --bundle-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_${p}_cl1024 --name ${p}_cl1024
+done
+# 장치 실행은 P3와 같은 인자(perf: --n-gen 128 --sessions 4, EOS: --stop-on-eos --sessions 2,
+# 경계: --tokens boundary_prompt_cl1024.bin --sessions 2, 채점: --mode score --tokens wikitext_w{0..3}.bin,
+# 프로파일: --n-gen 8 --profile-decode-step 3 --profile-prefill)
+```
 
 장치 파일은 `/data/local/tmp/qaihm_turboquant/` 아래에만 쓴다. 클라우드 작업은 제출하지 않는다.
 
@@ -361,11 +342,144 @@ PYTHONPATH=src python scripts/llm/turboquant/run_device_llm.py run --name k4_v4_
 - HTP fp16 index는 경계 근처에서 oracle과 다를 수 있다(실제 KV에서 측정 ≤0.19%). byte 단위 재현이 필요한 용도에는 fp32 host 경로만 bit-exact를 보장한다.
 - host cache(`cache.py`)는 `new == 128`일 때 shape로 K layout 실수를 잡지 못한다. 장치 runner는 I/O 이름으로 역할을 정하므로 이 문제가 없다.
 - Hexagon SDK 6.6.0.0(tools 19.0.07)은 QAIRT 문서가 V81용으로 명시한 6.4.0/19.0.04와 다르다. custom op이 필요해지면 ABI 호환부터 확인해야 한다.
-- P3 codec은 int8 activation을 입력으로 압축한다(§8.1). float 입력 경로는 재양자화나 encodings 변경이 필요하며 수행하지 않았다.
-- 성능은 baseline보다 크게 느리고, HTP 측 peak 메모리는 측정하지 않았다(§8.4, §8.5).
+- 성능은 baseline보다 크게 느리고, HTP 측 peak 메모리는 측정하지 않았다(§11.5, §8.3).
 - 변환한 context는 1024 하나다. 다른 context 길이, 3-bit 프로파일, 128 초과 prefill 청크는 실행하지 않았다.
 - QAIRT 2.45(AI Hub)와 2.48(로컬) 사이 수치 차이로 EOS 뒤 생성이 달라진다. 비교는 반드시 같은 변환 경로의 번들끼리 해야 한다.
+- §11의 codec cache 분기는 QAIRT 2.48의 encoding 전파·no-op 제거 동작에 맞춘 guard(`Max(x, x)`)에 의존한다. 다른 QAIRT 버전에서는 `verify_kv_boundary.py`로 경계를 다시 확인해야 한다. 이 경로는 배포 encodings를 파생시킨 것이며 재보정하지 않았다.
+- encode 서브그래프의 `ReduceMax`는 part의 opset(18)에 맞춰 `axes`를 입력으로 넣는다. 초기 버전은 속성 형태였고 QAIRT는 받아들였지만 onnxruntime은 거부했다. P2 codec 그래프(opset 17)는 속성 형태가 맞다.
 
-## 11. 출처
+## 11. codec 입력 경계(int8 이전 KV)와 비압축 int16 KV 비교군 (context 1024)
+
+배포 w4a16 그래프는 KV cache를 int8로 저장한다. 이 절은 codec이 **KV 전용 int8 양자화 이전의 K/V**를 읽도록 만든 경로를 정의·검증하고, 같은 값을 변환 없이 그대로 저장하는 **비압축 int16 KV** 비교군과 같은 w4a16 모델·runner·평가 조건에서 비교한다. decode 속도 최적화는 범위에 넣지 않았다.
+
+### 11.1 비교군 정의
+
+| 프로파일 | K 저장 | V 저장 | codec 입력 | 비고 |
+|---|---|---|---|---|
+| `baseline_int8` | 배포 affine int8 | 배포 affine int8 | — | 배포 경로 그대로. 성능·메모리 기준 |
+| `baseline_int16_kv` | uFxp_16 (K 생성 연산의 16-bit grid 그대로) | uFxp_16 | — | KV cache 저장과 graph I/O만 바꿈. 값 변환 없음. 가중치·tokenizer·분할·비-KV activation encodings는 동일 |
+| `k4_v4` | PolarQuant 4-bit | PolarQuant 4-bit | int8 이전 K/V | K는 k_norm·RoPE·SpinQuant R3 뒤 cache 좌표계에서 압축, V에는 RoPE 없음 |
+
+"int8 이전 K/V"는 HF 전체 FP16 모델의 KV가 아니다. 같은 w4a16 그래프에서 KV 전용 int8 encoding이 붙기 직전 텐서이며, 이 텐서는 이미 16-bit 정수 activation(K: SpinQuant R3 MatMul 출력, V: v_proj Conv 출력)이며, `baseline_int16_kv`는 그 값을 그대로 저장한다. HF FP16 모델 값은 §7의 PC 참조 평가와 §11.6의 host 참고값으로만 쓴다. 모든 프로파일은 `config_hash()`가 다르고, 번들 경로는 `~/.qaihm/tmp/turboquant/qwen3_1_7b_{profile}_cl1024`로 분리된다. 배포 checkpoint는 덮어쓰지 않았다.
+
+### 11.2 K/V 생성 → encoding → cache I/O → attention 소비 지도 (Qwen3-1.7B w4a16, Part2 layer 0)
+
+배포 checkpoint의 사전 생성 ONNX·AIMET encodings(v1.0.0)와 QAIRT 변환 결과를 직접 추적했다(ONNX의 논리 dtype은 모두 FLOAT이므로 encodings와 dlc-info로 판단).
+
+ONNX + encodings (head 0 기준, 8 KV head 동일 구조):
+
+| 단계 | K | V |
+|---|---|---|
+| projection | `conv2d_16` k_proj Conv, **bw16** | `conv2d_24` v_proj Conv, **bw8** (scale 0.00769, per-head) |
+| norm / RoPE | k_norm(`mul_2350`, bw16) → RoPE(`sub_881`/`add_2702`) → `cat_16` **bw16** | (없음) |
+| tap (KV 전용 int8 시작) | `spinquant_block0_k_R3` MatMul(int4 Hadamard param) 출력 `spinquant_block0_k_R3_out` **bw8** (0.2765, per-head) | `conv2d_24` 자체 |
+| 공유 Transpose | `transpose_1` bw8 (0.2765) | `permute_24` bw8 (0.00769) |
+| cache 쓰기 | Concat → `past_key_0_out` bw8 (**0.4101**, head 최대값 공유) | Concat → `past_value_0_out` bw8 (**0.0218**) |
+| cache 읽기 | `past_key_0_in` bw8 (0.4101) → Slice `slice_1..8` (동일 grid) | `past_value_0_in` bw8 (0.0218) → `slice_9..16` |
+| attention 소비 | Concat(`slice_i`, `transpose_i`) → `cat_24..31` bw8 (예: 0.3115) → QK MatMul 2번째 입력 (16×8) | Concat(`slice_i`, `permute_i`) → `cat_32..39` bw8 → AV MatMul 2번째 입력 (16×8) |
+
+이 int8은 `_apply_int8_kv_cache_tying_and_lm_head`가 KV I/O를 8-bit symmetric으로 묶고, `_set_matmul_second_input_to_8b`가 attention MatMul 2번째 입력을 8-bit로 만들며 Concat/Transpose/Slice를 거슬러 8-bit를 전파한 결과다. 전파가 멈추는 첫 연산 출력이 tap(K: R3 MatMul, V: v_proj Conv)이며, 그 입력(`cat_16`, layernorm 출력)은 16-bit다. 즉 `past_*_out` encoding만 지우면 per-head int8(tap·Transpose)이 그대로 남아 원본 값이 복원되지 않는다.
+
+QAIRT 변환 결과(`baseline_int8`, token 그래프, dlc-info):
+
+- K: `cat_16`(uFxp_16) → FullyConnected → `spinquant_block0_k_R3_out_fc` **uFxp_16** → `Convert → uFxp_8(0.2765)` → Reshape → Transpose(uFxp_8) → Concat `past_key_0_out`(uFxp_8, 0.4101) 및 Concat `cat_24`(uFxp_8, 0.3115).
+- V: layernorm 출력(uFxp_16) → Conv2d(Transpose 접힘) → `permute_24` **uFxp_16** → `Convert → uFxp_8(0.00769)` → Concat `past_value_0_out`(0.0218) 및 `cat_32`(0.00769).
+
+즉 장치에서도 tap 연산 자체는 16-bit로 계산되고, KV 전용 int8은 그 뒤 Convert 한 개에서 시작한다.
+
+### 11.3 적용한 변경 (재보정 없음)
+
+AIMET 재보정 대신 배포 encodings를 파생시켜 비-KV activation encodings와 param encodings(860개)를 bit 단위로 유지했다. `graph_surgery.apply_kv_profile`이 codec 프로파일(`k4_v4`)에 대해 part당 다음을 수행한다(part2 token 그래프, 10 layer 기준 수치):
+
+| 편집 | 대상 | 수 | 이유 |
+|---|---|---:|---|
+| regrid 8→16 bit | tap `spinquant_block{i}_k_R3_out`(80), `conv2d_*`(80) | 160 | 같은 calibrated min을 유지한 16-bit grid(scale/256, offset×256). 연산은 정수로 유지되고 가중치는 그대로 |
+| guard 삽입 | tap마다 `Max(x, x)` → `{tap}_tq_cache` | 160 | encoding 없는 정확한 no-op. float fallback으로 cache 분기를 float16으로 시작 |
+| Transpose 복제 | `transpose_i`/`permute_i` → `*_tq_cache` | 160 | 원본 Transpose는 int8 encoding을 유지해 새 토큰의 attention 경로를 baseline과 동일하게 둠 |
+| encoding 제거 | `past_*_in`, `past_*_out` | 40 | cache I/O. `past_*_out` Concat은 복제 체인만 읽도록 재배선 |
+| 유지 | `slice_*`(cache 입력 tied grid), `cat_24..39`(attention per-head int8), 나머지 4534개 activation encodings | — | Slice는 float 입력을 받으면 QAIRT가 float16으로 두고 attention Concat 입력에서 int8로 변환(P3에서 검증). attention MatMul은 16×8 유지 |
+
+`baseline_int16_kv`(비압축)는 codec 없이 저장 경로를 **무손실**로 만든다. float16 변환도 하지 않는다.
+
+| 편집 | 대상 | 수 | 이유 |
+|---|---|---:|---|
+| regrid 8→16 bit (공유 grid) | tap 160개 | 160 | layer·kind마다 8개 head의 16-bit grid를 합집합(가장 넓은 head의 scale, offset −32768)으로 통일. head마다 grid가 다르면 cache Concat에서 재격자화가 생기므로 하나의 grid로 맞춰 저장을 정확히 만든다 |
+| Transpose 복제 + encoding | `transpose_i`/`permute_i` → `*_tq_cache` | 160 | 복제본에 같은 공유 grid encoding을 명시. 원본은 int8 encoding을 유지해 attention 경로 불변 |
+| encoding 설정 | `past_*_out`(20), `past_*_in`(20), cache 입력 Slice 출력(160) | 200 | 모두 같은 공유 grid. cache I/O가 uFxp_16이 되고 입력·출력 encoding이 동일하다 |
+| 유지 | `cat_24..39`(attention per-head int8), 나머지 activation encodings | — | int8 변환은 attention Concat 입력 한 곳뿐 |
+
+guard는 넣지 않는다(모든 텐서에 encoding이 명시되어 QAIRT의 전파·no-op 제거에 영향을 받지 않는다). 처음에는 이 비교군을 float16 cache로 만들었으나(QAIRT가 FLOAT encoding을 버려 converter `--config`로 출력 dtype을 강제), uFxp_16→Float_16 변환이 큰 값에서 int16 grid보다 거친 반올림(상대 ≤2^-11)을 넣으므로 무손실 int16 저장으로 바꿨다. 편집 목록은 번들의 `{graph}.kv_edits.json`에 tensor·이유·전후 encoding으로 기록된다.
+
+시도했다가 버린 방법과 이유:
+
+1. 공유 Transpose의 int8 encoding만 제거: QAIRT가 tap의 16-bit encoding을 pass-through op에 전파해 `past_*_out`이 uFxp_16이 되고, attention Concat `cat_24`는 두 입력이 모두 비-int8이 되자 float16으로 바뀌어 QK MatMul이 **16×16**으로 변했다(attention 소비 경로 이탈).
+2. AIMET FLOAT encoding 명시: QAIRT 2.48 `convert_encodings.py`는 `dtype: FLOAT` encoding을 버린다("Discarding the float encodings").
+3. guard 없이 Transpose만 복제: token 그래프에서 V의 Transpose는 no-op(`[1,1,1,128]`)이라 QAIRT가 제거하면서 cache Concat을 attention 쪽 int8 Convert에 연결했고, Concat 출력 encoding이 "bitwidth 8 + 16-bit grid"로 뒤섞였다(수치 파괴). `Max(x, x)` guard는 QAIRT의 identity 제거 규칙(상수 곱/나눗셈)에 걸리지 않아 유지된다.
+
+### 11.4 변환 결과의 경계 검증 (`verify_kv_boundary.py`, dlc-info)
+
+프로파일마다 prompt(AR=128)·token(AR=1) × part 2/3/4 = 6개 그래프, 그래프당 KV 항목 20/20/16개를 검사했다(리포트: `reports/boundary_{profile}.json`). 아래는 token 그래프 part2 layer 0의 최종 QNN op 열이다(다른 layer·part·prompt 그래프도 같은 구조, 위반 0).
+
+`k4_v4` (codec):
+
+- **cache 쓰기(K):** `cat_16`(uFxp_16) → FullyConnected `spinquant_block0_k_R3` → Reshape → `spinquant_block0_k_R3_out` **uFxp_16** (encoding `bitwidth 16, min -39.429, scale 0.001203, offset -32768`; baseline 번들의 같은 텐서는 `bitwidth 8, min -39.429, scale 0.308, offset -128` — min 동일, scale 1/256) → `Convert → Float_16` → guard `..._tq_cache_guard`(Eltwise_Binary, Float_16) → `node_transpose_1_tq_cache`(Float_16) → Concat → `past_key_0_out`(Float_16) → codec 첫 op(`tq_key_0_present_tokens_last` Transpose)이 Convert 없이 직접 읽음.
+- **cache 쓰기(V):** layernorm 출력(uFxp_16) → Conv2d → `conv2d_24` **uFxp_16** → `Convert → Float_16` → guard → Concat → `past_value_0_out`(Float_16) → codec. token 그래프에서는 복제 Transpose가 no-op이라 QAIRT가 제거했지만 guard가 남아 float16 분기가 유지된다.
+- **attention 새 토큰(K):** 같은 `spinquant_block0_k_R3_out`(uFxp_16) → 원본 `node_transpose_1` → `Convert → uFxp_8`(0.2765, baseline과 같은 per-head grid) → `cat_24`(**uFxp_8**, 0.3115) → QK MatMul(2번째 입력 8-bit, 16×8 유지). V도 `conv2d_24 → Convert uFxp_8(0.00769) → cat_32`로 동일.
+- **cache 읽기:** codec 복원 텐서(Float_16) → StridedSlice(Float_16) → `Convert → uFxp_8` → `cat_24`(입력 두 개 모두 uFxp_8). 그래프당 160개(8 head × K/V × 10 layer)의 Convert가 모두 attention Concat 입력에 있다.
+- `tq_*_packed_*`는 Uint_8, `tq_*_norm_*`는 Float_16이며 모두 "No encoding info"로 재양자화되지 않는다.
+
+`baseline_int16_kv` (비압축):
+
+- **cache 쓰기(K):** FullyConnected → Reshape → `spinquant_block0_k_R3_out` **uFxp_16** (공유 grid `bitwidth 16, min -48.754, scale 0.001488, offset -32768` — layer 0 K에서 가장 넓은 head의 grid) → `node_transpose_1_tq_cache`(uFxp_16, 같은 encoding) → Concat → `past_key_0_out` **uFxp_16, APP_READ, 같은 encoding**. 변환 op이 하나도 없다.
+- **cache 쓰기(V):** Conv2d → `conv2d_24` **uFxp_16**(공유 grid `min -2.538, scale 7.744e-5`) → Concat `node_cat_1149` → `past_value_0_out` **uFxp_16**, 같은 encoding. no-op 복제 Transpose는 제거됐지만 tap 자체가 공유 grid라 결과는 같다.
+- **cache 읽기:** `past_key_0_in` **uFxp_16, APP_WRITE, 출력과 동일한 encoding** → StridedSlice `slice_1`(uFxp_16, 같은 grid) → `cat_24`. 여기서 QAIRT는 입력이 모두 16-bit가 되자 `cat_24`를 **uFxp_16**(범위 ±39.87, baseline `cat_24`와 같은 범위)으로 승격하고, `cat_24 → Convert → uFxp_8(0.3115)` 뒤에 QK MatMul을 둔다. 즉 int8 변환이 Concat 입력에서 Concat 출력으로 옮겨졌을 뿐 MatMul은 16×8이고 int8 grid도 baseline과 같다. 새 토큰 K는 원본 `transpose_1`이 16-bit(per-head 범위)로 승격되어 `cat_24`로 들어가므로, baseline의 "per-head int8(0.2765) → cat_24 int8(0.3115)" 두 번 반올림이 한 번(0.3115)으로 줄어든다. V(`cat_32`)도 같다.
+- I/O 표: `past_*_in`/`past_*_out` 모두 uFxp_16이고 encoding 문자열이 동일하다(runner의 in/out 일치 검사 통과). runner가 보고한 KV stream dtype은 `ufxp16`.
+
+`baseline_int8`과 비교하면 새 토큰 경로에서 tap 연산 출력이 uFxp_16인 점은 같고, 차이는 (1) cache 저장이 int8(공유 scale)이 아니라 tap의 16-bit grid 그대로, (2) attention 입력의 int8 변환이 한 번인 점이다.
+
+- **실행 증거:** context binary metadata `dspArch 81 / socModel 87`, HTP backend(CPU 분할 옵션 없음). runner detailed profile에서 `baseline_int16_kv` decode 1스텝 accelerator 시간은 part2/3/4 = 6.18/5.32/10.14 ms(baseline_int8 5.55/5.77/10.06 ms)로 모든 op이 accelerator에서 실행됐다.
+
+ONNX 쪽 증거는 `{graph}.kv_edits.json`(tap·복제·guard·set 목록)과 단위 테스트(`test_turboquant_graph_surgery.py`: 합성 part에서 attention Concat 입력 배선·encoding 유지·복제 체인·값 동일성·int16 grid 공유 검사)다.
+
+### 11.5 실기기 결과 (S26, CL=1024, 각 1회)
+
+조건: 같은 w4a16 가중치·tokenizer·4-part 분할, QAIRT 2.48 로컬 변환, 같은 runner(RAW buffer, pyref 전체 복사)와 burst 전력 설정, 35토큰 chat prompt(`enable_thinking=False`), 128토큰 greedy, WikiText 4 window/4,092 채점 토큰. 속도·메모리는 **프로파일당 1세션 1회**(warmup 없음) 측정이라 P3의 "warmup 뒤 3회 median"보다 편차가 크다(예: `baseline_int8` decode는 3회 median 38.97 tok/s였고 이번 1회는 41.75 tok/s). 리포트는 `reports/once/`. TTFT는 prefill 시작부터 첫 argmax까지이며 모델 로딩은 제외한다. RSS는 host 프로세스 기준이고 HTP·DMA-BUF 측 메모리를 포함하지 않는다. runner는 RAW client buffer와 pyref 전체 복사를 쓰므로 baseline 수치도 Genie 수준의 최적 경로가 아니다.
+
+| 지표 | `baseline_int8` | `baseline_int16_kv` | `k4_v4` |
+|---|---:|---:|---:|
+| KV 저장 형식 | uFxp_8 (공유 scale) | uFxp_16 (tap grid 그대로, 무손실) | 4-bit packed + fp16 norm |
+| TTFT | 54 ms | 40 ms | 729 ms |
+| prefill (35토큰) | 648 tok/s | 877 tok/s | 48.1 tok/s |
+| decode | 41.75 tok/s (24.0 ms/tok) | 34.72 tok/s (28.8 ms/tok) | 1.43 tok/s (698 ms/tok) |
+| host KV 저장소 (1024토큰) | 56.0 MiB | 112.0 MiB | 28.9 MiB |
+| runner I/O 버퍼 | 151.2 MiB | 263.2 MiB | 96.9 MiB |
+| 프로세스 VmRSS (종료 시) | 221.8 MiB | 391.7 MiB | 138.6 MiB |
+| WikiText PPL (4 window 통합) | 19.903 | 20.108 | 20.296 |
+| PPL vs `baseline_int8` | — | +1.03% | +1.97% |
+| PPL vs `baseline_int16_kv` | −1.02% | — | +0.93% |
+| window별 PPL | 11.651 / 23.729 / 22.017 / 25.781 | 11.545 / 24.098 / 21.856 / 26.888 | 12.600 / 23.931 / 21.178 / 26.573 |
+
+PPL은 teacher-forced라 세션 반복과 무관하다. `baseline_int8`과 `k4_v4`의 PPL은 이전 측정값을 그대로 쓴다(번들 불변). `baseline_int16_kv`의 기능 검증(1세션): 128토큰 생성 완료, `--stop-on-eos`에서 11번째 토큰 `<|im_end|>` 정지, 897토큰 프롬프트 + 128토큰으로 KV 1024/1024 채움. 고정 프롬프트의 첫 문장은 세 프로파일 모두 "Gravity is the force that pulls objects toward Earth."로 같았고 EOS 뒤 continuation은 다르다. 이것으로 품질 동등을 주장하지 않는다. HTP backend에는 CPU 분할이 없고 detailed profile의 모든 op이 accelerator cycle을 가지므로 CPU/GPU fallback은 없다.
+
+관찰:
+
+- `baseline_int16_kv`(무손실 16-bit 저장)는 int8 KV baseline보다 PPL이 **1.03% 나쁘다.** 이전에 float16으로 저장했을 때(+1.35%; §11.3)보다 차이가 줄었지만 부호는 같다. 즉 int8 KV 단계를 제거하는 것 자체가 이 모델에서는 PPL을 낮추지 않는다. 원인은 검증하지 않았다. 후보: 배포 checkpoint의 AdaScale·calibration이 int8 KV quantizer를 켠 채로 수행되어 하류 encodings가 그 분포에 맞춰져 있음, 그리고 attention 입력 int8 변환이 baseline과 다른 위치(Concat 출력)에서 한 번만 일어남(§11.4). "16-bit KV가 곧 상한"이라는 가정이 이 모델·양자화 경로에서는 성립하지 않으므로 비교는 두 baseline 모두에 대해 제시한다.
+- `k4_v4`(K·V 4-bit)는 `baseline_int8` 대비 +1.97%, `baseline_int16_kv` 대비 +0.93%다. window 0(12.600)에서 가장 나쁘고 window 2에서는 두 baseline보다 낮다. 단일 실행·4 window이므로 유의성을 주장하지 않고, 응답 품질 평가는 수행하지 않았다.
+- decode: `baseline_int16_kv`는 accelerator 시간이 baseline과 비슷하지만(§11.4) host KV 복사량이 2배(run당 1,379 vs 690 MiB)라 end-to-end는 느리다. `k4_v4`는 decode 1스텝에 part2/3/4 accelerator 241/246/204 ms가 걸리고(codec op 903/903/723개), 매 스텝 과거 1023토큰 전체를 복원하는 decode 서브그래프가 accelerator cycle의 86–88%를 차지한다. 그중 LUT `Gather`(`dec_centroid_pairs`)가 codec cycle의 대부분이며 새 토큰 encode는 작다.
+- 메모리: host 값만 측정했다. HTP intermediate·scratch·DMA-BUF는 **미측정**이다. int16 KV의 이론 payload(112 MiB)와 실측 NPU 메모리는 다른 값이다.
+
+### 11.6 host 참고값 (장치 결과 아님)
+
+HF Qwen3-1.7B의 float K/V snapshot(layer 0/13/27, 8 head × 256 token)에 4-bit codec을 적용한 상대 L2 재구성 오차(`reports/host_snapshot_input_grid.json`). int8 grid는 텐서 자체 max로 잡은 유리한 per-tensor symmetric grid다.
+
+| 입력 | K (layer 0/13/27) | V (layer 0/13/27) |
+|---|---|---|
+| int8만 | 0.050 / 0.029 / 0.034 | 0.042 / 0.096 / 0.031 |
+| codec, float 입력 | 0.085 / 0.094 / 0.090 | 0.094 / 0.095 / 0.096 |
+| codec, int8 입력 (float 대비) | 0.098 / 0.098 / 0.096 | 0.103 / 0.135 / 0.100 |
+
+codec 자체 오차(≈9%)에 int8 오차가 대략 제곱합으로 더해진다. 장치 K는 R3 회전 뒤 값이고 int8 grid도 다르므로 이 표는 경향 참고용이다.
+
+## 12. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

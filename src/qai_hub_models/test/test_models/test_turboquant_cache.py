@@ -11,7 +11,11 @@ import pytest
 import torch
 
 from qai_hub_models.models.templates.llm.turboquant.cache import TurboQuantKVCache
-from qai_hub_models.models.templates.llm.turboquant.config import get_profile
+from qai_hub_models.models.templates.llm.turboquant.config import (
+    BASELINE,
+    TurboQuantConfig,
+    get_profile,
+)
 from qai_hub_models.models.templates.llm.turboquant.reference import (
     PolarQuantReference,
 )
@@ -91,9 +95,13 @@ def test_append_encodes_only_new_tokens_and_decodes_in_hub_layout() -> None:
     assert cos.min() > 0.97
 
 
-def test_k8_v4_keeps_keys_bit_exact() -> None:
+# Value-only codec: the repo's affine int8 K path stays as exported.
+V_ONLY = TurboQuantConfig("v_only", BASELINE, get_profile("k4_v4").value)
+
+
+def test_baseline_key_keeps_keys_bit_exact() -> None:
     rng = np.random.default_rng(2)
-    cache = make_cache("k8_v4")
+    cache = TurboQuantKVCache(V_ONLY, LAYERS, KV_HEADS, D, CTX)
     step = make_step(rng, 4)
     cache.append(step)
     dec_k, _ = cache.layer_float(1)
@@ -224,7 +232,7 @@ def test_memory_report_matches_spec_arithmetic() -> None:
     assert report.allocated_bytes == 112 * mib + int(3.5 * mib)
     assert report.baseline_float_bytes == 0
 
-    k8 = TurboQuantKVCache(get_profile("k8_v4"), 28, 8, 128, 4096).memory_report(4096)
+    k8 = TurboQuantKVCache(V_ONLY, 28, 8, 128, 4096).memory_report(4096)
     assert k8.packed_payload_bytes == 56 * mib
     # Host generator stores baseline K as float32; int8 lives only inside the graph.
     assert k8.baseline_float_bytes == 28 * 8 * 4096 * 128 * 4

@@ -278,8 +278,7 @@ def test_storage_norms_policy() -> None:
 
 def test_profiles() -> None:
     assert not get_profile("baseline_int8").enabled
-    k8_v4 = get_profile("k8_v4")
-    assert k8_v4.key == BASELINE and k8_v4.value.bits == 4
+    assert get_profile("k8_v3").key == BASELINE
     k4_v4 = get_profile("k4_v4")
     assert (k4_v4.key.bits, k4_v4.key.seed, k4_v4.value.seed) == (4, 42, 542)
     assert get_profile("k4_v3").value.bits == 3
@@ -310,6 +309,8 @@ def test_config_rejects_unsupported_settings() -> None:
         KVCodecSpec(CodecKind.POLAR, bits=2, seed=42)
     with pytest.raises(ValueError, match="no bits"):
         KVCodecSpec(CodecKind.BASELINE, bits=4)
+    with pytest.raises(ValueError, match="no bits"):
+        KVCodecSpec(CodecKind.INT16, bits=4)
     with pytest.raises(ValueError, match="FWHT signs"):
         TurboQuantConfig("x", KVCodecSpec(CodecKind.POLAR, bits=4, seed=7), V4)
     with pytest.raises(ValueError, match="codebook"):
@@ -331,7 +332,7 @@ QWEN3_SHAPES = {
 
 
 @pytest.mark.parametrize("model_id", sorted(QWEN3_SHAPES))
-@pytest.mark.parametrize("profile", ["k8_v4", "k4_v4", "k4_v3"])
+@pytest.mark.parametrize("profile", ["k4_v4", "k8_v3", "k4_v3"])
 def test_qwen3_sizes_share_one_config(model_id: str, profile: str) -> None:
     layers, heads, kv_heads, hidden, head_dim = QWEN3_SHAPES[model_id]
     get_profile(profile).validate_for_model(layers, kv_heads, head_dim)

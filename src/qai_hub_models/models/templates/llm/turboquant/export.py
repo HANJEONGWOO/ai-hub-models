@@ -115,8 +115,13 @@ def encode_subgraph(
     lead: tuple[int, int],
     num_tokens: int,
     prefix: str,
+    opset: int = OPSET,
 ) -> Subgraph:
-    """``src -> (packed_out, norm_out)``, matching :class:`PolarQuantReference`."""
+    """``src -> (packed_out, norm_out)``, matching :class:`PolarQuantReference`.
+
+    ``opset`` is the default-domain opset of the graph the subgraph goes into:
+    ReduceMax takes its axes as an attribute up to opset 17 and as an input from 18.
+    """
     _check_supported(spec, config)
     d = config.block_size
     sg = Subgraph()
@@ -128,7 +133,10 @@ def encode_subgraph(
 
     # Overflow-safe x / ||x|| for FP16: divide by max|x| before squaring.
     sg.node("Abs", [src], [f"{p}abs"])
-    sg.node("ReduceMax", [f"{p}abs"], [f"{p}max_abs"], axes=[3], keepdims=1)
+    if opset >= 18:
+        sg.node("ReduceMax", [f"{p}abs", axis3], [f"{p}max_abs"], keepdims=1)
+    else:
+        sg.node("ReduceMax", [f"{p}abs"], [f"{p}max_abs"], axes=[3], keepdims=1)
     # SM8850 HTP FP16 Div is inaccurate for divisors above 2**14 (NaN past ~3.6e4),
     # so rows with max|x| > 256 are first scaled by an exact power of two.
     sg.node("Greater", [f"{p}max_abs", threshold], [f"{p}big"])

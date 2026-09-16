@@ -32,7 +32,9 @@ from typing import Any
 import onnx
 
 from qai_hub_models.models.templates.llm.turboquant.config import get_profile
-from qai_hub_models.models.templates.llm.turboquant.graph_surgery import apply_kv_codec
+from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
+    apply_kv_profile,
+)
 
 DEFAULT_SDK = Path("~/qairt/2.48.0.260626").expanduser()
 DEFAULT_QNN_PYTHON = Path("~/qnn-venv/bin/python").expanduser()
@@ -97,15 +99,15 @@ def apply_profile(
     name: str,
     seq_len: int,
     out: Path,
-) -> tuple[Path, Path, list[dict[str, Any]]]:
-    """Insert codecs for this graph; baseline graphs are converted as exported."""
+) -> tuple[Path, Path, dict[str, Any]]:
+    """Apply the profile to this graph; baseline graphs are converted as exported."""
     config = get_profile(args.profile)
     model = onnx.load(str(onnx_path), load_external_data=False)
-    if not config.enabled or not any(
+    if not config.modifies_graph or not any(
         i.name.startswith("past_") for i in model.graph.input
     ):
-        return onnx_path, encodings, []
-    new_model, new_enc, codec_io = apply_kv_codec(
+        return onnx_path, encodings, {}
+    result = apply_kv_profile(
         model, json.loads(encodings.read_text()), config, seq_len, args.context_length
     )
     # Initializers keep their external-data location, so expose the weights file here.
@@ -114,10 +116,20 @@ def apply_profile(
         if not link.exists():
             link.symlink_to(data)
     new_onnx = out / f"{name}.onnx"
-    onnx.save(new_model, str(new_onnx))
+    onnx.save(result.model, str(new_onnx))
     new_encodings = out / f"{name}.encodings"
-    new_encodings.write_text(json.dumps(new_enc))
-    return new_onnx, new_encodings, [io.to_dict() for io in codec_io]
+    new_encodings.write_text(json.dumps(result.encodings))
+    report = result.report()
+    (out / f"{name}.kv_edits.json").write_text(json.dumps(report, indent=1) + "\n")
+    actions = [e["action"] for e in report["encoding_edits"]]
+    summary = {
+        "codec_io": report["codec_io"],
+        "encodings_dropped": actions.count("drop"),
+        "encodings_regridded": actions.count("regrid"),
+        "tensors_duplicated": actions.count("duplicate"),
+        "kv_paths": len(report["kv_paths"]),
+    }
+    return new_onnx, new_encodings, summary
 
 
 def convert_graph(
@@ -129,7 +141,7 @@ def convert_graph(
     out: Path,
     env: dict[str, str],
 ) -> dict[str, Any]:
-    onnx_path, encodings, codec_io = apply_profile(
+    onnx_path, encodings, surgery = apply_profile(
         args, onnx_path, encodings, name, seq_len, out
     )
     graph = onnx.load(str(onnx_path), load_external_data=False).graph
@@ -152,7 +164,7 @@ def convert_graph(
     float_dlc = out / "float" / f"{name}.dlc"
     dlc = out / f"{name}.dlc"
     timings: dict[str, Any] = {
-        "codec_io": codec_io,
+        "surgery": surgery,
         "convert_s": run_logged(
             [
                 str(args.qnn_python),
