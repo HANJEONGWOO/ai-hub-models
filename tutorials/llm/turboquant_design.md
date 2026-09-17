@@ -1,6 +1,6 @@
 # Qwen3 TurboQuant KV-cache — 설계(ABI·수치 계약)와 P0–P3 결과
 
-> §11의 ladder 복원 결과 이후 성능 수정과 재측정은 §12에 기록한다.
+> §11 이후 codec 성능 수정은 §12, tiled KV/attention 구현은 §13에 기록한다.
 
 작성일: 2026-09-15 · 작업 브랜치: `turboquant-kv-cache` (기준 commit `2a895603e`)
 
@@ -645,6 +645,146 @@ PYTHONPATH=src python scripts/llm/turboquant/run_device_llm.py run \
     --report ~/.qaihm/tmp/turboquant/reports/perf_k4_v4_optimized.json
 ```
 
-## 13. 출처
+## 13. 2026-09-17 tiled KV 복원과 attention
+
+### 13.1 구현 범위
+
+`tiled_attention.py`는 codec 삽입 후 Qwen3의 head별 attention을 검사하고
+다음 **two-pass tiled 그래프**로 바꾼다. `convert_parts.py --attention-tile 256`으로
+명시적으로 켜며, 기본값 0은 §12의 전체 복원 경로를 유지한다.
+
+1. packed K와 norm을 token 축에서 최대 256토큰씩 Slice한다. 해당 블록만
+   복원하고 head별 QK를 계산한다. 복원 K를 전체 캐시로 합치지 않는다.
+2. 작은 QK score 블록만 context 축으로 합쳐 기존 mask와 **전역 softmax**를
+   그대로 적용한다. block별 softmax를 따로 정규화하는 잘못된 계산은 하지 않는다.
+3. packed V와 norm도 같은 크기로 Slice한다. 각 V 블록을 복원해 해당 확률
+   블록과 곱한 부분 AV를 만들고 누적한다. 복원 V도 전체 캐시로 합치지 않는다.
+
+이것은 **그래프 수준 tiling**이며, 하나의 HTP custom kernel로 decode·attention을
+fusion하거나 online softmax까지 구현한 FlashAttention은 아니다. 중간 텐서의
+실제 배치·생존 기간·VTCM/DDR 이동은 QAIRT 스케줄러가 결정한다. 따라서
+"전체 FP16 KV 텐서 제거"와 "peak NPU memory/latency 감소"를 구분해 검증한다.
+고정 context의 모든 past slot은 여전히 처리하며 유효 길이 버킷은 추가하지 않았다.
+
+캐시 ABI, MSB-first packed bytes, FP16 norm, encoder, codebook, 회전 행렬,
+가중치와 param encodings는 바꾸지 않는다. tile 크기는 cache format이 아닌
+컴파일 옵션이다. 인식하지 못한 attention 구조·누락된 encoding은 오류로
+거부하며 일부 head만 바꾸고 조용히 계속하지 않는다.
+
+### 13.2 양자화 경계와 수치 차이
+
+각 tile의 per-head KV Slice와 attention Concat에는 원본 Slice/Concat의
+encoding을 모두 복사한다. **Concat encoding만 복사한 초기 시도에서는
+QAIRT가 attention을 16×16으로 승격했다.** Slice encoding을 함께 유지한 뒤
+실제 모델에서 추출한 attention 그래프의 모든 QK·AV가 16×8임을 확인했다.
+새 토큰은 기존 attention 입력에서 가져오며 캐시 encoder 경로는 그대로다.
+
+HTP의 혼합 dtype Concat 경계를 유지하기 위해 각 KV tile 뒤에 현재 토큰을
+붙인다. 마지막이 아닌 K tile에서는 현재 토큰의 score를 제외하고, V tile에서는
+현재 토큰에 대응하는 확률을 0으로 둔다. 현재 토큰의 기여는 마지막 tile에서만
+포함된다. mask와 softmax의 입력 순서는 기존 past → current 순서다.
+
+QK tile과 부분 AV는 원래 MatMul의 calibrated output grid를 재사용한다.
+부분 AV의 재양자화와 누적 순서 때문에 FP16/정수 반올림은 원래 한 번의 AV와
+다르다. float32 ONNX의 수학적 동등성을 실기기 품질 동등성으로 간주하지 않고,
+최종 바이너리의 WikiText PPL을 별도로 측정한다.
+
+`verify_tiled_attention.py`는 최종 DLC op 표에서 각 tile의 KV 쓰기/읽기 경계,
+packed/norm I/O, 모든 attention MatMul의 16×8 dtype, 전체 복원 텐서의 부재와
+복원 중간 텐서의 크기를 검사한다. 빈/미완성 DLC op 표는 실패로 판정한다.
+CPU 검증은 빈/부분/전체 캐시, causal mask, GQA, 불완전한 마지막 tile,
+cache I/O 유지, 미지원 구조 거부를 포함한다. 기존 테스트와 합쳐 185개가 통과했다.
+
+### 13.3 재현 및 측정 규칙
+
+명령은 `scripts/llm/turboquant/README.md`의 "Tiled KV restore and attention"에
+있다. 이 변경부터 성능 수치는 사용자 요청에 따라 **구성당 128토큰 생성 1회**로
+측정한다. median/반복 범위로 표시하지 않는다. 품질·EOS·context 경계·세션 reset
+검증 및 detailed profiling은 성능 측정과 분리한다.
+
+### 13.4 실기기 결과: 중간 텐서 제거, 속도 개선 없음
+
+S26/SM8850, CL=1024, 같은 가중치·runner·burst 설정, 35토큰 prompt,
+128토큰 greedy 생성이다. **아래 네 구성 모두 이번 작업에서 성능을 1회씩
+측정했다.** 프로파일링은 껐고 모델 로딩은 TTFT에서 제외했다. 별도 warmup 제외,
+온도 통제, 실행 순서 교차는 하지 않았다. 약 0.5–2% 차이의 유의성은 판단할 수 없다.
+
+| 지표 | int8 baseline | int16 KV baseline | 기존 최적화 `k4_v4` | tiled-256 `k4_v4` |
+|---|---:|---:|---:|---:|
+| TTFT | 52.4ms | 40.3ms | 116.7ms | 114.4ms |
+| prefill | 670.62 tok/s | 873.38 tok/s | 300.96 tok/s | 306.96 tok/s |
+| decode | 42.245 tok/s | 35.144 tok/s | 10.867 tok/s | 10.813 tok/s |
+| host KV 저장소 | 56.0MiB | 112.0MiB | 28.875MiB | 28.875MiB |
+| 프로세스 종료 VmRSS | 223.3MiB | 391.4MiB | 144.0MiB | 151.9MiB |
+| PPL (4 window) | 19.903103* | 20.108306* | 20.463505* | 20.369400 |
+
+`*` PPL은 변경하지 않은 동일 바이너리의 §12 측정값을 재사용했다. tiled PPL은
+이번에 같은 WikiText 4 window, 총 4,092토큰으로 새로 측정했다. window별 PPL은
+12.700146 / 24.147175 / 21.198048 / 26.481465다. 기존 최적화 대비 -0.460%,
+int8 baseline 대비 +2.343%다. 4 window만으로 전반적인 품질 향상을 주장하지 않는다.
+
+decode는 기존 대비 **-0.49%**로 사실상 동일하며 int8 baseline이 여전히
+**3.91배 빠르다.** prefill +1.99%, TTFT -1.95% 역시 단회 측정의 관찰값이다.
+평균 decode step의 QNN 호출 합계는 88.666 → 89.890ms, host prepare는
+1.093 → 0.981ms, commit은 0.034 → 0.032ms다. 따라서 host 복사 시간을 줄이는
+것만으로 남은 차이를 해결할 수 없다. 기본 경로는 기존 untiled 구현으로 유지한다.
+
+메모리 결과는 구분해서 해석해야 한다.
+
+- 최종 prompt/token × part 2/3/4 모두 전체 FP16 K/V 복원 텐서가 없고,
+  최대 단일 FP16 codec 중간 텐서는 **512KiB**다. decode의 기존 1023토큰
+  텐서 2,095,104 bytes(약 2MiB) 대비 약 75% 작다. 전체 중간 텐서 합계나
+  NPU peak memory가 75% 감소했다는 뜻은 아니다.
+- 컴파일러 context metadata의 decode `spillFillBufferSize`는 part 2/3/4에서
+  2,555,904 / 2,686,976 / 2,424,832 bytes → **모두 0**으로 줄었다.
+  prefill은 6,815,744 / 6,815,744 / 5,767,168 →
+  5,308,416 / 5,308,416 / 4,325,376 bytes다. 이는 컴파일러가 보고한 buffer
+  요구량이지 실측 DDR 트래픽이나 전체 HTP peak allocation이 아니다.
+- 반대로 decode `opDataSize`는 part 2/3/4에서
+  12,167,168 / 12,185,088 / 11,122,432 →
+  19,411,968 / 19,501,568 / 17,041,920 bytes로 늘었다. 타일별 연산과
+  스케줄 자료가 증가했고, host VmRSS도 약 7.9MiB 증가했다.
+
+타일링은 전체 복원 텐서를 없애지만 **총 1023토큰의 unpack·centroid 복원·norm
+보정·dense inverse rotation 연산량은 줄이지 않는다.** 또한 tile마다 Slice,
+Concat, QK/AV, AV 누적이 추가된다. 이 결과는 그래프 tiling만으로 baseline과의
+속도 차이를 줄이지 못했음을 보여준다. 다음 속도 개선 후보는 실제 packed KV를
+소비하는 HTP custom fusion 또는 유효 cache 길이별 그래프 버킷이며, 이번에는
+구현하거나 성능을 입증하지 않았다.
+
+검증과 별도 detailed profile:
+
+- EOS는 11번째 토큰에서 정상 정지했다. 897토큰 prompt + 128토큰 생성으로
+  cache 1024/1024에 도달했고, 별도 reset 검증의 두 짧은 8토큰 세션은 token ID가
+  완전히 같았다. 이 기능 검증들의 시간 수치는 위 성능 표에 포함하지 않았다.
+- prefill과 decode 양쪽에서 28개 레이어의 tile 0/256/512/768 연산이 HTP
+  profile에 기록됐다. decode part 2/3/4의 accelerator execute 시간은
+  28.861 / 28.685 / 28.365ms다. 단일 custom fused kernel이 실행됐다는 뜻은 아니다.
+- decode op cycle 합계에서 KV 복원 경로가 차지하는 비중은 part별
+  77.2 / 77.2 / 73.8%로 여전히 크다. 여기서 복원 경로는
+  `tq_{key,value}_<layer>_tile<start>_` 아래 `dec_*`, `restored*`, packed/norm
+  Slice이며 encoder와 `tq_attn_*`는 제외했다. 이는 **op cycle 합계의 비중**이지
+  벽시계 시간의 비중이 아니다. 기존 runner의 `codec_op_cycles_sum`은 `tq_*`를
+  모두 세므로 새 `tq_attn_*`까지 포함한다. 이를 이전 codec 비중과 직접 비교하면
+  안 된다. detailed profile 실행의 큰 계측 오버헤드도 성능 수치에 섞지 않았다.
+- 관련 단위 테스트 **185개**와 변경 파일의 pre-commit 검사(mypy 포함)를 통과했다.
+
+산출물은 `~/.qaihm/tmp/turboquant/` 아래에 보존했다.
+
+- 최종 번들: `qwen3_1_7b_k4_v4_tiled256_int8_cl1024/`;
+  device bundle: `k4_v4_tiled256_cl1024`. part 1은 기존 최적화 번들과 동일하며
+  part 3/4의 별도 변환 디렉터리는 최종 번들에서 symlink로 참조한다.
+- `reports/perf_{baseline_int8_tiled_control_once,baseline_int16_tiled_control_once,k4_v4_optimized_tiled_control_once,k4_v4_tiled256_once}.json`:
+  구성당 1회의 원본 성능 결과.
+- `reports/quality_k4_v4_tiled256.json`, `reports/score_k4_v4_tiled256_w{0,1,2,3}.json`:
+  통합 PPL과 window별 NLL.
+- `reports/boundary_k4_v4_tiled256.json`: 모든 tile의 dtype·경계·복원 크기 검사 통과.
+- `reports/tiled256_int8_grid_comparison.json`: 6개 그래프의 KV Concat·QK·부분 AV
+  10,752개 encoding 비교가 모두 기존 calibrated grid와 일치한다.
+- `reports/invariants_k4_v4_tiled256.json`,
+  `reports/generation_{eos,boundary,reset}_k4_v4_tiled256.json`: 기능 검증 결과.
+- `reports/profile_k4_v4_tiled256.json`: 별도 prefill/decode HTP op profile.
+
+## 14. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

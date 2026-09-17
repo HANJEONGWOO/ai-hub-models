@@ -35,6 +35,9 @@ from qai_hub_models.models.templates.llm.turboquant.config import get_profile
 from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
     apply_kv_profile,
 )
+from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
+    tile_kv_attention,
+)
 
 DEFAULT_SDK = Path("~/qairt/2.48.0.260626").expanduser()
 DEFAULT_QNN_PYTHON = Path("~/qnn-venv/bin/python").expanduser()
@@ -110,6 +113,8 @@ def apply_profile(
     result = apply_kv_profile(
         model, json.loads(encodings.read_text()), config, seq_len, args.context_length
     )
+    if args.attention_tile:
+        result = tile_kv_attention(result, config, args.attention_tile)
     # Initializers keep their external-data location, so expose the weights file here.
     for data in onnx_path.parent.glob("*.data"):
         link = out / data.name
@@ -128,6 +133,7 @@ def apply_profile(
         "encodings_regridded": actions.count("regrid"),
         "tensors_duplicated": actions.count("duplicate"),
         "kv_paths": len(report["kv_paths"]),
+        "attention_tile": args.attention_tile,
     }
     return new_onnx, new_encodings, summary
 
@@ -285,6 +291,12 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--profile", default="baseline_int8")
+    parser.add_argument(
+        "--attention-tile",
+        type=int,
+        default=0,
+        help="Opt-in two-pass KV restore/attention tiling; 0 keeps the full restore.",
+    )
     parser.add_argument("--parts", type=int, nargs="*", default=[])
     parser.add_argument(
         "--sequence-lengths", type=int, nargs="+", default=list(SEQUENCE_LENGTHS)
@@ -293,6 +305,10 @@ def main() -> None:
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     args = parser.parse_args()
+    if args.attention_tile < 0:
+        parser.error("--attention-tile must be nonnegative")
+    if args.attention_tile and args.profile != "k4_v4":
+        parser.error("--attention-tile requires --profile k4_v4")
 
     split_dir = args.split_dir.expanduser()
     out = args.out.expanduser()
@@ -310,6 +326,7 @@ def main() -> None:
             "profile": args.profile,
             "config": config.to_dict(),
             "config_hash": config.config_hash(),
+            "attention_tile": args.attention_tile,
         }
     )
     report.setdefault("parts", {})

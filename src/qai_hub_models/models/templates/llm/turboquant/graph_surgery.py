@@ -127,12 +127,14 @@ class SurgeryResult:
     codec_io: list[CodecTensorIO] = field(default_factory=list)
     edits: list[EncodingEdit] = field(default_factory=list)
     paths: list[KVPath] = field(default_factory=list)
+    attention_tiles: list[dict[str, Any]] = field(default_factory=list)
 
     def report(self) -> dict[str, Any]:
         return {
             "codec_io": [io.to_dict() for io in self.codec_io],
             "encoding_edits": [e.to_dict() for e in self.edits],
             "kv_paths": [p.to_dict() for p in self.paths],
+            "attention_tiles": self.attention_tiles,
         }
 
 

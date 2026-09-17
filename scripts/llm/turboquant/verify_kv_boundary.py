@@ -263,7 +263,10 @@ def walk_forward(
 
 
 def check_graph(
-    info: DlcInfo, config: TurboQuantConfig, baseline: DlcInfo | None
+    info: DlcInfo,
+    config: TurboQuantConfig,
+    baseline: DlcInfo | None,
+    read_start_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     layers = sorted(
         {
@@ -392,6 +395,7 @@ def check_graph(
                     )
                 read_start = f"past_{kind}_{layer}_in"
 
+            read_start = (read_start_overrides or {}).get(read_start, read_start)
             if read_start not in info.consumers:
                 violations.append(f"{read_start}: no consumers")
             else:
@@ -429,7 +433,10 @@ def check_graph(
                         at_matmul = (
                             c["op_type"] == "MatMul"
                             and not conv_dtypes - INT8_TYPES
-                            and b["from"].startswith("cat_")
+                            and (
+                                b["from"].startswith("cat_")
+                                or b["from"].endswith(("_key_cat", "_value_cat"))
+                            )
                         )
                         entry["attention_int8_at"] = (
                             "concat_inputs" if at_concat else "concat_output"
