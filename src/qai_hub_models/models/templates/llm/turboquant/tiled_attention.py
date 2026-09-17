@@ -6,6 +6,8 @@
 
 K tiles feed QK immediately; only scores are concatenated for the unchanged
 global masked softmax. V tiles feed partial AV products, which are summed.
+The opt-in rotated variant moves inverse rotations from cached KV to Q/output
+and uses format-2 effective scales without decode-time norm correction.
 No full restored K/V tensor is retained. This is graph tiling, not a claim
 that QAIRT fuses the resulting operations into a single kernel.
 """
@@ -23,12 +25,14 @@ from onnx import helper, numpy_helper
 from qai_hub_models.models.templates.llm.turboquant.config import TurboQuantConfig
 from qai_hub_models.models.templates.llm.turboquant.export import (
     Subgraph,
+    _rotation_name,
     decode_subgraph,
 )
 from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
     CodecTensorIO,
     SurgeryResult,
     _GraphIndex,
+    regrid_encoding,
 )
 
 
@@ -136,7 +140,12 @@ def _slice(sg: Subgraph, src: str, dst: str, start: int, stop: int, axis: int) -
 
 
 def _restore_tile(
-    sg: Subgraph, io: CodecTensorIO, config: TurboQuantConfig, start: int, stop: int
+    sg: Subgraph,
+    io: CodecTensorIO,
+    config: TurboQuantConfig,
+    start: int,
+    stop: int,
+    rotated: bool = False,
 ) -> str:
     prefix = f"tq_{io.kind}_{io.layer}_tile{start}_"
     packed = _slice(sg, io.packed_in, prefix + "packed", start, stop, 2)
@@ -152,6 +161,7 @@ def _restore_tile(
             (io.num_kv_heads, 1),
             stop - start,
             prefix + "dec_",
+            rotated=rotated,
         )
     )
     if io.kind == "key":
@@ -189,13 +199,21 @@ def _prune(model: onnx.ModelProto) -> None:
 
 
 def tile_kv_attention(
-    result: SurgeryResult, config: TurboQuantConfig, tile_tokens: int
+    result: SurgeryResult,
+    config: TurboQuantConfig,
+    tile_tokens: int,
+    *,
+    rotated: bool = False,
 ) -> SurgeryResult:
     """Return a tiled copy; reject unsupported attention patterns instead of falling back."""
     if not config.key.is_polar or not config.value.is_polar:
         raise ValueError("Tiled attention requires both K and V to use the codec.")
     if tile_tokens < 1 or not result.codec_io:
         raise ValueError("Tiled attention needs a positive tile size and codec I/O.")
+    if rotated and not config.precomputed_norm:
+        raise ValueError(
+            "Rotated attention requires the precomputed-scale cache format."
+        )
     result = copy.deepcopy(result)
     graph = result.model.graph
     index = _GraphIndex(graph)
@@ -215,7 +233,7 @@ def tile_kv_attention(
         ios = {io.kind: io for io in result.codec_io if io.layer == layer}
         key_io, value_io = ios["key"], ios["value"]
         past, seq = key_io.past_tokens, key_io.new_tokens
-        if tile_tokens >= past:
+        if tile_tokens >= past and not rotated:
             raise ValueError(
                 f"Tile size {tile_tokens} does not tile the {past}-token cache."
             )
@@ -225,11 +243,49 @@ def tile_kv_attention(
         score_chunks: dict[str, list[str]] = {qk.output[0]: [] for qk, _ in pairs}
         accumulated: dict[str, str] = {}
         tile_report: list[dict[str, Any]] = []
+        queries: dict[str, str] = {}
+        current: dict[tuple[int, str], str] = {}
+        if rotated:
+            for head in heads:
+                prefix = f"tq_attn_{layer}_head{head.head}_"
+                for kind, sg, original in (
+                    ("key", keys, head.key),
+                    ("value", values, head.value),
+                ):
+                    src = original.input[1]
+                    if src in acts and acts[src]["bw"] == 8:
+                        acts[src] = regrid_encoding(acts[src])
+                    if kind == "key":
+                        sg.node(
+                            "Transpose",
+                            [src],
+                            [prefix + "current_key"],
+                            perm=[0, 1, 3, 2],
+                        )
+                        src = prefix + "current_key"
+                    dest = prefix + kind + "_rotated"
+                    sg.node(
+                        "MatMul",
+                        [src, _rotation_name(sg, config, getattr(config, kind), True)],
+                        [dest],
+                    )
+                    if kind == "key":
+                        sg.node("Transpose", [dest], [dest + "_hub"], perm=[0, 1, 3, 2])
+                        dest += "_hub"
+                    current[head.head, kind] = dest
+                for group, (qk, _) in enumerate(head.products):
+                    dest = prefix + f"q{group}_rotated"
+                    keys.node(
+                        "MatMul",
+                        [qk.input[0], _rotation_name(keys, config, config.key, True)],
+                        [dest],
+                    )
+                    queries[qk.output[0]] = dest
         for start in range(0, past, tile_tokens):
             stop = min(start + tile_tokens, past)
             last = stop == past
-            k = _restore_tile(keys, key_io, config, start, stop)
-            v = _restore_tile(values, value_io, config, start, stop)
+            k = _restore_tile(keys, key_io, config, start, stop, rotated)
+            v = _restore_tile(values, value_io, config, start, stop, rotated)
             tile_cats: dict[str, list[str]] = {"key": [], "value": []}
             for head in heads:
                 prefix = f"tq_attn_{layer}_tile{start}_head{head.head}_"
@@ -247,17 +303,21 @@ def tile_kv_attention(
                         0,
                     )
                     # QAIRT needs the Slice grid too; tagging only Concat promotes KV to 16-bit.
-                    encoding(original.input[0], sliced)
+                    if not rotated:
+                        encoding(original.input[0], sliced)
                     cat = prefix + kind + "_cat"
-                    # A mixed-input Concat retains the original attention int8 boundary.
-                    sg.node("Concat", [sliced, original.input[1]], [cat], axis=axis)
-                    encoding(original.output[0], cat)
+                    # The legacy path needs mixed-input Concat for its int8 boundary.
+                    present = current[head.head, kind] if rotated else original.input[1]
+                    sg.node("Concat", [sliced, present], [cat], axis=axis)
+                    if not rotated:
+                        encoding(original.output[0], cat)
                     cats[kind] = cat
                     tile_cats[kind].append(cat)
                 for group, (qk, av) in enumerate(head.products):
                     stem = prefix + f"q{group}_"
                     score = stem + "score"
-                    keys.node("MatMul", [qk.input[0], cats["key"]], [score])
+                    query = queries[qk.output[0]] if rotated else qk.input[0]
+                    keys.node("MatMul", [query, cats["key"]], [score])
                     encoding(qk.output[0], score)
                     if not last:
                         score = _slice(
@@ -285,12 +345,13 @@ def tile_kv_attention(
                         prob = padded
                     partial = stem + "partial"
                     values.node("MatMul", [prob, cats["value"]], [partial])
-                    encoding(av.output[0], partial)
+                    if not rotated:
+                        encoding(av.output[0], partial)
                     previous = accumulated.get(av.output[0])
                     if previous is None:
                         accumulated[av.output[0]] = partial
                     else:
-                        total = av.output[0] if last else stem + "sum"
+                        total = av.output[0] if last and not rotated else stem + "sum"
                         values.node("Add", [previous, partial], [total])
                         accumulated[av.output[0]] = total
             tile_report.append(
@@ -304,6 +365,16 @@ def tile_kv_attention(
             )
         for qk, _ in pairs:
             keys.node("Concat", score_chunks[qk.output[0]], list(qk.output), axis=3)
+        if rotated:
+            for _, av in pairs:
+                values.node(
+                    "MatMul",
+                    [
+                        accumulated[av.output[0]],
+                        _rotation_name(values, config, config.value, False),
+                    ],
+                    list(av.output),
+                )
         qks, avs = [qk for qk, _ in pairs], [av for _, av in pairs]
         insertions[max(qks, key=lambda n: positions[n.output[0]]).output[0]] = (
             keys.nodes
@@ -322,7 +393,9 @@ def tile_kv_attention(
                 "new_tokens": seq,
                 "kv_heads": key_io.num_kv_heads,
                 "query_heads": len(pairs),
-                "strategy": "two_pass_tiled_global_softmax",
+                "strategy": "rotated_precomputed_scale"
+                if rotated
+                else "two_pass_tiled_global_softmax",
                 "tiles": tile_report,
             }
         )

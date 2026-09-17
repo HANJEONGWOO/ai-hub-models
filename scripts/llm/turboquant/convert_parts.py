@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -66,7 +67,7 @@ def input_shape(
         return [int(onnx_dims[0]), 1, int(onnx_dims[2]), past]
     if re.fullmatch(r"past_value_\d+_in", name):
         return [int(onnx_dims[0]), 1, past, int(onnx_dims[3])]
-    if re.fullmatch(r"tq_(key|value)_\d+_(packed|norm)_in", name):
+    if re.fullmatch(r"tq_(key|value)_\d+_(packed|norm|scale)_in", name):
         return [int(onnx_dims[0]), 1, past, int(onnx_dims[3])]
     if len(onnx_dims) == 3:
         return [1, seq_len, int(onnx_dims[2])]
@@ -114,7 +115,9 @@ def apply_profile(
         model, json.loads(encodings.read_text()), config, seq_len, args.context_length
     )
     if args.attention_tile:
-        result = tile_kv_attention(result, config, args.attention_tile)
+        result = tile_kv_attention(
+            result, config, args.attention_tile, rotated=args.rotated_attention
+        )
     # Initializers keep their external-data location, so expose the weights file here.
     for data in onnx_path.parent.glob("*.data"):
         link = out / data.name
@@ -134,6 +137,7 @@ def apply_profile(
         "tensors_duplicated": actions.count("duplicate"),
         "kv_paths": len(report["kv_paths"]),
         "attention_tile": args.attention_tile,
+        "rotated_attention": args.rotated_attention,
     }
     return new_onnx, new_encodings, summary
 
@@ -291,6 +295,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--profile", default="baseline_int8")
+    parser.add_argument("--context-buckets", type=int, nargs="+", default=[])
+    parser.add_argument("--rotated-attention", action="store_true")
     parser.add_argument(
         "--attention-tile",
         type=int,
@@ -307,8 +313,15 @@ def main() -> None:
     args = parser.parse_args()
     if args.attention_tile < 0:
         parser.error("--attention-tile must be nonnegative")
-    if args.attention_tile and args.profile != "k4_v4":
-        parser.error("--attention-tile requires --profile k4_v4")
+    if args.attention_tile and args.profile not in ("k4_v4", "k4_v4_scaled"):
+        parser.error("--attention-tile requires a k4_v4 profile")
+    if args.rotated_attention and (
+        args.profile != "k4_v4_scaled" or not args.attention_tile
+    ):
+        parser.error("--rotated-attention requires k4_v4_scaled and --attention-tile")
+    buckets = sorted({*args.context_buckets, args.context_length})
+    if any(c <= 1 or c > args.context_length for c in buckets):
+        parser.error("context buckets must be in [2, context-length]")
 
     split_dir = args.split_dir.expanduser()
     out = args.out.expanduser()
@@ -327,6 +340,8 @@ def main() -> None:
             "config": config.to_dict(),
             "config_hash": config.config_hash(),
             "attention_tile": args.attention_tile,
+            "rotated_attention": args.rotated_attention,
+            "context_buckets": buckets,
         }
     )
     report.setdefault("parts", {})
@@ -339,13 +354,18 @@ def main() -> None:
         encodings = bundle / f"{info['class']}.encodings"
         entry: dict[str, Any] = {"graphs": {}}
         names = []
-        for seq_len in args.sequence_lengths:
-            name = graph_name(seq_len, args.context_length, part_id, num_parts)
-            entry["graphs"][name] = convert_graph(
-                args, onnx_path, encodings, name, seq_len, out, env
-            )
-            names.append(name)
-            print(f"{part_name}: converted {name} {entry['graphs'][name]}", flush=True)
+        for context in buckets:
+            graph_args = copy.copy(args)
+            graph_args.context_length = context
+            for seq_len in args.sequence_lengths:
+                if seq_len >= context:
+                    continue
+                name = graph_name(seq_len, context, part_id, num_parts)
+                entry["graphs"][name] = convert_graph(
+                    graph_args, onnx_path, encodings, name, seq_len, out, env
+                )
+                names.append(name)
+                print(f"{part_name}: converted {name}", flush=True)
         if not args.skip_context:
             entry["context_s"] = build_context(args, names, part_name, out, env)
             print(f"{part_name}: context {entry['context_s']:.0f}s", flush=True)

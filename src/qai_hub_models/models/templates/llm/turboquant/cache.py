@@ -2,13 +2,14 @@
 # Copyright (c) 2026 Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
-"""Host-side packed KV cache for the Qwen3 delta-cache ABI (format version 1).
+"""Host-side packed KV cache for the Qwen3 delta-cache ABI (formats 1 and 2).
 
 The exported graphs return only the new tokens' KV in hub layout, key
 ``(kv_heads, batch, head_dim, new)`` and value ``(kv_heads, batch, new, head_dim)``.
 This cache encodes just those tokens and keeps them packed in preallocated
 ``capacity``-sized buffers laid out ``(kv_heads, batch, token, bytes)`` for both
 K and V, so the token axis is always -2 regardless of the hub layout.
+Format 1 stores original norms; format 2 stores norm-corrected effective scales.
 
 ``BASELINE`` tensors are kept as float32, exactly what the existing host
 generator stores; their int8 treatment happens inside the deployed graph.
@@ -25,7 +26,6 @@ import torch
 
 from qai_hub_models.models.templates.llm.turboquant.config import (
     FORMAT_NAME,
-    FORMAT_VERSION,
     KVCodecSpec,
     TurboQuantConfig,
 )
@@ -86,7 +86,11 @@ class PackedKVStore:
         self.raw: np.ndarray | None = None
         if spec.is_polar:
             self.codec = PolarQuantReference(
-                spec, config.block_size, config.rotation, config.norm_correction
+                spec,
+                config.block_size,
+                config.rotation,
+                config.norm_correction,
+                config.precomputed_norm,
             )
             self.packed = np.zeros(
                 (*lead, packed_nbytes(head_dim, spec.bits)), np.uint8
@@ -275,7 +279,7 @@ class TurboQuantKVCache:
         """Snapshot (copied buffers) tagged with the format and config hash."""
         return {
             "format": FORMAT_NAME,
-            "format_version": FORMAT_VERSION,
+            "format_version": self.config.format_version,
             "config_hash": self.config.config_hash(),
             "shape": [self.num_layers, self.num_kv_heads, self.head_dim],
             "context_length": self.context_length,
@@ -291,11 +295,11 @@ class TurboQuantKVCache:
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
         if state.get("format") != FORMAT_NAME or (
-            state.get("format_version") != FORMAT_VERSION
+            state.get("format_version") != self.config.format_version
         ):
             raise ValueError(
                 f"Cache state format {state.get('format')} v{state.get('format_version')} "
-                f"is not {FORMAT_NAME} v{FORMAT_VERSION}."
+                f"is not {FORMAT_NAME} v{self.config.format_version}."
             )
         if state.get("config_hash") != self.config.config_hash():
             raise ValueError(

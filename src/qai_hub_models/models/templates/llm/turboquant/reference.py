@@ -162,12 +162,14 @@ class PolarQuantReference:
         block_size: int = 128,
         rotation: Rotation = Rotation.FWHT,
         norm_correction: bool = True,
+        precomputed_norm: bool = False,
     ) -> None:
         if not spec.is_polar:
             raise ValueError("PolarQuantReference needs a POLAR codec spec.")
         self.spec = spec
         self.block_size = block_size
         self.norm_correction = norm_correction
+        self.precomputed_norm = precomputed_norm
         self.centroids = load_codebook(spec.bits, block_size)
         self.boundaries = load_boundaries(spec.bits, block_size)
         self.rotation = make_rotation(rotation, spec.seed, block_size)
@@ -192,7 +194,11 @@ class PolarQuantReference:
     def encode(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """``(indices uint8 [..., d], norms float64 [..., 1])``."""
         y, norms = self.rotate_normalized(x)
-        return nearest_centroid_indices(y, self.boundaries), norms
+        indices = nearest_centroid_indices(y, self.boundaries)
+        if self.precomputed_norm and self.norm_correction:
+            lengths = np.linalg.norm(self.centroids[indices], axis=-1, keepdims=True)
+            norms = norms / np.where(lengths > NORM_CORRECTION_EPS, lengths, 1.0)
+        return indices, norms
 
     def decode(self, indices: np.ndarray, norms: np.ndarray) -> np.ndarray:
         indices = np.asarray(indices)
@@ -201,7 +207,7 @@ class PolarQuantReference:
                 f"Index {int(indices.max())} out of range for {self.spec.bits}-bit codebook."
             )
         y_hat = self.centroids[indices.astype(np.intp)]
-        if self.norm_correction:
+        if self.norm_correction and not self.precomputed_norm:
             lengths = np.linalg.norm(y_hat, axis=-1, keepdims=True)
             y_hat = y_hat / np.where(lengths > NORM_CORRECTION_EPS, lengths, 1.0)
         return self.rotation.inverse(y_hat) * np.asarray(norms, dtype=np.float64)

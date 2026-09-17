@@ -31,6 +31,7 @@ struct Args {
   std::string system = "libQnnSystem.so";
   std::vector<std::string> bins;
   int contextLength = 1024;
+  std::vector<int> contextBuckets;
   std::string rope;
   int ropeHalf = 64;
   std::string mode = "generate";
@@ -79,6 +80,7 @@ Args parseArgs(int argc, char** argv) {
   a.system = get("--system", a.system);
   a.bins = split(get("--bins", ""), ',');
   a.contextLength = std::stoi(get("--context-length", std::to_string(a.contextLength)));
+  for (const auto& c : split(get("--context-buckets", ""), ',')) a.contextBuckets.push_back(std::stoi(c));
   a.rope = get("--rope", "");
   a.ropeHalf = std::stoi(get("--rope-half", std::to_string(a.ropeHalf)));
   a.mode = get("--mode", a.mode);
@@ -200,6 +202,7 @@ std::string stepJson(const StepRecord& r, const char* kind) {
   Json j;
   j.str("kind", kind);
   j.num("ar", r.ar);
+  j.num("graph_context", r.graphContext);
   j.num("new_tokens", r.newTokens);
   j.num("cached_before", static_cast<double>(r.cachedBefore));
   j.num("prepare_s", r.prepareSeconds);
@@ -280,6 +283,7 @@ int main(int argc, char** argv) {
     options.bins = args.bins;
     options.contextLength = args.contextLength;
     options.graphSuffix = args.graphSuffix;
+    options.contextBuckets = args.contextBuckets;
     LlmSession session(rt, options, rope);
     memSamples.push_back("{\"at\": \"contexts_loaded\", \"mem\": " + memJson(readProcStatus()) + "}");
 

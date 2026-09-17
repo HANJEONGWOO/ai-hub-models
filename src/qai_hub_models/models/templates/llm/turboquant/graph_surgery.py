@@ -591,13 +591,14 @@ def apply_kv_profile(
         if spec.is_int16:
             continue
 
+        scalar = "scale" if config.precomputed_norm else "norm"
         io = CodecTensorIO(
             kind=kind,
             layer=layer,
             packed_in=f"tq_{kind}_{layer}_packed_in",
-            norm_in=f"tq_{kind}_{layer}_norm_in",
+            norm_in=f"tq_{kind}_{layer}_{scalar}_in",
             packed_out=f"tq_{kind}_{layer}_packed_out",
-            norm_out=f"tq_{kind}_{layer}_norm_out",
+            norm_out=f"tq_{kind}_{layer}_{scalar}_out",
             num_kv_heads=heads,
             past_tokens=past,
             new_tokens=seq_len,

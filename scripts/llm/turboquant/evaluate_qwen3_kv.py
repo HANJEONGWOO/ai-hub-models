@@ -116,7 +116,11 @@ class PackedPastCache(Cache):
             if not spec.is_polar:
                 return None
             return PolarQuantReference(
-                spec, config.block_size, config.rotation, config.norm_correction
+                spec,
+                config.block_size,
+                config.rotation,
+                config.norm_correction,
+                config.precomputed_norm,
             )
 
         super().__init__(
@@ -158,7 +162,13 @@ def kv_statistics(cache: Cache, config: TurboQuantConfig) -> dict[str, Any]:
     stats: dict[str, Any] = {}
     for name in ("key", "value"):
         spec = getattr(config, name)
-        codec = PolarQuantReference(spec, config.block_size)
+        codec = PolarQuantReference(
+            spec,
+            config.block_size,
+            config.rotation,
+            config.norm_correction,
+            config.precomputed_norm,
+        )
         per_layer = []
         max_norm = 0.0
         near_boundary = 0
@@ -169,8 +179,9 @@ def kv_statistics(cache: Cache, config: TurboQuantConfig) -> dict[str, Any]:
             x = states.to("cpu", torch.float64).numpy()
             y, norms = codec.rotate_normalized(x)
             indices = np.searchsorted(codec.boundaries, y, side="left").astype(np.uint8)
-            fits = float(norms.max()) <= FLOAT16_MAX
-            stored = to_storage_norms(norms, config.norm_dtype if fits else "float32")
+            scalars = codec.encode(x)[1] if config.precomputed_norm else norms
+            fits = float(scalars.max()) <= FLOAT16_MAX
+            stored = to_storage_norms(scalars, config.norm_dtype if fits else "float32")
             row = reconstruction_stats(x, codec.decode(indices, stored))
             row["layer"] = layer_idx
             row["max_norm"] = float(norms.max())

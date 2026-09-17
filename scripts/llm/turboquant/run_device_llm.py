@@ -178,6 +178,21 @@ def cmd_push(args: argparse.Namespace) -> None:
             {"name": local.name, "sha256": sha256_file(local), "pushed": changed}
         )
         print(f"{local.name}: {'pushed' if changed else 'up to date'}", flush=True)
+    conversion = bundle / "convert_report.json"
+    metadata = json.loads(conversion.read_text()) if conversion.exists() else {}
+    runtime = bundle / "runtime_manifest.json"
+    runtime.write_text(
+        json.dumps(
+            {
+                k: metadata[k]
+                for k in ("context_length", "context_buckets", "config_hash", "config")
+                if k in metadata
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    push_if_changed(args, runtime, f"{remote_bundle}/runtime_manifest.json")
     (bundle / f"device_push_{args.name}.json").write_text(
         json.dumps(manifest, indent=2) + "\n"
     )
@@ -193,6 +208,16 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     remote_bundle = f"{DEVICE_ROOT}/bundles/{args.name}"
     listing = adb(args, "shell", f"ls {remote_bundle}").split()
+    runtime = (
+        json.loads(adb(args, "shell", "cat", f"{remote_bundle}/runtime_manifest.json"))
+        if "runtime_manifest.json" in listing
+        else {}
+    )
+    if (
+        runtime.get("context_length", assets["context_length"])
+        != assets["context_length"]
+    ):
+        raise ValueError("Bundle and assets context lengths differ.")
     bins = sorted((b for b in listing if re.fullmatch(r"part\d+_of_\d+\.bin", b)),
                   key=lambda b: int(re.search(r"part(\d+)", b).group(1)))  # fmt: skip
     tokens = args.tokens or (
@@ -213,6 +238,16 @@ def cmd_run(args: argparse.Namespace) -> None:
     ]
     if args.stop_on_eos:
         runner_args.append("--stop-on-eos")
+    buckets = args.context_buckets or runtime.get("context_buckets", [])
+    if buckets:
+        buckets = sorted({*buckets, assets["context_length"]})
+        available = set(runtime.get("context_buckets", [assets["context_length"]]))
+        if runtime and not set(buckets).issubset(available):
+            raise ValueError(
+                "Requested context buckets are not present in this bundle."
+            )
+    if buckets:
+        runner_args.append("--context-buckets " + ",".join(map(str, buckets)))
     if args.graph_suffix:
         runner_args.append(f"--graph-suffix {args.graph_suffix}")
     if args.dump_logits:
@@ -248,6 +283,9 @@ def cmd_run(args: argparse.Namespace) -> None:
         "fingerprint": adb(args, "shell", "getprop", "ro.build.fingerprint").strip(),
     }
     report["bundle_name"] = args.name
+    report["context_buckets"] = buckets or [assets["context_length"]]
+    if runtime.get("config_hash"):
+        report["config_hash"] = runtime["config_hash"]
     report["assets"] = {
         k: assets[k] for k in ("context_length", "prompt", "prompt_tokens")
     }
@@ -283,6 +321,7 @@ def main() -> None:
     run.add_argument("--n-gen", type=int, default=128)
     run.add_argument("--stop-on-eos", action="store_true")
     run.add_argument("--graph-suffix", default="")
+    run.add_argument("--context-buckets", type=int, nargs="+", default=[])
     run.add_argument("--dump-logits", action="store_true")
     run.add_argument("--profile-decode-step", type=int, default=-1)
     run.add_argument("--profile-prefill", action="store_true")

@@ -91,8 +91,9 @@ def sha256_file(path: Path) -> str:
 def graph_specs(
     token_counts: tuple[int, ...] = TOKEN_COUNTS,
     operations: tuple[str, ...] = ("encode", "decode"),
+    profile: str = PROFILE,
 ) -> list[dict[str, Any]]:
-    config = get_profile(PROFILE)
+    config = get_profile(profile)
     graphs = []
     for which in ("key", "value"):
         for tokens in token_counts:
@@ -109,10 +110,18 @@ def graph_specs(
     return graphs
 
 
-def codec_for(which: str) -> tuple[KVCodecSpec, PolarQuantReference]:
-    config = get_profile(PROFILE)
+def codec_for(
+    which: str, profile: str = PROFILE
+) -> tuple[KVCodecSpec, PolarQuantReference]:
+    config = get_profile(profile)
     spec = getattr(config, which)
-    return spec, PolarQuantReference(spec, config.block_size)
+    return spec, PolarQuantReference(
+        spec,
+        config.block_size,
+        config.rotation,
+        config.norm_correction,
+        config.precomputed_norm,
+    )
 
 
 def range_case(tokens: int, seed: int) -> np.ndarray:
@@ -137,7 +146,9 @@ def range_case(tokens: int, seed: int) -> np.ndarray:
     return rows.reshape(1, HEADS, tokens, D)
 
 
-def encode_cases(snapshot: Any, which: str, tokens: int) -> dict[str, np.ndarray]:
+def encode_cases(
+    snapshot: Any, which: str, tokens: int, range_scale: float = 1.0
+) -> dict[str, np.ndarray]:
     """Real Qwen3 KV (first and last layer) plus the input-domain range case."""
     kind = "keys" if which == "key" else "values"
     start = 0 if tokens > 1 else 128
@@ -149,9 +160,11 @@ def encode_cases(snapshot: Any, which: str, tokens: int) -> dict[str, np.ndarray
         positions = np.arange(start, start + tokens) % values.shape[1]
         cases[f"layer{layer}"] = np.take(values, positions, axis=1)[None]
     cases["range"] = range_case(tokens, seed=tokens * 10 + (which == "value"))
-    return {
+    cases = {
         name: np.ascontiguousarray(x, dtype=np.float32) for name, x in cases.items()
     }
+    cases["range"] *= range_scale
+    return cases
 
 
 def qairt_env(sdk: Path, qnn_python: Path) -> dict[str, str]:
@@ -185,9 +198,10 @@ def cmd_build(args: argparse.Namespace) -> None:
         (work / sub).mkdir(parents=True, exist_ok=True)
     snapshot = np.load(args.snapshot)
     env = qairt_env(args.sdk, args.qnn_python)
-    config = get_profile(PROFILE)
+    config = get_profile(args.profile)
     manifest: dict[str, Any] = {
-        "profile": PROFILE,
+        "profile": args.profile,
+        "range_scale": args.range_scale,
         "head_major": args.head_major,
         "config": config.to_dict(),
         "config_hash": config.config_hash(),
@@ -199,9 +213,9 @@ def cmd_build(args: argparse.Namespace) -> None:
         "graphs": {},
     }
 
-    for g in graph_specs(tuple(args.tokens), tuple(args.operations)):
+    for g in graph_specs(tuple(args.tokens), tuple(args.operations), args.profile):
         name = g["name"]
-        spec, codec = codec_for(g["which"])
+        spec, codec = codec_for(g["which"], args.profile)
         builder = build_encode_model if g["op"] == "encode" else build_decode_model
         model = builder(
             config,
@@ -214,7 +228,7 @@ def cmd_build(args: argparse.Namespace) -> None:
         onnx_path = work / "onnx" / f"{name}.onnx"
         onnx.save(model, onnx_path)
 
-        cases = encode_cases(snapshot, g["which"], g["tokens"])
+        cases = encode_cases(snapshot, g["which"], g["tokens"], args.range_scale)
         input_lines, ort_reports = [], {}
         for case, x in cases.items():
             if args.head_major:
@@ -540,6 +554,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
     work: Path = args.work_dir
     manifest = json.loads((work / "manifest.json").read_text())
     runs = json.loads((work / "device_runs.json").read_text())
+    profile = manifest["profile"]
+    if get_profile(profile).config_hash() != manifest["config_hash"]:
+        raise ValueError("Validation manifest and current codec config differ.")
     report: dict[str, Any] = {
         "scope": "S26 HTP execution of standalone codec graphs (P2); not full-model integration",
         "tolerance": HTP_FP16.__dict__,
@@ -550,7 +567,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     all_passed = True
     lead = (HEADS, 1) if manifest.get("head_major", False) else (1, HEADS)
     for name, info in manifest["graphs"].items():
-        spec, codec = codec_for(info["which"])
+        spec, codec = codec_for(info["which"], profile)
         tokens = info["tokens"]
         entry: dict[str, Any] = {"cases": {}, "profiles": {}}
         for level in PROFILING_LEVELS:
@@ -615,6 +632,13 @@ def main() -> None:
     parser.add_argument("stage", choices=["build", "run", "compare", "all"])
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--profile", choices=["k4_v4", "k4_v4_scaled"], default=PROFILE)
+    parser.add_argument(
+        "--range-scale",
+        type=float,
+        default=1.0,
+        help="Scale only synthetic range inputs; use 0.5 for bounded effective-scale probes.",
+    )
     parser.add_argument("--tokens", type=int, nargs="+", default=list(TOKEN_COUNTS))
     parser.add_argument(
         "--head-major",
@@ -634,6 +658,8 @@ def main() -> None:
     args = parser.parse_args()
     if any(tokens < 1 for tokens in args.tokens):
         parser.error("--tokens must be positive")
+    if not 0 < args.range_scale <= 1:
+        parser.error("--range-scale must be in (0, 1]")
     args.work_dir = args.work_dir.expanduser()
     args.snapshot = args.snapshot.expanduser()
     if args.stage in ("build", "all"):

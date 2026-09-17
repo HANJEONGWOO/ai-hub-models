@@ -102,6 +102,7 @@ class TurboQuantConfig:
     norm_dtype: str = "float16"
     bit_order: str = "msb_first"
     format_version: int = FORMAT_VERSION
+    precomputed_norm: bool = False
     reference_commit: str = field(default=REFERENCE_COMMIT)
 
     def __post_init__(self) -> None:
@@ -109,10 +110,11 @@ class TurboQuantConfig:
             raise ValueError(f"Unsupported norm dtype {self.norm_dtype}.")
         if self.bit_order != "msb_first":
             raise ValueError(f"Unsupported bit order {self.bit_order}.")
-        if self.format_version != FORMAT_VERSION:
+        expected_version = 2 if self.precomputed_norm else FORMAT_VERSION
+        if self.format_version != expected_version:
             raise ValueError(
                 f"Config format version {self.format_version} does not match "
-                f"this implementation ({FORMAT_VERSION})."
+                f"this norm representation ({expected_version})."
             )
         for spec in self.codecs:
             if not spec.is_polar:
@@ -153,12 +155,12 @@ class TurboQuantConfig:
         if head_dim & (head_dim - 1) or head_dim <= 0:
             raise ValueError(
                 f"head_dim={head_dim} is not a power of two; FWHT padding is not "
-                "supported in format version 1."
+                f"supported in format version {self.format_version}."
             )
         if head_dim != self.block_size:
             raise ValueError(
                 f"head_dim={head_dim} must equal block_size={self.block_size} "
-                "in format version 1 (one norm per head vector)."
+                f"in format version {self.format_version} (one scalar per head vector)."
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -176,6 +178,8 @@ class TurboQuantConfig:
             "qjl": False,
             "reference_commit": self.reference_commit,
         }
+        if self.precomputed_norm:
+            data["norm_representation"] = "effective_scale"
         for name, spec in (("key", self.key), ("value", self.value)):
             if spec.is_polar:
                 data[name]["codebook_sha256"] = CODEBOOK_SHA256[
@@ -201,6 +205,13 @@ PROFILES: dict[str, TurboQuantConfig] = {
     "baseline_int8": TurboQuantConfig("baseline_int8", BASELINE, BASELINE),
     "baseline_int16_kv": TurboQuantConfig("baseline_int16_kv", INT16, INT16),
     "k4_v4": TurboQuantConfig("k4_v4", _polar(4, KEY_SEED), _polar(4, VALUE_SEED)),
+    "k4_v4_scaled": TurboQuantConfig(
+        "k4_v4_scaled",
+        _polar(4, KEY_SEED),
+        _polar(4, VALUE_SEED),
+        format_version=2,
+        precomputed_norm=True,
+    ),
     "k8_v3": TurboQuantConfig("k8_v3", BASELINE, _polar(3, VALUE_SEED)),
     "k4_v3": TurboQuantConfig("k4_v3", _polar(4, KEY_SEED), _polar(3, VALUE_SEED)),
 }

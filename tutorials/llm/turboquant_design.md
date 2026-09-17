@@ -785,6 +785,179 @@ Concat, QK/AV, AV 누적이 추가된다. 이 결과는 그래프 tiling만으�
   `reports/generation_{eos,boundary,reset}_k4_v4_tiled256.json`: 기능 검증 결과.
 - `reports/profile_k4_v4_tiled256.json`: 별도 prefill/decode HTP op profile.
 
-## 14. 출처
+## 14. 2026-09-17 유효 길이 버킷·회전 이동·scale 사전 계산
+
+### 14.1 선택형 구현과 호환성
+
+새 `k4_v4_scaled` profile, `--rotated-attention --attention-tile 256` 및
+`--context-buckets 128 256 512 1024`를 함께 사용한다. 기존 `k4_v4`, format 1,
+단일 CL1024 runner 동작은 유지한다. 명령은 도구 README에 있다.
+
+- **유효 길이 버킷:** runner가 `cached <= C - AR`인 가장 작은 C를 고른다.
+  AR1의 past 용량은 127/255/511/1023, AR128은 CL256/512/1024에서
+  128/384/896이다. AR128/CL128은 past 용량이 0이므로 생성하지 않는다.
+  따라서 선택한 버킷 내부의 padding은 여전히 계산한다. 정확히 n토큰만
+  처리하는 동적 커널이나 모델의 context window 축소가 아니다.
+- host cache는 1024토큰 용량과 절대 위치를 유지한다. graph I/O만 선택한
+  길이로 줄이고 유효 KV를 오른쪽에 정렬한다. 버킷이 바뀔 때 cache row stride는
+  계속 1024이며 RoPE 위치도 초기화하지 않는다. 단계별 `graph_context`를 기록한다.
+- **회전 위치 변경:** 행벡터 표기로 복원값이 `K = K_r R_K`, `V = V_r R_V`일 때
+  `Q K^T = (Q R_K^T) K_r^T`, `A V = (A V_r) R_V`를 이용한다. 과거 KV 벡터의
+  역회전을 제거하고 query와 누적 attention output만 변환한다. 현재 K/V도
+  attention용으로 회전하며, 새 토큰의 cache encoder 회전은 별도로 남는다.
+- 전역 mask/softmax와 past→current 순서는 유지한다. 기존 int8 grid는 회전된
+  좌표에 유효하지 않으므로 새 QK/부분 AV는 **FP16**이다. 원래 좌표계의 score,
+  softmax, 최종 attention output encoding을 유지하지만 실수 대수 동등성이
+  기존 양자화 바이너리와의 bit-exact 동등성을 뜻하지 않는다.
+- **scale 사전 계산:** `s = ||x|| / ||c[index]||`를 encoder에서 한 번 계산하고
+  FP16으로 저장한다. norm correction이 꺼져 있으면 `s = ||x||`다. decoder는
+  centroid 조회 후 s만 곱하며 norm의 제곱합·제곱근·나눗셈을 반복하지 않는다.
+  모든 유효 토큰의 nibble unpack과 centroid 조회 자체는 여전히 필요하다.
+
+format **2**는 packed byte 순서와 크기를 유지하지만 scalar 의미가 다르다.
+I/O를 `tq_*_scale_{in,out}`으로 구분하고 config hash·cache snapshot version도
+분리했다. format 1 norm을 format 2 scale로 읽으면 틀린 결과가 되므로 자동
+혼용하지 않는다. 각 KV 벡터당 FP16 scalar 한 개여서 host KV 저장소 크기는 같다.
+FP16에 들어가야 하는 값은 원래 norm이 아니라 **effective scale**이다. norm만
+65504 이하라고 scale까지 표현 가능하다고 보장하지 않는다. host 저장은 범위를
+검사하며, device encoder를 다른 모델에 적용할 때는 그 모델의 scale 범위도
+검증해야 한다.
+
+버킷 그래프는 part별 하나의 weight-shared context에 넣지만, graph metadata와
+각 길이별 resident I/O buffer는 늘어난다. 저장소 절감과 프로세스 전체 메모리를
+구분해서 보고한다. 이것도 그래프 수준 변환이며 native packed-attention fusion은
+아니다. 성능 목표는 **int16 KV baseline**이고, 성능 측정은 구성당 1회다.
+
+### 14.2 검증
+
+- 빈/부분/전체 cache, GQA, causal mask, 마지막 짧은 tile, 한 tile짜리 작은
+  버킷에서 float32 ONNX 결과를 기존 복원 방식 및 format-2 전체 복원과 비교한다.
+  FP16/정수 실행의 품질을 CPU 동등성만으로 보증하지 않는다.
+- cache format 혼용 거부, append/reset/snapshot, padding 길이 변경과 C++ runner의
+  정확한 경계 선택(127→128, 255→256, 511→512)을 검사한다.
+- 기존 경로의 회귀 검사를 포함한 단위 테스트 219개가 통과했다.
+- `verify_rotated_attention.py`는 최종 DLC의 UINT8 packed / unencoded FP16 scale,
+  16-bit KV 쓰기 경로, FP16 attention, decoder 역회전·norm reduction 제거,
+  tile 크기를 검사한다. 빈/미완성 DLC 표는 실패로 처리한다.
+- 새 scale codec의 실제 HTP 검증은 `p2_scaled_20260917/p2_report.json`에 있다.
+  K/V × 1/128토큰 encode/decode 8개 그래프를 실제 layer 0/27 KV와 제한된
+  범위 입력으로 검증했다. format-2 scale 범위 때문에 range 입력은 기존
+  probe의 0.5배(원래 norm 최대 약 32500)이며 full-FP16-domain 검증은 아니다.
+- 이 probe에서 **128토큰 K/V encoder의 scale 오차는 기존 norm-only 0.2%
+  기준을 넘었다**(최대 약 0.2564%). 따라서 기존 기준의 전체 판정은 실패이며
+  통과로 재표기하지 않았다. index 차이는 모두 허용한 인접 경계 안에 있고,
+  decoder와 detailed HTP 실행은 통과했다. scale에 norm 보정이 합쳐지면서
+  추가 FP16 반올림이 생긴다. 이 수치 한계를 보존하고 전체 모델 PPL을 별도로
+  평가한다. 기존 norm/decoder tolerance는 완화하지 않는다.
+- `htp_codec_validation.py build/all --profile k4_v4_scaled --range-scale 0.5`로
+  같은 종류의 bounded probe를 만들 수 있다. `compare`는 저장된 manifest의
+  profile과 config hash를 사용하므로 format-2 결과를 format-1 oracle로 잘못
+  해석하지 않는다. 기존 기기 출력을 재비교해도 위 실패가 그대로 재현됐다.
+
+### 14.3 실기기 성능: 짧은 문맥은 개선, 전체 문맥 목표는 미달
+
+S26/SM8850, 동일 가중치·runner·burst 설정에서 **구성·입력 조건당 1회** 측정했다.
+아래 표는 35토큰 prompt와 128토큰 greedy 생성이다. profiling은 끄고 모델
+로딩은 TTFT에서 제외했다. 별도 warmup 제외, 온도 통제, 실행 순서 교차는 없으며
+단회 관찰값이다. 성능 측정을 재시도하거나 기존 결과와 평균하지 않았다.
+
+| 지표 | int16 KV baseline | 기존 tiled-256 `k4_v4` | 새 구현, CL1024 고정 | 새 구현, 자동 버킷 |
+|---|---:|---:|---:|---:|
+| TTFT | 44.5ms | 118.3ms | 104.8ms | 62.2ms |
+| prefill | 792.47 tok/s | 296.61 tok/s | 335.16 tok/s | 567.19 tok/s |
+| decode | 32.239 tok/s | 10.507 tok/s | 14.650 tok/s | **44.600 tok/s** |
+| host KV 저장소 | 112.0MiB | 28.875MiB | 28.875MiB | 28.875MiB |
+| 프로세스 종료 VmRSS | 392.0MiB | 152.2MiB | 153.9MiB | 296.1MiB |
+| PPL (4 window) | 20.108306* | 20.369400* | 20.388335 | 20.388335 |
+
+`*` PPL만 변경하지 않은 동일 바이너리의 기존 측정값을 재사용했다. 새 구현의
+두 구성은 각각 같은 WikiText 4 window, 총 4,092토큰으로 평가했다. window별
+PPL은 두 구성 모두 12.743880 / 23.649163 / 21.229252 / 27.006912다.
+int16 baseline 대비 +1.393%, 기존 tiled 대비 +0.093%다. 이 네 window에서
+PPL/NLL이 같았다는 결과가 모든 입력이나 decode의 bit-exact 동등성을 보장하지는
+않는다. §14.2의 standalone scale encoder 기준 실패도 그대로 남아 있다.
+
+- CL1024 고정 결과는 기존 tiled 대비 **39.4%** 빨라졌다. 회전 이동과 scale
+  사전 계산, 회전 좌표의 FP16 attention을 함께 적용한 결과이며 각 변경의
+  독립적인 기여도를 분리한 실험은 아니다.
+- 자동 버킷은 기존 tiled 대비 **4.24배**, 이번 CL1024 고정 int16 baseline 대비
+  **38.3%** 높은 decode 처리량을 보였다. 127개 decode step 중 C128이 93개,
+  C256이 34개다. 평균 past 계산 용량은 1023 → **161.27토큰**, 약 **84.24% 감소**다.
+  유효 KV 자체를 버린 것이 아니라 큰 고정 그래프의 불필요한 padding을 줄였다.
+- **int16 baseline에도 같은 버킷 최적화를 적용한 비교는 아니다.** 따라서
+  이 결과는 현재 배포 구성끼리의 비교이지, 같은 attention 길이에서 4-bit 연산이
+  int16보다 본질적으로 빠르다는 근거가 아니다. prefill/TTFT는 여전히 baseline이
+  더 빠르다.
+- 평균 decode step의 host prepare / QNN 호출 합계 / commit은 기존 tiled에서
+  1.308 / 91.233 / 0.054ms, 새 고정 CL1024에서 0.964 / 65.400 / 0.032ms,
+  자동 버킷에서 0.153 / 21.665 / 0.009ms다. 작은 버킷이 NPU 계산과 host I/O
+  양쪽의 작업량을 줄였다. 이 합계에는 token 선택 등 모든 generation 비용이
+  들어 있지는 않다.
+
+별도 긴 입력 조건도 각각 **1회** 실행했다. 897토큰 prompt + 128토큰 생성으로
+캐시가 정확히 1024에 도달하며, 모든 decode step이 C1024를 사용한다. 새 구현의
+context 경계 검증 실행을 이 조건의 측정으로 함께 사용했고 다시 실행하지 않았다.
+
+| 지표 | int16 KV baseline | 새 구현, 자동 버킷 |
+|---|---:|---:|
+| TTFT | 319.3ms | 722.1ms |
+| prefill | 2811.58 tok/s | 1243.94 tok/s |
+| decode | **34.912 tok/s** | **13.884 tok/s** |
+
+**전체 문맥에서는 int16 baseline이 여전히 2.51배 빠르다.** 버킷으로 줄일 padding이
+거의 없어지면 짧은 입력의 이점도 사라진다. 따라서 현재 구현은 짧은 문맥의
+decode 목표를 달성했지만, 전체 1023토큰 처리 조건의 목표는 달성하지 못했다.
+
+### 14.4 메모리·기능·남은 병목
+
+- 최종 attention DLC 21개 모두 UINT8 packed / FP16 scale I/O, 16-bit KV 쓰기,
+  FP16 회전 attention, 과거 KV 역회전·norm reduction 제거 검사를 통과했다.
+  최대 단일 FP16 codec 중간 텐서는 여전히 **512KiB**다. 전체 원래 좌표의 FP16
+  KV 텐서는 없지만 packed unpack과 centroid 복원은 각 선택 버킷의 past 용량만큼
+  남는다. custom fused HTP kernel이 추가된 것은 아니다.
+- host KV 저장소는 int16 대비 **74.22% 작다**. 반면 자동 버킷은 모든 길이의
+  graph I/O를 resident로 유지하므로 I/O buffer가 96.93 → **222.20MiB**, 종료
+  VmRSS가 153.9 → **296.1MiB**로 늘었다. KV 저장소 절감률을 프로세스 전체나
+  peak HTP 메모리 절감률로 해석하면 안 된다.
+- EOS는 11번째 생성 토큰에서 정지했다. 897토큰 prompt 경계, 두 세션 reset의
+  동일 token ID, 600토큰 생성 중 128→256→512→1024 버킷 전환 및 매 step의
+  최소 수용 길이 선택이 모두 통과했다. 이 기능 검증과 detailed profile의 시간
+  수치는 위 짧은 조건 성능 표에 섞지 않았다.
+- 별도 decode detailed profile에서 CL1024 고정 part 2/3/4의 accelerator execute
+  시간은 19.879 / 19.748 / 20.810ms다. KV tile 복원 경로의 **op cycle 합계 비중**은
+  84.5 / 85.4 / 80.2%다. decoder 역회전과 norm 보정은 제거됐지만 unpack,
+  centroid 선택, scale 곱, layout 처리의 비용이 남는다. 이 비중은 벽시계 시간의
+  비중이 아니며 이전 profile과의 절대 cycle 비교도 동일한 계측 조건 안에서
+  제한적으로 해석해야 한다.
+- C128 decode profile에서는 해당 비중이 56.6 / 56.7 / 41.9%다. 긴 문맥에서
+  목표 속도에 더 접근하려면 남은 nibble unpack·centroid 선택을 packed KV를
+  직접 소비하는 attention 연산과 통합하는 native HTP 최적화가 다음 후보다.
+  이번 결과만으로 그 구현의 속도나 baseline 동등성을 보장하지 않는다.
+- 단위 테스트 219개와 변경 파일 전체의 pre-commit 검사(mypy 포함)가 통과했다.
+  다만 standalone scalar 오차 기준은 실패이므로 새 profile은 선택형으로 유지하고
+  기존 기본 profile과 cache format은 바꾸지 않았다.
+
+### 14.5 산출물
+
+`~/.qaihm/tmp/turboquant/` 아래에 보존했다.
+
+- 최종 번들 `qwen3_1_7b_rotated_scaled_buckets/`, device bundle
+  `rotated_scaled_buckets`: part별 weight-shared context에 총 28개 그래프.
+  part 1/3/4는 최종 번들에서 별도 변환 디렉터리를 symlink로 참조한다.
+- `reports/comparison_rotated_scaled_buckets.json`: 비교 수치, 원본 경로,
+  PPL 재사용 여부, profile·기능·수치 기준 결과를 모은 요약.
+- `reports/perf_{baseline_int16_rotated_control,k4_v4_tiled_rotated_control,rotated_scaled_fixed,rotated_scaled_buckets}_once.json`:
+  짧은 입력의 구성당 1회 성능 원본.
+- `reports/perf_baseline_int16_rotated_long_once.json`,
+  `reports/generation_boundary_rotated_scaled_buckets.json`: 긴 입력 각 1회.
+- `reports/quality_rotated_scaled_{fixed,buckets}.json`,
+  `reports/score_rotated_scaled_{fixed,buckets}_w{0,1,2,3}.json`: PPL 원본.
+- `reports/boundary_rotated_scaled_buckets.json`,
+  `reports/invariants_rotated_scaled_buckets.json`: 최종 DLC 및 기능 검사.
+- `reports/profile_rotated_scaled_{fixed,buckets}.json`: 별도 detailed profile.
+- `p2_scaled_20260917/p2_report.json`: 기존 tolerance를 그대로 적용한 standalone
+  HTP codec 수치 결과. 전체 판정은 실패이며 성능 개선과 별개로 확인해야 한다.
+
+## 15. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

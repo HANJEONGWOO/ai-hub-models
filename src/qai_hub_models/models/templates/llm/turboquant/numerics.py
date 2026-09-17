@@ -60,10 +60,13 @@ def compare_encode(
     allowed = (np.abs(dev_idx - ref_idx) == 1) & (distance <= tol.boundary_distance)
     unexplained = mismatch & ~allowed
 
+    if codec.precomputed_norm and codec.norm_correction:
+        lengths = np.linalg.norm(codec.centroids[dev_idx], axis=-1, keepdims=True)
+        ref_norms = ref_norms / np.where(lengths > TINY, lengths, 1.0)
     norms = np.asarray(norms, np.float64)
     norm_rel = np.abs(norms - ref_norms) / np.maximum(ref_norms, TINY)
     zero_rows = ref_norms[..., 0] == 0
-    report = {
+    report: dict[str, Any] = {
         "values": int(ref_idx.size),
         "index_mismatches": int(mismatch.sum()),
         "index_mismatch_fraction": float(mismatch.mean()),
@@ -77,6 +80,8 @@ def compare_encode(
         "zero_vectors": int(zero_rows.sum()),
         "zero_vector_norms_exact": bool(np.all(norms[zero_rows] == 0)),
     }
+    if codec.precomputed_norm:
+        report["stored_scalar"] = "effective_scale"
     report["passed"] = bool(
         report["unexplained_index_mismatches"] == 0
         and report["norm_max_rel_error"] <= tol.norm_rel
@@ -106,7 +111,12 @@ def compare_decode(
         np.asarray(x_hat, np.float64) - expected, axis=-1, keepdims=True
     )
     zero_rows = norms == 0
-    rel = err / np.maximum(norms, TINY)
+    reference_norms = norms
+    if codec.precomputed_norm and codec.norm_correction:
+        reference_norms = norms * np.linalg.norm(
+            codec.centroids[indices], axis=-1, keepdims=True
+        )
+    rel = err / np.maximum(reference_norms, TINY)
     report = {
         "vectors": int(norms.size),
         "decode_max_rel_error": float(rel[~zero_rows].max())

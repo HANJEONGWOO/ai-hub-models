@@ -76,9 +76,7 @@ class Subgraph:
 
 def _check_supported(spec: KVCodecSpec, config: TurboQuantConfig) -> None:
     if not spec.is_polar or spec.bits != 4:
-        raise NotImplementedError(
-            "ONNX lowering exists only for 4-bit PolarQuant in format version 1."
-        )
+        raise NotImplementedError("ONNX lowering exists only for 4-bit PolarQuant.")
     if config.block_size % 2:
         raise ValueError("4-bit packing needs an even block size.")
 
@@ -172,9 +170,15 @@ def encode_subgraph(
     sg.node("Where", [f"{p}has_len", f"{p}len", one], [f"{p}safe_len"])
     sg.node("Div", [f"{p}scaled", f"{p}safe_len"], [f"{p}unit"])
     sg.node("Mul", [f"{p}max_pre", f"{p}len"], [f"{p}norm_pre"])
-    norm_target = norm_out if storage_lead == lead else f"{p}canonical_norm"
+    norm_target = (
+        f"{p}raw_norm"
+        if config.precomputed_norm
+        else norm_out
+        if storage_lead == lead
+        else f"{p}canonical_norm"
+    )
     sg.node("Mul", [f"{p}norm_pre", f"{p}post"], [norm_target])
-    if storage_lead != lead:
+    if storage_lead != lead and not config.precomputed_norm:
         sg.node(
             "Reshape",
             [norm_target, sg.shape([*storage_lead, num_tokens, 1])],
@@ -216,6 +220,35 @@ def encode_subgraph(
         [f"{p}byte_u8", sg.shape([*storage_lead, num_tokens, d // 2])],
         [packed_out],
     )
+    if config.precomputed_norm:
+        effective = norm_target
+        if config.norm_correction:
+            sg.node("Cast", [f"{p}index"], [f"{p}scale_index_f"], to=TensorProto.FLOAT)
+            sg.node(
+                "Reshape",
+                [f"{p}scale_index_f", sg.shape([*lead, num_tokens, d])],
+                [f"{p}scale_index"],
+            )
+            y_hat = _select_centroid(
+                sg,
+                f"{p}scale_index",
+                load_codebook(spec.bits, d).astype(np.float32),
+                spec.bits,
+                d,
+                p + "scale_",
+            )
+            sg.node("Mul", [y_hat, y_hat], [f"{p}scale_sq"])
+            sg.node("ReduceSum", [f"{p}scale_sq", axis3], [f"{p}scale_sum"], keepdims=1)
+            sg.node("Sqrt", [f"{p}scale_sum"], [f"{p}scale_len"])
+            sg.node("Greater", [f"{p}scale_len", zero], [f"{p}scale_valid"])
+            sg.node(
+                "Where", [f"{p}scale_valid", f"{p}scale_len", one], [f"{p}scale_safe"]
+            )
+            effective = f"{p}effective_scale"
+            sg.node("Div", [norm_target, f"{p}scale_safe"], [effective])
+        sg.node(
+            "Reshape", [effective, sg.shape([*storage_lead, num_tokens, 1])], [norm_out]
+        )
     return sg
 
 
@@ -289,6 +322,8 @@ def decode_subgraph(
     lead: tuple[int, int],
     num_tokens: int,
     prefix: str,
+    *,
+    rotated: bool = False,
 ) -> Subgraph:
     """``(packed_in, norm_in) -> dst`` with the config's norm correction."""
     _check_supported(spec, config)
@@ -338,7 +373,7 @@ def decode_subgraph(
     centroids = load_codebook(spec.bits, d).astype(np.float32)
     y_hat = _select_centroid(sg, f"{p}index_f", centroids, spec.bits, d, p)
     y_unit = y_hat
-    if config.norm_correction:
+    if config.norm_correction and not config.precomputed_norm:
         sg.node("Mul", [y_hat, y_hat], [f"{p}sq"])
         sg.node("ReduceSum", [f"{p}sq", axis3], [f"{p}sum_sq"], keepdims=1)
         sg.node("Sqrt", [f"{p}sum_sq"], [f"{p}len"])
@@ -347,9 +382,13 @@ def decode_subgraph(
         sg.node("Div", [y_hat, f"{p}safe_len"], [f"{p}y_unit"])
         y_unit = f"{p}y_unit"
     # Row vectors: x = R^T y  <=>  x_row = y_row @ R.
-    sg.node("MatMul", [y_unit, _rotation_name(sg, config, spec, False)], [f"{p}x_unit"])
+    if not rotated:
+        sg.node(
+            "MatMul", [y_unit, _rotation_name(sg, config, spec, False)], [f"{p}x_unit"]
+        )
+        y_unit = f"{p}x_unit"
     target = dst if storage_lead == lead else f"{p}canonical_restored"
-    sg.node("Mul", [f"{p}x_unit", norm_in], [target])
+    sg.node("Mul", [y_unit, norm_in], [target])
     if storage_lead != lead:
         sg.node("Reshape", [target, sg.shape([*storage_lead, num_tokens, d])], [dst])
     return sg

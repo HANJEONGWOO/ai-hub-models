@@ -12,6 +12,7 @@
 #include <stdexcept>
 
 #include "numeric.h"
+#include "buckets.h"
 
 namespace tqrun {
 namespace {
@@ -24,8 +25,8 @@ double since(Clock::time_point start) {
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error(what); }
 
-const std::regex kKvIn(R"((past_(key|value)_\d+|tq_(key|value)_\d+_(packed|norm))_in)");
-const std::regex kKvOut(R"((past_(key|value)_\d+|tq_(key|value)_\d+_(packed|norm))_out)");
+const std::regex kKvIn(R"((past_(key|value)_\d+|tq_(key|value)_\d+_(packed|norm|scale))_in)");
+const std::regex kKvOut(R"((past_(key|value)_\d+|tq_(key|value)_\d+_(packed|norm|scale))_out)");
 
 // Token axis of a KV tensor: hub keys are (heads, 1, head_dim, tokens); everything else is -2.
 int tokenAxis(const std::string& base, size_t rank) {
@@ -68,8 +69,8 @@ struct LlmSession::KvStream {
   size_t outer = 0;
   size_t inner = 0;  // bytes per (outer row, token)
   std::vector<uint8_t> clear;  // one element's bytes for an empty slot
-  std::map<int, const TensorMeta*> inMeta, outMeta;
-  std::map<int, Buffer*> inBuf, outBuf;
+  std::map<std::pair<int, int>, const TensorMeta*> inMeta, outMeta;
+  std::map<std::pair<int, int>, Buffer*> inBuf, outBuf;
   std::vector<uint8_t> store;  // [outer][contextLength][inner], tokens left-aligned
   std::string dtype;
 };
@@ -92,13 +93,20 @@ LlmSession::LlmSession(QnnRuntime& rt, const SessionOptions& options, const Rope
     fail("RoPE table has fewer positions than the context length");
   }
   auto start = Clock::now();
+  options_.contextBuckets = contextBuckets(options_.contextBuckets, options_.contextLength);
   const size_t numParts = options_.bins.size();
   for (size_t p = 0; p < numParts; ++p) {
     std::vector<std::string> names;
-    for (int ar : options_.sequenceLengths) names.push_back(graphName(ar, options_.contextLength, p + 1, numParts) + options_.graphSuffix);
+    for (int c : options_.contextBuckets) {
+      for (int ar : options_.sequenceLengths) {
+        if (ar < c) names.push_back(graphName(ar, c, p + 1, numParts) + options_.graphSuffix);
+      }
+    }
     contexts_.push_back(std::make_unique<ContextBinary>(rt_, options_.bins[p], names));
   }
-  for (int ar : options_.sequenceLengths) bindGraphSet(ar);
+  for (int c : options_.contextBuckets) {
+    for (int ar : options_.sequenceLengths) if (ar < c) bindGraphSet(ar, c);
+  }
   loadSeconds_ = since(start);
   reset();
 }
@@ -122,12 +130,13 @@ LlmSession::Buffer& LlmSession::sharedBuffer(GraphSet& set, const TensorMeta& me
   return *it->second;
 }
 
-void LlmSession::bindGraphSet(int ar) {
+void LlmSession::bindGraphSet(int ar, int context) {
+  const auto key = std::make_pair(ar, context);
   auto set = std::make_unique<GraphSet>();
   set->ar = ar;
   const size_t numParts = contexts_.size();
   for (size_t p = 0; p < numParts; ++p) {
-    set->parts.push_back(&contexts_[p]->graph(graphName(ar, options_.contextLength, p + 1, numParts) + options_.graphSuffix));
+    set->parts.push_back(&contexts_[p]->graph(graphName(ar, context, p + 1, numParts) + options_.graphSuffix));
   }
   std::map<std::string, bool> produced;
   auto bindTensor = [](const TensorMeta& meta, Buffer& buf) {
@@ -157,8 +166,8 @@ void LlmSession::bindGraphSet(int ar) {
         owned->data.assign(meta.bytes(), 0);
         buf = owned.get();
         set->buffers.emplace(meta.name, std::move(owned));
-        stream->inMeta[ar] = &meta;
-        stream->inBuf[ar] = buf;
+        stream->inMeta[key] = &meta;
+        stream->inBuf[key] = buf;
       } else {
         const bool known = meta.name == "input_ids" || meta.name == "attention_mask" ||
                            meta.name == "position_ids_cos" || meta.name == "position_ids_sin";
@@ -185,8 +194,8 @@ void LlmSession::bindGraphSet(int ar) {
         owned->data.assign(meta.bytes(), 0);
         buf = owned.get();
         set->buffers.emplace(meta.name, std::move(owned));
-        it->second->outMeta[ar] = &meta;
-        it->second->outBuf[ar] = buf;
+        it->second->outMeta[key] = &meta;
+        it->second->outBuf[key] = buf;
       } else {
         buf = &sharedBuffer(*set, meta);
         produced[meta.name] = true;
@@ -199,13 +208,13 @@ void LlmSession::bindGraphSet(int ar) {
   }
   if (!set->tokens || !set->logits) fail("graph set ar" + std::to_string(ar) + " lacks input_ids or logits");
 
-  const size_t past = options_.contextLength - ar;
+  const size_t past = context - ar;
   for (auto& [base, stream] : streams_) {
-    if (!stream->inMeta.count(ar) || !stream->outMeta.count(ar)) {
+    if (!stream->inMeta.count(key) || !stream->outMeta.count(key)) {
       fail("KV stream " + base + " is missing an input or output in graph set ar" + std::to_string(ar));
     }
-    const TensorMeta& in = *stream->inMeta[ar];
-    const TensorMeta& out = *stream->outMeta[ar];
+    const TensorMeta& in = *stream->inMeta[key];
+    const TensorMeta& out = *stream->outMeta[key];
     const int axis = tokenAxis(base, in.dims.size());
     if (in.dims[axis] != past || out.dims[axis] != static_cast<uint32_t>(ar)) {
       fail("KV stream " + base + " token axis does not match context/sequence length");
@@ -228,8 +237,18 @@ void LlmSession::bindGraphSet(int ar) {
     } else if (stream->outer != outer || stream->inner != inner) {
       fail("KV stream " + base + " layout differs between sequence lengths");
     }
+    const TensorMeta& first = *stream->inMeta.begin()->second;
+    if (first.dataType != in.dataType || first.quantized != in.quantized ||
+        first.scale != in.scale || first.offset != in.offset || first.dims.size() != in.dims.size()) {
+      fail("KV stream " + base + " encoding differs between graph buckets");
+    }
+    for (size_t d = 0; d < in.dims.size(); ++d) {
+      if (static_cast<int>(d) != axis && (in.dims[d] != first.dims[d] || in.dims[d] != out.dims[d])) {
+        fail("KV stream " + base + " dimensions differ between graph buckets");
+      }
+    }
   }
-  sets_[ar] = std::move(set);
+  sets_[key] = std::move(set);
 }
 
 void LlmSession::reset() {
@@ -238,16 +257,18 @@ void LlmSession::reset() {
   }
   cached_ = 0;
   lastAr_ = 0;
+  lastContext_ = 0;
   lastNew_ = 0;
 }
 
 StepRecord LlmSession::step(const std::vector<int32_t>& tokens, int ar, bool profile) {
   auto stepStart = Clock::now();
-  auto setIt = sets_.find(ar);
+  const int C = selectContext(options_.contextBuckets, ar, cached_);
+  const auto key = std::make_pair(ar, C);
+  auto setIt = sets_.find(key);
   if (setIt == sets_.end()) fail("no graphs for sequence length " + std::to_string(ar));
   GraphSet& set = *setIt->second;
   const int m = static_cast<int>(tokens.size());
-  const int C = options_.contextLength;
   const int S = C - ar;
   const int n = static_cast<int>(cached_);
   if (m < 1 || m > ar) fail("step needs 1..ar new tokens");
@@ -256,6 +277,7 @@ StepRecord LlmSession::step(const std::vector<int32_t>& tokens, int ar, bool pro
 
   StepRecord record;
   record.ar = ar;
+  record.graphContext = C;
   record.newTokens = m;
   record.cachedBefore = cached_;
   auto prepStart = Clock::now();
@@ -286,7 +308,7 @@ StepRecord LlmSession::step(const std::vector<int32_t>& tokens, int ar, bool pro
     if (cosMeta.dims.back() != half || sinMeta.dims.back() != half) fail("RoPE width mismatch");
     for (int k = 0; k < ar; ++k) {
       int pos = k < ar - m ? std::max(n - 1, 0) : n + (k - (ar - m));
-      pos = std::min(pos, C - 1);
+      pos = std::min(pos, options_.contextLength - 1);
       for (size_t f = 0; f < half; ++f) {
         encodeScalar(cosMeta, rope_.cos[pos * half + f], set.cos->data.data() + (k * half + f) * elem);
         encodeScalar(sinMeta, rope_.sin[pos * half + f], set.sin->data.data() + (k * half + f) * elem);
@@ -294,13 +316,13 @@ StepRecord LlmSession::step(const std::vector<int32_t>& tokens, int ar, bool pro
     }
   }
   for (auto& [base, stream] : streams_) {
-    uint8_t* dst = stream->inBuf[ar]->data.data();
+    uint8_t* dst = stream->inBuf[key]->data.data();
     const size_t rowIn = static_cast<size_t>(S) * stream->inner;
     const size_t emptyBytes = static_cast<size_t>(S - n) * stream->inner;
     for (size_t o = 0; o < stream->outer; ++o) {
       uint8_t* row = dst + o * rowIn;
       fillPattern(row, emptyBytes, stream->clear);
-      std::memcpy(row + emptyBytes, stream->store.data() + o * C * stream->inner, n * stream->inner);
+      std::memcpy(row + emptyBytes, stream->store.data() + o * options_.contextLength * stream->inner, n * stream->inner);
     }
     kvCopyBytes_ += stream->outer * static_cast<uint64_t>(n) * stream->inner;
   }
@@ -318,15 +340,16 @@ StepRecord LlmSession::step(const std::vector<int32_t>& tokens, int ar, bool pro
 
   auto commitStart = Clock::now();
   for (auto& [base, stream] : streams_) {
-    const uint8_t* src = stream->outBuf[ar]->data.data();
+    const uint8_t* src = stream->outBuf[key]->data.data();
     for (size_t o = 0; o < stream->outer; ++o) {
-      std::memcpy(stream->store.data() + (o * C + n) * stream->inner,
+      std::memcpy(stream->store.data() + (o * options_.contextLength + n) * stream->inner,
                   src + (o * ar + (ar - m)) * stream->inner, m * stream->inner);
     }
     kvCopyBytes_ += stream->outer * static_cast<uint64_t>(m) * stream->inner;
   }
   cached_ += m;
   lastAr_ = ar;
+  lastContext_ = C;
   lastNew_ = m;
   record.commitSeconds = since(commitStart);
   record.totalSeconds = since(stepStart);
@@ -340,7 +363,7 @@ size_t LlmSession::vocabSize() const {
 
 void LlmSession::logitsRow(int i, std::vector<float>& out) const {
   if (lastAr_ == 0 || i < 0 || i >= lastNew_) fail("logits row out of range");
-  const GraphSet& set = *sets_.at(lastAr_);
+  const GraphSet& set = *sets_.at({lastAr_, lastContext_});
   const TensorMeta& meta = *set.logits->meta;
   const size_t vocab = meta.dims.back();
   const size_t elem = meta.elementBytes();

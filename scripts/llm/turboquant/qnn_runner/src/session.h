@@ -31,6 +31,7 @@ struct SessionOptions {
   std::vector<std::string> bins;
   int contextLength = 1024;
   std::vector<int> sequenceLengths{128, 1};
+  std::vector<int> contextBuckets;
   std::string graphSuffix;
   int32_t padToken = 151645;
   double maskMin = -100.0;
@@ -38,6 +39,7 @@ struct SessionOptions {
 
 struct StepRecord {
   int ar = 0;
+  int graphContext = 0;
   int newTokens = 0;
   size_t cachedBefore = 0;
   double prepareSeconds = 0.0;
@@ -80,17 +82,18 @@ class LlmSession {
   struct KvStream;
   struct GraphSet;
 
-  void bindGraphSet(int ar);
+  void bindGraphSet(int ar, int context);
   Buffer& sharedBuffer(GraphSet& set, const TensorMeta& meta);
 
   QnnRuntime& rt_;
   SessionOptions options_;
   const RopeTable& rope_;
   std::vector<std::unique_ptr<ContextBinary>> contexts_;
-  std::map<int, std::unique_ptr<GraphSet>> sets_;
+  std::map<std::pair<int, int>, std::unique_ptr<GraphSet>> sets_;
   std::map<std::string, std::unique_ptr<KvStream>> streams_;
   size_t cached_ = 0;
   int lastAr_ = 0;
+  int lastContext_ = 0;
   int lastNew_ = 0;
   double loadSeconds_ = 0.0;
   uint64_t kvCopyBytes_ = 0;
