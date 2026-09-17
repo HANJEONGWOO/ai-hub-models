@@ -24,3 +24,24 @@ and current results are in
 
 Run from the repo root with `PYTHONPATH=src` so the repo sources shadow any
 installed `qai_hub_models` wheel. None of these tools submit AI Hub jobs.
+
+For restore throughput, benchmark the **past-cache length**, not only the
+number of newly generated tokens. An AR=1, context=1024 graph restores 1023
+tokens per KV tensor:
+
+```bash
+PYTHONPATH=src python scripts/llm/turboquant/htp_codec_validation.py all \
+    --work-dir ~/.qaihm/tmp/turboquant/p2_optimized_hub_1023 \
+    --snapshot ~/.qaihm/tmp/turboquant/qwen3_1_7b_kv_snapshot.npz \
+    --tokens 1023 --operations decode --head-major
+```
+
+Long codec probes repeat the recorded KV vectors to fill the requested shape;
+they measure codec accuracy/throughput, not long-context model quality.
+`--head-major` flag uses the actual model's `[heads, 1, tokens, dim]` I/O;
+without it the standalone `[1, heads, tokens, dim]` layout can hide HTP batch
+overhead. The codec normalizes its internal layout while preserving either ABI.
+The `run` and `compare` stages use the built manifest, so the shape options only
+need to be supplied to `build` (or `all`). Always reconvert the full model into
+a new bundle after changing the codec lowering; an existing context binary
+does not pick up Python source changes.

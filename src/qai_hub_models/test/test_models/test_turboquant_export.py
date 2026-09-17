@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import onnx
 import onnxruntime as ort
@@ -36,8 +38,8 @@ HEADS, D = 8, 128
 CONFIG = get_profile("k4_v4")
 # Ops the QAIRT 2.48 HTP backend supports for the dtypes these graphs use.
 HTP_SAFE_OPS = {
-    "Abs", "Add", "Cast", "Div", "Gather", "Greater", "Identity", "MatMul", "Mul",
-    "ReduceMax", "ReduceSum", "Reshape", "Slice", "Sqrt", "Where",
+    "Abs", "Add", "Cast", "Concat", "Div", "Floor", "Greater", "Identity", "MatMul",
+    "Mul", "ReduceMax", "ReduceSum", "Reshape", "Slice", "Sqrt", "Sub", "Where",
 }  # fmt: skip
 
 
@@ -59,12 +61,17 @@ def sample_inputs(tokens: int) -> np.ndarray:
 
 @pytest.mark.parametrize("tokens", [1, 128])
 @pytest.mark.parametrize("which", ["key", "value"])
-def test_encode_graph_matches_oracle(tokens: int, which: str) -> None:
+@pytest.mark.parametrize("head_major", [False, True])
+def test_encode_graph_matches_oracle(tokens: int, which: str, head_major: bool) -> None:
     spec = getattr(CONFIG, which)
     x = sample_inputs(tokens)
-    packed, norm = run(build_encode_model(CONFIG, spec, HEADS, tokens), {"x": x})
-    assert packed.dtype == np.uint8 and packed.shape == (1, HEADS, tokens, D // 2)
-    assert norm.shape == (1, HEADS, tokens, 1)
+    lead = (HEADS, 1) if head_major else (1, HEADS)
+    x = x.reshape(*lead, tokens, D)
+    packed, norm = run(
+        build_encode_model(CONFIG, spec, HEADS, tokens, head_major=head_major), {"x": x}
+    )
+    assert packed.dtype == np.uint8 and packed.shape == (*lead, tokens, D // 2)
+    assert norm.shape == (*lead, tokens, 1)
     report = compare_encode(
         PolarQuantReference(spec, D), x, packed, norm, FLOAT32_GRAPH
     )
@@ -73,18 +80,83 @@ def test_encode_graph_matches_oracle(tokens: int, which: str) -> None:
 
 
 @pytest.mark.parametrize("tokens", [1, 128])
-def test_decode_graph_matches_oracle(tokens: int) -> None:
+@pytest.mark.parametrize("head_major", [False, True])
+def test_decode_graph_matches_oracle(tokens: int, head_major: bool) -> None:
     spec = CONFIG.value
     codec = PolarQuantReference(spec, D)
-    idx, norms = codec.encode(sample_inputs(tokens))
+    lead = (HEADS, 1) if head_major else (1, HEADS)
+    idx, norms = codec.encode(sample_inputs(tokens).reshape(*lead, tokens, D))
     packed = pack_indices(idx, 4)
     norms32 = norms.astype(np.float32)
     (x_hat,) = run(
-        build_decode_model(CONFIG, spec, HEADS, tokens),
+        build_decode_model(CONFIG, spec, HEADS, tokens, head_major=head_major),
         {"packed": packed, "norm": norms32},
     )
     report = compare_decode(codec, packed, norms32, x_hat, FLOAT32_GRAPH)
     assert report["passed"], report
+
+
+@pytest.mark.parametrize("norm_correction", [False, True])
+@pytest.mark.parametrize("which", ["key", "value"])
+def test_decode_all_bytes_and_centroids(which: str, norm_correction: bool) -> None:
+    """Cover every nibble pair, including the outermost affine segments."""
+    config = replace(CONFIG, norm_correction=norm_correction)
+    spec = getattr(config, which)
+    packed = np.tile(np.arange(256, dtype=np.uint8), 4).reshape(1, 1, 16, D // 2)
+    norms = np.repeat(np.array([0.0, 0.01, 1.0, 65000.0], dtype=np.float32), 4).reshape(
+        1, 1, 16, 1
+    )
+    (actual,) = run(
+        build_decode_model(config, spec, 1, 16), {"packed": packed, "norm": norms}
+    )
+    report = compare_decode(
+        PolarQuantReference(spec, D, norm_correction=norm_correction),
+        packed,
+        norms,
+        actual,
+        FLOAT32_GRAPH,
+    )
+    assert report["passed"], report
+
+
+def test_decode_has_no_threshold_expansion() -> None:
+    """Cache-sized restores must not allocate a 15x centroid-lookup tensor."""
+    tokens = 1023
+    model = onnx.shape_inference.infer_shapes(
+        build_decode_model(CONFIG, CONFIG.key, HEADS, tokens)
+    )
+    for info in model.graph.value_info:
+        dims = [d.dim_value for d in info.type.tensor_type.shape.dim]
+        assert np.prod(dims) <= HEADS * tokens * D, (info.name, dims)
+
+
+def test_encode_comparisons_keep_head_dim_innermost() -> None:
+    model = onnx.shape_inference.infer_shapes(
+        build_encode_model(CONFIG, CONFIG.key, HEADS, 128)
+    )
+    shapes = {
+        v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
+        for v in model.graph.value_info
+    }
+    assert shapes["enc_above"] == [HEADS, 128, 15, D]
+
+
+@pytest.mark.parametrize(
+    ("encode", "tensor"),
+    [(True, "enc_rotated"), (False, "dec_y_hat")],
+)
+def test_head_major_io_does_not_batch_codec_by_head(encode: bool, tensor: str) -> None:
+    build = build_encode_model if encode else build_decode_model
+    model = onnx.shape_inference.infer_shapes(
+        build(CONFIG, CONFIG.key, HEADS, 128, head_major=True)
+    )
+    shapes = {
+        v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
+        for v in model.graph.value_info
+    }
+    assert shapes[tensor] == [1, HEADS, 128, D]
+    for value in [*model.graph.input, *model.graph.output]:
+        assert [d.dim_value for d in value.type.tensor_type.shape.dim][:2] == [HEADS, 1]
 
 
 def test_encode_graph_handles_full_float16_input_range() -> None:

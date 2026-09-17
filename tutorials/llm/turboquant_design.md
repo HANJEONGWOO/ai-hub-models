@@ -1,5 +1,7 @@
 # Qwen3 TurboQuant KV-cache — 설계(ABI·수치 계약)와 P0–P3 결과
 
+> §11의 ladder 복원 결과 이후 성능 수정과 재측정은 §12에 기록한다.
+
 작성일: 2026-09-15 · 작업 브랜치: `turboquant-kv-cache` (기준 commit `2a895603e`)
 
 작업 명세: [turboquant_npu_implementation_spec.md](turboquant_npu_implementation_spec.md). 이 문서는 명세 P0의 `design.md` 산출물이며, P1(참조 구현), P2(최소 HTP 실행 검증), P3(Qwen3-1.7B 실기기 통합, context 1024)의 실제 결과를 포함한다. codec 입력 경계(KV 전용 int8 이전 값)의 정의·검증과 FP16 KV 비교군은 §11에 있다. P4의 체계적 벤치마크(여러 context, 응답 품질 평가, HTP 측 메모리 계측)와 P5(다른 모델 크기)는 수행하지 않았다.
@@ -10,10 +12,10 @@
 |---|---|---|
 | 참조 구현 완료 | **완료** | 고정 commit 원본 대비 index 불일치 0, FWHT 복원 오차 0.0, packed byte 동일 (§4.4). 단위 테스트 144개 통과 |
 | 최소 codec HTP 실행 (P2) | **완료** | S26(SM8850) HTP에서 encode/decode 8개 그래프가 fp16 허용오차로 oracle과 일치, 모든 op이 accelerator 프로파일에 기록됨 (§6) |
-| NPU 기능 검증 완료 (1.7B 전체 생성 루프) | **완료, 단 메모리 경로 조건 미충족** | `k4_v4`가 S26에서 prefill + 128토큰 decode, EOS 처리, 세션 reset, context 경계(1024) 통과. codec encode/decode op이 28개 layer 전부 HTP detailed profile에 기록됨 (§11.5). KV는 호출 사이에 host에서 packed로 보관되지만, 그래프 안에서 과거 KV 전체를 매 스텝 복원하므로 명세 5.3의 "최종 메모리 경로"는 아님 |
+| NPU 기능 검증 완료 (1.7B 전체 생성 루프) | **완료, 단 메모리 경로 조건 미충족** | `k4_v4`가 S26에서 prefill + 128토큰 decode, EOS 처리, 세션 reset, context 경계(1024) 통과. 최종 수정 번들의 codec op이 28개 layer 전부 HTP detailed profile에 기록됨 (§12.3). KV는 호출 사이에 host에서 packed로 보관되지만, 그래프 안에서 과거 KV 전체를 매 스텝 복원하므로 명세 5.3의 "최종 메모리 경로"는 아님 |
 | 압축 효과 입증 | 부분 | host KV 저장소(56.0→28.9 MiB)와 프로세스 RSS(221.8→138.6 MiB, 1회 측정) 감소를 측정. HTP 측 intermediate·scratch·shared memory는 측정하지 않음 |
 | 품질 평가 완료 | 부분 | 실기기 WikiText teacher-forced PPL(4 window) 측정. 응답 품질 평가(Grace 등)와 retrieval 시험은 수행하지 않음 |
-| 성능 개선 입증 | **미달** | 동일 runner 측정에서 decode가 baseline 대비 약 29배 느림 (§11.5) |
+| 성능 개선 입증 | **기존 codec 대비 개선, baseline 대비 미달** | §12 수정으로 decode 1.95→10.76 tok/s(5.52배), TTFT 1270→118ms. 동일 장치 int8 baseline은 41.79 tok/s로 여전히 3.88배 빠름 |
 | 타 모델 검증 완료 | 미착수 | 0.6B/4B/8B는 config·shape 테스트만 통과 |
 | codec 입력 경계 검증 | **완료** | codec이 KV 전용 int8 양자화 이전의 16-bit 값을 읽음을 ONNX encodings·dlc-info·onnxruntime에서 확인(§11.4). 같은 16-bit 값을 변환 없이 그대로 저장하는 비압축 비교군 `baseline_int16_kv`를 별도 artifact로 생성·실행 |
 
@@ -154,7 +156,8 @@ Qwen3는 현재 delta-cache I/O(`genie_input_ids`)만 구현되어 있다. 그�
 - 사용 op: `Abs, ReduceMax, Greater, Where, Mul, Div, ReduceSum, Sqrt, MatMul(→FullyConnected), Reshape(→Transpose), Cast, Slice(→StridedSlice), Add, Gather`. 모든 텐서는 rank ≤4.
 - QAIRT 2.48 HTP 제약과 대응은 다음과 같다(문서 확인, 일부 실측):
   - bitwise op이 없고 UINT_8 산술도 없다 → index는 `Greater` + INT32 `ReduceSum`, pack은 INT32 `hi*16+lo` 후 `Cast→UINT8`
-  - UINT_8 Concat/Gather/Transpose와 fp16→uint8 Cast는 prepare에서 거부된다 → unpack은 `Cast(UINT8→INT32)` + `Gather([256,2] fp16 LUT)`
+  - UINT_8 Concat/Gather/Transpose와 fp16→uint8 Cast는 prepare에서 거부된다 → unpack은 `Cast(UINT8→FLOAT)` 뒤 정확한 fp16 산술(`b/16`의 `Floor`, 나머지)로 nibble을 풀고(마지막 축 64인 packed 레이아웃에서 계산; 마지막 축이 1인 텐서에서 하면 HTP가 약 3배 느림), centroid는 `y = c_0 + Σ_k (c_k − c_{k−1})·[idx ≥ k]`로 복원한다: 임계값 15개와의 브로드캐스트 `Greater` 1회 → `Cast` → K=15 `MatMul`(반올림 1회) → `Add`. 처음 구현은 `Cast(UINT8→INT32)` + `Gather([256,2] fp16 LUT)`였는데 SM8850 HTP의 `Gather`는 index 하나당 약 35 cycle(scalar 경로)이라 복원 cycle의 80%를 차지했다.
+  - 8 head × 1023 token 복원 그래프(unpack + centroid + norm 보정 + 회전) 단독 accelerator 시간(S26, 3회 실행 중 마지막): `Gather` 9.7 ms, 16-entry `Gather`(nibble index) 20.9 ms, 2-byte(65536×4) LUT `Gather` 5.6 ms, `Greater`+`Where` 이진 트리 1.6 ms(leaf를 텐서 산술로 바꾼 profiling 호환판 1.8 ms), ladder `MatMul` 4.2 ms, ladder `Mul`+`ReduceSum` 22.7 ms. 모두 oracle과 HTP 허용오차 안(max rel 1.6e-3). Where 트리가 가장 빠르지만 KV 텐서당 op이 약 50개라 LLM part(codec 20개) 컨텍스트 컴파일이 그래프당 25분·host RAM 약 10 GB로 늘어 OOM으로 실패했고(값 입력이 둘 다 상수인 `Where`는 `--profiling_level detailed`에서 실행 실패), op 6개로 컴파일 부담이 작은 ladder `MatMul`을 채택했다. norm 보정 op을 encode 쪽으로 접는 것은 7%(5.48→5.11 ms) 이득이라 포맷을 바꾸지 않았다.
   - fp16에서 `sum(x²)`는 norm 약 256부터 overflow → max|x|로 먼저 나눈 뒤 제곱한다
   - **실측(SM8850)**: HTP FP16 `Div`는 나누는 값이 2^14를 넘으면 부정확했다(20000에서 norm 오차 22%, 36000 이상은 NaN). 그래서 max|x| > 256인 행은 먼저 정확한 2^-8을 곱해 나누는 값이 항상 ≤256이 되게 했다. 수정 후 max|x| 1e-2~6.5e4 전 범위에서 통과했다.
 - 그래프 입력 계약: finite, `||x|| ≤ 65504`(fp16 norm 저장 한계).
@@ -245,10 +248,10 @@ Qwen3는 현재 delta-cache I/O(`genie_input_ids`)만 구현되어 있다. 그�
 ### 8.3 명세 대비 남은 조건과 다음 단계
 
 1. **메모리 경로(명세 5.3):** 복원이 그래프 안에서 전체 past에 대해 일어난다. 복원 결과(fp16)와 int8 변환 텐서가 HTP intermediate로 잡히므로, packed 저장만으로는 실제 peak 메모리 이득을 주장할 수 없다. tile 단위 복원이나 packed 소비형 attention 융합이 필요하다.
-2. **속도:** decode 경로의 LUT Gather가 병목이다. 후보는 세 가지이며 모두 실험 전이다.
-   - 복원을 과거 토큰 증분만 처리하도록 바꾸는 구조(예: 이전 스텝의 int8 past를 그래프 출력으로 유지)
-   - custom HVX op(`TQDecodeTile`)
-   - attention과 융합
+2. **속도:** 복원 서브그래프의 LUT `Gather`가 병목이었고, §6.1의 ladder `MatMul` 복원으로 바꿨다(§11.5에 전후 측정). Where 트리는 단독 그래프에서 2배 더 빠르지만 LLM 규모 컴파일이 실패해 보류했다. 그 뒤에도 매 스텝 과거 전체를 복원하는 구조는 같다. 남은 후보:
+   - context 길이 bucket(예: 256/512/1024 token 그래프)으로 실제 길이만큼만 복원(runner가 그래프를 고르고 cache를 옮겨야 함)
+   - Q를 회전 좌표계로 보내 K 복원의 회전 MatMul을 생략하고, AV 출력에서 역회전(attention 경로 encodings 재검토 필요)
+   - custom HVX op(`TQDecodeTile`) 또는 attention과 융합
 3. **runner:** shared buffer(rpcmem)와 smartmask KV 배치를 쓰면 baseline을 Genie 수준에 가깝게 비교할 수 있다. 명세의 "동일 runner 비교" 원칙은 현재도 지켜진다.
 4. **P4:** context 512/2048/4096, 응답 품질 평가, HTP 측 메모리(`dumpsys meminfo`, QNN 메모리 이벤트), 전력 조건 기록.
 5. **P5:** 0.6B/4B/8B는 같은 surgery·변환·runner로 적용 가능한 구조지만 실행하지 않았다.
@@ -448,24 +451,25 @@ ONNX 쪽 증거는 `{graph}.kv_edits.json`(tap·복제·guard·set 목록)과 �
 | 지표 | `baseline_int8` | `baseline_int16_kv` | `k4_v4` |
 |---|---:|---:|---:|
 | KV 저장 형식 | uFxp_8 (공유 scale) | uFxp_16 (tap grid 그대로, 무손실) | 4-bit packed + fp16 norm |
-| TTFT | 54 ms | 40 ms | 729 ms |
-| prefill (35토큰) | 648 tok/s | 877 tok/s | 48.1 tok/s |
-| decode | 41.75 tok/s (24.0 ms/tok) | 34.72 tok/s (28.8 ms/tok) | 1.43 tok/s (698 ms/tok) |
+| TTFT | 54 ms | 40 ms | 1263 ms |
+| prefill (35토큰) | 648 tok/s | 877 tok/s | 27.7 tok/s |
+| decode | 41.75 tok/s (24.0 ms/tok) | 34.72 tok/s (28.8 ms/tok) | 1.96 tok/s (512 ms/tok) |
 | host KV 저장소 (1024토큰) | 56.0 MiB | 112.0 MiB | 28.9 MiB |
 | runner I/O 버퍼 | 151.2 MiB | 263.2 MiB | 96.9 MiB |
-| 프로세스 VmRSS (종료 시) | 221.8 MiB | 391.7 MiB | 138.6 MiB |
-| WikiText PPL (4 window 통합) | 19.903 | 20.108 | 20.296 |
-| PPL vs `baseline_int8` | — | +1.03% | +1.97% |
-| PPL vs `baseline_int16_kv` | −1.02% | — | +0.93% |
-| window별 PPL | 11.651 / 23.729 / 22.017 / 25.781 | 11.545 / 24.098 / 21.856 / 26.888 | 12.600 / 23.931 / 21.178 / 26.573 |
+| 프로세스 VmRSS (종료 시) | 221.8 MiB | 391.7 MiB | 144.0 MiB |
+| WikiText PPL (4 window 통합) | 19.903 | 20.108 | 20.415 |
+| PPL vs `baseline_int8` | — | +1.03% | +2.57% |
+| PPL vs `baseline_int16_kv` | −1.02% | — | +1.53% |
+| window별 PPL | 11.651 / 23.729 / 22.017 / 25.781 | 11.545 / 24.098 / 21.856 / 26.888 | 12.637 / 24.182 / 21.309 / 26.674 |
 
-PPL은 teacher-forced라 세션 반복과 무관하다. `baseline_int8`과 `k4_v4`의 PPL은 이전 측정값을 그대로 쓴다(번들 불변). `baseline_int16_kv`의 기능 검증(1세션): 128토큰 생성 완료, `--stop-on-eos`에서 11번째 토큰 `<|im_end|>` 정지, 897토큰 프롬프트 + 128토큰으로 KV 1024/1024 채움. 고정 프롬프트의 첫 문장은 세 프로파일 모두 "Gravity is the force that pulls objects toward Earth."로 같았고 EOS 뒤 continuation은 다르다. 이것으로 품질 동등을 주장하지 않는다. HTP backend에는 CPU 분할이 없고 detailed profile의 모든 op이 accelerator cycle을 가지므로 CPU/GPU fallback은 없다.
+`k4_v4`는 §6.1의 ladder `MatMul` 복원으로 다시 변환·측정한 번들이다(이전 `Gather` 복원 번들은 decode 1.43 tok/s, TTFT 729 ms였다). PPL은 teacher-forced라 세션 반복과 무관하다. `baseline_int8`의 PPL은 번들 불변이라 이전 값을 쓴다. 세 프로파일 모두 128토큰 생성 완료, `--stop-on-eos`에서 11번째 토큰 `<|im_end|>` 정지, 897토큰 프롬프트 + 128토큰으로 KV 1024/1024 채움을 1세션에서 확인했다. 고정 프롬프트의 첫 문장은 모두 "Gravity is the force that pulls objects toward Earth."로 같았고 EOS 뒤 continuation은 다르다. 이것으로 품질 동등을 주장하지 않는다. HTP backend에는 CPU 분할이 없다.
 
 관찰:
 
 - `baseline_int16_kv`(무손실 16-bit 저장)는 int8 KV baseline보다 PPL이 **1.03% 나쁘다.** 이전에 float16으로 저장했을 때(+1.35%; §11.3)보다 차이가 줄었지만 부호는 같다. 즉 int8 KV 단계를 제거하는 것 자체가 이 모델에서는 PPL을 낮추지 않는다. 원인은 검증하지 않았다. 후보: 배포 checkpoint의 AdaScale·calibration이 int8 KV quantizer를 켠 채로 수행되어 하류 encodings가 그 분포에 맞춰져 있음, 그리고 attention 입력 int8 변환이 baseline과 다른 위치(Concat 출력)에서 한 번만 일어남(§11.4). "16-bit KV가 곧 상한"이라는 가정이 이 모델·양자화 경로에서는 성립하지 않으므로 비교는 두 baseline 모두에 대해 제시한다.
-- `k4_v4`(K·V 4-bit)는 `baseline_int8` 대비 +1.97%, `baseline_int16_kv` 대비 +0.93%다. window 0(12.600)에서 가장 나쁘고 window 2에서는 두 baseline보다 낮다. 단일 실행·4 window이므로 유의성을 주장하지 않고, 응답 품질 평가는 수행하지 않았다.
-- decode: `baseline_int16_kv`는 accelerator 시간이 baseline과 비슷하지만(§11.4) host KV 복사량이 2배(run당 1,379 vs 690 MiB)라 end-to-end는 느리다. `k4_v4`는 decode 1스텝에 part2/3/4 accelerator 241/246/204 ms가 걸리고(codec op 903/903/723개), 매 스텝 과거 1023토큰 전체를 복원하는 decode 서브그래프가 accelerator cycle의 86–88%를 차지한다. 그중 LUT `Gather`(`dec_centroid_pairs`)가 codec cycle의 대부분이며 새 토큰 encode는 작다.
+- `k4_v4`(K·V 4-bit)는 `baseline_int8` 대비 +2.57%, `baseline_int16_kv` 대비 +1.53%다. window 0(12.637)에서 가장 나쁘고 window 2에서는 두 baseline보다 낮다. 이전 `Gather` 번들(+1.97%)보다 약간 커졌는데, ladder `MatMul` centroid 복원이 반올림을 1회 추가하기 때문이다(§6.1). 단일 실행·4 window이므로 유의성을 주장하지 않고, 응답 품질 평가는 수행하지 않았다.
+- decode 속도: ladder `MatMul` 복원으로 `k4_v4` decode가 **1.43 → 1.96 tok/s(698 → 512 ms/tok)**로 빨라졌다(§6.1 단독 복원 그래프 9.7 → 4.2 ms). 여전히 `baseline_int8`의 약 1/21이며, 매 스텝 과거 1023토큰 전체를 복원하는 구조가 남은 병목이다(§8.3). 이번 1회 실행에서 TTFT(729 → 1263 ms)와 prefill(48 → 27.7 tok/s)은 오히려 나빠졌다: ladder는 임계값 축(15)을 브로드캐스트한 `[heads, past, 128, 15]` 중간 텐서를 만들어 128토큰 청크의 prefill에서 메모리·대역폭 비용이 크다. decode(새 토큰 1개, 과거 복원)에서는 이 비용보다 `Gather` 제거 이득이 커서 순이득이다. 이 prefill 회귀는 단일 실행이라 재확인이 필요하며, 필요하면 prefill 그래프만 `Gather`를 유지하는 혼합도 가능하다.
+- `baseline_int16_kv`는 accelerator 시간이 baseline과 비슷하지만(§11.4) host KV 복사량이 2배(run당 1,379 vs 690 MiB)라 end-to-end decode는 느리다.
 - 메모리: host 값만 측정했다. HTP intermediate·scratch·DMA-BUF는 **미측정**이다. int16 KV의 이론 payload(112 MiB)와 실측 NPU 메모리는 다른 값이다.
 
 ### 11.6 host 참고값 (장치 결과 아님)
@@ -480,6 +484,167 @@ HF Qwen3-1.7B의 float K/V snapshot(layer 0/13/27, 8 head × 256 token)에 4-bit
 
 codec 자체 오차(≈9%)에 int8 오차가 대략 제곱합으로 더해진다. 장치 K는 R3 회전 뒤 값이고 int8 grid도 다르므로 이 표는 경향 참고용이다.
 
-## 12. 출처
+## 12. 2026-09-17 성능 수정: centroid 복원·비교 축·head 배치
+
+### 12.1 원인과 변경
+
+`k4_v4`의 KV 저장 용량 감소는 attention 계산량 감소를 뜻하지 않는다.
+AR=1/context=1024에서도 `decode_subgraph`는 유효 캐시 길이와 무관하게
+각 K/V의 과거 1023토큰을 복원한다. 28 layer × K/V × 8 heads × 1023 × 128
+= 58,662,912개 값을 매 생성 토큰마다 복원하고, norm 보정과 dense inverse
+rotation을 수행한 다음 attention의 int8 경계로 넘긴다. host에 저장된
+packed KV는 작아도 그래프 내부에는 전체 FP16 KV가 생긴다. WSL RAM 증설은
+변환 작업의 OOM에는 도움이 되지만 이 장치 실행 비용을 없애지는 않는다.
+
+동일 장치에서 기존 ladder 번들을 다시 실행한 마지막 세션의 decode step
+평균은 host prepare 1.488ms, commit 0.063ms, 4개 QNN 호출 합계 508.067ms였다
+(`perf_k4_v4_before_affine.json`). host KV 복사보다 장치 그래프 실행이 지배적이다.
+logits 처리까지 포함한 decode는 3회 세션 중앙값 1.94895 tok/s,
+4개 window 합산 PPL은 20.414824로 기존 보고를 재현했다.
+
+추가 병목은 ONNX 연산의 배치였다.
+
+- **Encode:** 기존 비교 텐서 `[heads, tokens, 128, 15]`를
+  `[heads, tokens, 15, 128]`로 변경했다. 마지막 축에 128개의 head 성분을
+  유지해 HTP의 벡터 연산이 가능하도록 하고, INT32 합산 축만 함께 옮겼다.
+- **Decode:** 15개 임계값을 브로드캐스트하는 ladder MatMul을 제거했다.
+  대칭 codebook의 index를 `abs(index - 7.5) - 0.5`로 0..7에 접고,
+  인접 centroid 두 개씩을 잇는 네 개 선형식 중 하나를 선택한 뒤 부호를
+  복원한다. 정수 index 0..15에서는 원래 codebook lookup과 같은 수식이다.
+  FP16 연산 순서는 달라지므로 bit-exact 주장이 아니라 기존 수치 tolerance로
+  검증한다. 15-fold 중간 텐서가 없어져 1023토큰, 8 head 복원에서 최대 단일
+  FP16 중간 텐서는 약 30MiB에서 2MiB로 줄었다(전체 peak allocation 수치는 아님).
+- packed byte 순서, codebook, 회전 seed/행렬, norm 보정, cache ABI와
+  `config_hash()`는 유지했다. 새 byte 포맷이나 host CPU codec은 추가하지 않았다.
+- **실제 모델 배치:** standalone `[1, heads, tokens, dim]`과 달리 모델 ABI는
+  `[heads, 1, tokens, dim]`이다. 같은 affine decoder도 후자에서는 HTP가
+  heads를 batch로 처리하여 1023토큰 K 복원이 1.557ms에서 7.477ms로 느려졌다.
+  codec 내부를 `[1, heads, tokens, dim]`으로 정규화하고 경계에서만 element
+  순서를 보존하는 Reshape를 넣었다. packed 입력은 UINT8 Transpose 제약을
+  피하도록 float Cast 후 reshape한다. 입출력 ABI와 runner는 그대로다.
+  실제 모델 ABI의 K/V 복원 시간이 1.875/1.900ms로 줄었고, 수치 검증을
+  통과했다. batch 변경은 codec 내부에만 적용하며 attention 배치는 바꾸지 않는다.
+
+### 12.2 단독 codec 검증
+
+동일 S26/SM8850, QAIRT 2.48, HTP backend, burst 설정. 아래는 standalone
+`qnn-net-run` basic profile의 마지막 실행 accelerator 시간이며, 전체 LLM
+속도로 환산하지 않는다. 이 표는 `[1, heads, tokens, dim]` standalone
+배치의 진단 결과이고, 실제 ABI 결과는 아래에 별도로 기록한다.
+
+| 경로 (8 heads) | 기존 ladder | 수정 후 |
+|---|---:|---:|
+| K encode, 128토큰 | 3.910ms | 0.622ms |
+| V encode, 128토큰 | 3.916ms | 0.608ms |
+| K decode, 128토큰 | 0.849ms | 0.467ms |
+| V decode, 128토큰 | 0.852ms | 0.457ms |
+| K decode, 1023토큰 | 약 4.2ms (§6.1) | 1.557ms |
+| V decode, 1023토큰 | — | 1.553ms |
+
+1/128토큰의 encode/decode 8개 그래프와 1023토큰 decode 2개 그래프 모두
+실제 KV 및 full-FP16-range 입력에서 기존 tolerance를 통과했다. 1023토큰의
+최대 decode 상대 오차는 K=0.001521, V=0.001409(기준 0.005). basic와 detailed
+실행 및 DLC op의 HTP profile 확인도 통과했다. 긴 codec 입력은 기록된
+256토큰 snapshot의 벡터를 반복한 것이며, 모델의 긴 문맥 품질 검증과 다르다.
+
+근거: `~/.qaihm/tmp/turboquant/{p2_ladder,p2_affine,p2_affine_1023}/p2_report.json`.
+실제 모델 ABI로 최종 소스를 재검증한
+`{p2_optimized_hub,p2_optimized_hub_1023}/p2_report.json`에서는
+K/V encode 128토큰 0.621/0.609ms, decode 128토큰 0.478/0.470ms,
+decode 1023토큰 1.875/1.900ms였다. 이 마지막 검증의 decode 상대 오차는
+K=0.00152047, V=0.00140818로 기준 0.005 이내다.
+
+전체 byte 값, K/V, norm correction on/off, zero/큰 norm, decoder 중간 텐서
+크기, encode 비교 축, 실제 Hub I/O와 내부 batch 배치를 포함한 관련 테스트
+158개를 통과했다. `htp_codec_validation.py --head-major`로 모델과 같은 I/O를
+검증할 수 있다. `[1, heads]` 단독 수치를 모델의 `[heads, 1]` 경로에 그대로
+대입하면 이 배치 병목을 놓치게 된다.
+
+### 12.3 전체 모델 실측
+
+S26/SM8850, CL=1024, 같은 가중치·runner·burst 설정, 35토큰 prompt,
+128토큰 greedy, **각 번들 3개 연속 세션의 중앙값**이다. 프로파일링은 끄고
+측정했고 모델 로딩은 TTFT에서 제외한다. 별도 warmup 제외나 온도 통제·
+실행 순서 교차는 하지 않았으므로 체계적인 P4 결과가 아니라 이번 수정의
+동일 장치 재측정이다. baseline 두 종류와 수정 전 ladder 번들도 재실행했다.
+PPL은 같은 WikiText 4 window의 NLL 합계 / 4,092토큰으로 산출했다.
+
+| 지표 | int8 baseline | int16 KV baseline | 수정 전 `k4_v4` | 수정 후 `k4_v4` |
+|---|---:|---:|---:|---:|
+| TTFT | 49.4ms | 35.5ms | 1269.5ms | **117.8ms** |
+| prefill | 710.7 tok/s | 990.0 tok/s | 27.59 tok/s | **299.12 tok/s** |
+| decode | 41.795 tok/s | 32.425 tok/s | 1.949 tok/s | **10.759 tok/s** |
+| decode 범위 (3세션) | 41.776–42.152 | 32.230–32.458 | 1.946–1.952 | 10.742–10.965 |
+| host KV 저장소 | 56.0MiB | 112.0MiB | 28.875MiB | 28.875MiB |
+| 프로세스 종료 VmRSS | 223.2MiB | 391.4MiB | 143.9MiB | 144.2MiB |
+| PPL (4 window) | 19.903103 | 20.108306 | 20.414824 | 20.463505 |
+
+수정 전 대비 decode **5.52배**, prefill **10.84배**, TTFT **10.78배** 개선했다.
+PPL은 **+0.238%**로 약간 나빠졌다(int8 baseline 대비 +2.816%, int16 대비
++1.766%). window별 PPL은 12.591734 / 24.004772 / 21.468385 / 27.023249다.
+codebook·ABI는 같지만 FP16 실행 순서·배치가 달라졌으므로 품질이 완전히
+같다고 주장하지 않는다. 4 window만으로 응답 품질이나 통계적 유의성을
+판정하지 않는다. VmRSS는 host 값이며 HTP/DMA-BUF peak memory는 아니다.
+
+변경을 분리한 전체 모델 중간 측정도 수행했다. centroid 복원과 비교 축만
+수정한 번들은 decode 2.809 tok/s, TTFT 364.1ms였다. 실제 모델의 head 배치를
+추가로 정규화한 뒤 10.759 tok/s, 117.8ms가 됐다. 따라서 standalone codec의
+빠른 결과만으로 모델 성능을 예측하면 실제 배치 문제를 놓친다.
+
+최종 번들의 마지막 세션에서 decode step 평균 QNN 호출 합계는
+**89.257ms**(수정 전 508.067ms), host prepare/commit은 1.185/0.043ms였다.
+여전히 int8 baseline보다 decode가 **3.88배 느리다.** 과거 1023토큰 전체의
+dequantization·norm 보정·dense inverse rotation이 매 layer/step에 남아 있기
+때문이다. 압축은 현재 **호출 사이의 host KV 저장량**을 줄이는 기능이지
+packed KV를 직접 소비하는 attention 구현이 아니다. baseline 수준의 속도를
+목표로 한다면 다음 단계는 유효 길이에 맞춘 그래프 버킷 또는 packed decode와
+attention의 fused/tiled HTP 구현이며, 그 성능은 이번 결과로 입증하지 않았다.
+
+기능 검증:
+
+- 3세션 각각 128토큰 생성 완료, reset 뒤 생성 token ID 완전 일치.
+- EOS 처리 2세션 모두 11번째 토큰 `<|im_end|>`에서 정지, token ID 일치.
+- 897토큰 prompt + 128토큰 생성으로 cache 1024/1024 도달, 2세션 token ID 일치.
+- prompt/token × part 2/3/4의 KV 양자화 경계 검사 통과: packed UINT8와
+  FP16 norm ABI, codec 이전 16-bit 경계와 attention int8 경계를 유지한다.
+- 별도 detailed profile의 prefill/decode 양쪽에서 28개 layer 전체의 codec
+  op이 HTP에 기록됨. decode part 2/3/4의 accelerator execute 시간은
+  28.114/27.940/28.729ms이며, codec 이름의 op cycle 합계는 각 part 전체
+  op cycle 합계의 82.2/82.2/77.9%였다(벽시계 시간의 비중은 아님).
+  detailed profiling은 큰 계측 오버헤드가 있으므로 그 실행의 TTFT·tok/s를
+  위 성능 표에 섞지 않았다.
+- 관련 단위 테스트 158개 및 변경 파일의 pre-commit 검사 통과.
+
+산출물은 `~/.qaihm/tmp/turboquant/` 아래에 있으며, 원래 번들은 보존했다.
+
+- 최종 번들: `qwen3_1_7b_k4_v4_optimized_cl1024/`;
+  device bundle: `k4_v4_optimized_cl1024`.
+- `reports/perf_{baseline_int8_affine_control,baseline_int16_affine_control,k4_v4_before_affine,k4_v4_optimized}.json`:
+  세션별 측정, step별 host/QNN 시간, host 메모리.
+- 같은 이름의 `quality_*.json`: window별 NLL과 통합 PPL.
+- `reports/generation_{eos,boundary}_k4_v4_optimized.json`: reset/EOS/context 경계.
+- `reports/boundary_k4_v4_optimized.json`: 변환된 그래프의 양자화 경계 검사.
+- `reports/profile_k4_v4_optimized.json`: 별도 prefill/decode HTP op profile.
+
+### 12.4 재현
+
+기존 번들을 덮어쓰지 않고 수정된 소스로 재변환해야 한다.
+
+```bash
+PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
+    --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
+    --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_k4_v4_optimized_cl1024 \
+    --context-length 1024 --profile k4_v4
+PYTHONPATH=src python scripts/llm/turboquant/run_device_llm.py push \
+    --bundle-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_k4_v4_optimized_cl1024 \
+    --name k4_v4_optimized_cl1024
+PYTHONPATH=src python scripts/llm/turboquant/run_device_llm.py run \
+    --name k4_v4_optimized_cl1024 \
+    --assets ~/.qaihm/tmp/turboquant/device_assets_cl1024 \
+    --mode generate --n-gen 128 --sessions 3 \
+    --report ~/.qaihm/tmp/turboquant/reports/perf_k4_v4_optimized.json
+```
+
+## 13. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

@@ -88,12 +88,15 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def graph_specs() -> list[dict[str, Any]]:
+def graph_specs(
+    token_counts: tuple[int, ...] = TOKEN_COUNTS,
+    operations: tuple[str, ...] = ("encode", "decode"),
+) -> list[dict[str, Any]]:
     config = get_profile(PROFILE)
     graphs = []
     for which in ("key", "value"):
-        for tokens in TOKEN_COUNTS:
-            for op in ("encode", "decode"):
+        for tokens in token_counts:
+            for op in operations:
                 graphs.append(
                     {
                         "name": f"tq_{op}_{which}_t{tokens}",
@@ -138,12 +141,13 @@ def encode_cases(snapshot: Any, which: str, tokens: int) -> dict[str, np.ndarray
     """Real Qwen3 KV (first and last layer) plus the input-domain range case."""
     kind = "keys" if which == "key" else "values"
     start = 0 if tokens > 1 else 128
-    cases = {
-        f"layer{layer}": snapshot[f"layer{layer}_{kind}"][
-            None, :, start : start + tokens
-        ]
-        for layer in (0, 27)
-    }
+    # Repeat recorded vectors for cache-sized throughput probes. This is a
+    # codec microbenchmark, not a claim of full-model long-context quality.
+    cases = {}
+    for layer in (0, 27):
+        values = snapshot[f"layer{layer}_{kind}"]
+        positions = np.arange(start, start + tokens) % values.shape[1]
+        cases[f"layer{layer}"] = np.take(values, positions, axis=1)[None]
     cases["range"] = range_case(tokens, seed=tokens * 10 + (which == "value"))
     return {
         name: np.ascontiguousarray(x, dtype=np.float32) for name, x in cases.items()
@@ -184,6 +188,7 @@ def cmd_build(args: argparse.Namespace) -> None:
     config = get_profile(PROFILE)
     manifest: dict[str, Any] = {
         "profile": PROFILE,
+        "head_major": args.head_major,
         "config": config.to_dict(),
         "config_hash": config.config_hash(),
         "qairt_sdk": str(args.sdk),
@@ -194,17 +199,26 @@ def cmd_build(args: argparse.Namespace) -> None:
         "graphs": {},
     }
 
-    for g in graph_specs():
+    for g in graph_specs(tuple(args.tokens), tuple(args.operations)):
         name = g["name"]
         spec, codec = codec_for(g["which"])
         builder = build_encode_model if g["op"] == "encode" else build_decode_model
-        model = builder(config, spec, HEADS, g["tokens"], graph_name=name)
+        model = builder(
+            config,
+            spec,
+            HEADS,
+            g["tokens"],
+            graph_name=name,
+            head_major=args.head_major,
+        )
         onnx_path = work / "onnx" / f"{name}.onnx"
         onnx.save(model, onnx_path)
 
         cases = encode_cases(snapshot, g["which"], g["tokens"])
         input_lines, ort_reports = [], {}
         for case, x in cases.items():
+            if args.head_major:
+                x = x.reshape(HEADS, 1, g["tokens"], D)
             if g["op"] == "encode":
                 x16 = x.astype(np.float16)
                 raw = work / "inputs" / f"{name}_{case}_x.raw"
@@ -442,8 +456,8 @@ def cmd_run(args: argparse.Namespace) -> None:
         "/system/lib/rfsa/adsp:/dsp'"
     )
     runs: dict[str, Any] = {"device": device_info, "runs": {}}
-    for g in graph_specs():
-        name = g["name"]
+    manifest = json.loads((work / "manifest.json").read_text())
+    for name in manifest["graphs"]:
         for level in PROFILING_LEVELS:
             out_dir = f"out_{name}_{level}"
             local = device_out / out_dir
@@ -534,6 +548,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
         "graphs": {},
     }
     all_passed = True
+    lead = (HEADS, 1) if manifest.get("head_major", False) else (1, HEADS)
     for name, info in manifest["graphs"].items():
         spec, codec = codec_for(info["which"])
         tokens = info["tokens"]
@@ -556,10 +571,8 @@ def cmd_compare(args: argparse.Namespace) -> None:
             result = out_dir / f"Result_{i}"
             if info["op"] == "encode":
                 x = np.load(work / "inputs" / f"{name}_{case}_x.npy")
-                packed = read_native(
-                    result, "packed", "uint8", (1, HEADS, tokens, D // 2)
-                )
-                norm = read_native(result, "norm", "float16", (1, HEADS, tokens, 1))
+                packed = read_native(result, "packed", "uint8", (*lead, tokens, D // 2))
+                norm = read_native(result, "norm", "float16", (*lead, tokens, 1))
                 cmp = compare_encode(codec, x, packed, norm, HTP_FP16)
                 decoded = codec.decode(
                     unpack_indices(packed, spec.bits, D), norm.astype(np.float64)
@@ -572,11 +585,11 @@ def cmd_compare(args: argparse.Namespace) -> None:
             else:
                 packed = np.fromfile(
                     work / "inputs" / f"{name}_{case}_packed.raw", dtype=np.uint8
-                ).reshape(1, HEADS, tokens, D // 2)
+                ).reshape(*lead, tokens, D // 2)
                 norm = np.fromfile(
                     work / "inputs" / f"{name}_{case}_norm.raw", dtype=np.float16
-                ).reshape(1, HEADS, tokens, 1)
-                x_hat = read_native(result, "x_hat", "float16", (1, HEADS, tokens, D))
+                ).reshape(*lead, tokens, 1)
+                x_hat = read_native(result, "x_hat", "float16", (*lead, tokens, D))
                 cmp = compare_decode(codec, packed, norm, x_hat, HTP_FP16)
             entry["cases"][case] = cmp
         profiled = set(
@@ -602,11 +615,25 @@ def main() -> None:
     parser.add_argument("stage", choices=["build", "run", "compare", "all"])
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--tokens", type=int, nargs="+", default=list(TOKEN_COUNTS))
+    parser.add_argument(
+        "--head-major",
+        action="store_true",
+        help="Use the real Hub KV I/O layout [heads, 1, tokens, dim].",
+    )
+    parser.add_argument(
+        "--operations",
+        choices=["encode", "decode"],
+        nargs="+",
+        default=["encode", "decode"],
+    )
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     parser.add_argument("--ndk", type=Path, default=DEFAULT_NDK)
     parser.add_argument("--adb", type=Path, default=DEFAULT_ADB)
     args = parser.parse_args()
+    if any(tokens < 1 for tokens in args.tokens):
+        parser.error("--tokens must be positive")
     args.work_dir = args.work_dir.expanduser()
     args.snapshot = args.snapshot.expanduser()
     if args.stage in ("build", "all"):
