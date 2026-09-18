@@ -180,14 +180,29 @@ def cmd_push(args: argparse.Namespace) -> None:
         print(f"{local.name}: {'pushed' if changed else 'up to date'}", flush=True)
     conversion = bundle / "convert_report.json"
     metadata = json.loads(conversion.read_text()) if conversion.exists() else {}
+    runtime_metadata = {
+        k: metadata[k]
+        for k in ("context_length", "context_buckets", "config_hash", "config")
+        if k in metadata
+    }
+    if native := metadata.get("native_decoder"):
+        lib = native["libraries"]["hexagon-v81"]
+        local = Path(lib["path"])
+        if sha256_file(local) != lib["sha256"]:
+            raise ValueError(
+                "Native package changed since conversion; rebuild the bundle"
+            )
+        push_if_changed(args, local, f"{remote_bundle}/{local.name}")
+        runtime_metadata["native_decoder"] = {
+            "package": native["package"],
+            "interface": native["interface"],
+            "library": local.name,
+            "sha256": lib["sha256"],
+        }
     runtime = bundle / "runtime_manifest.json"
     runtime.write_text(
         json.dumps(
-            {
-                k: metadata[k]
-                for k in ("context_length", "context_buckets", "config_hash", "config")
-                if k in metadata
-            },
+            runtime_metadata,
             indent=2,
         )
         + "\n"
@@ -236,6 +251,15 @@ def cmd_run(args: argparse.Namespace) -> None:
         f"--mode {args.mode} --tokens {remote_assets}/{tokens}",
         f"--n-gen {args.n_gen} --report {remote_report}",
     ]
+    native = runtime.get("native_decoder")
+    if native:
+        package_path = f"{remote_bundle}/{native['library']}"
+        digest = adb(args, "shell", "sha256sum", package_path).split()[0]
+        if digest != native["sha256"]:
+            raise ValueError("Device native decoder does not match the context bundle")
+        runner_args.append(
+            f"--op-package {package_path} --op-package-provider {native['interface']}"
+        )
     if args.stop_on_eos:
         runner_args.append("--stop-on-eos")
     buckets = args.context_buckets or runtime.get("context_buckets", [])
@@ -260,7 +284,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         runner_args.append(f"--sessions {args.sessions}")
     script = (
         f"cd {DEVICE_ROOT}/bin && export LD_LIBRARY_PATH={DEVICE_ROOT}/bin:/vendor/lib64 "
-        f"&& export ADSP_LIBRARY_PATH='{DEVICE_ROOT}/bin:/vendor/dsp/cdsp:/vendor/lib/rfsa/adsp:/system/lib/rfsa/adsp:/dsp' "
+        f"&& export ADSP_LIBRARY_PATH='{remote_bundle}:{DEVICE_ROOT}/bin:/vendor/dsp/cdsp:/vendor/lib/rfsa/adsp:/system/lib/rfsa/adsp:/dsp' "
         f"&& {' '.join(runner_args)} 2>&1; echo __RC__$?"
     )
     out = adb(args, "shell", script, check=False)
@@ -284,6 +308,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     }
     report["bundle_name"] = args.name
     report["context_buckets"] = buckets or [assets["context_length"]]
+    if native:
+        report["native_decoder"] = native
     if runtime.get("config_hash"):
         report["config_hash"] = runtime["config_hash"]
     report["assets"] = {

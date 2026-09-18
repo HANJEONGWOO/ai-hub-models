@@ -958,6 +958,151 @@ decode 목표를 달성했지만, 전체 1023토큰 처리 조건의 목표는 �
 - `p2_scaled_20260917/p2_report.json`: 기존 tolerance를 그대로 적용한 standalone
   HTP codec 수치 결과. 전체 판정은 실패이며 성능 개선과 별개로 확인해야 한다.
 
-## 15. 출처
+## 15. Native unpack + LUT decoder
+
+### 15.1 변경 범위와 재현 경로
+
+`convert_parts.py --native-decoder-package PATH`로 선택하는 HTP V81 QHPI
+패키지 `TurboQuantNative::Decode4`를 추가했다. 기존 graph decoder와 배포
+바이너리는 보존하며 기본 실행 경로도 바꾸지 않는다. 지원 범위는 D128,
+K4/V4, FP16 effective scale을 사용하는 format-2 rotated/tiled attention이다.
+
+- UINT8 packed tile의 상위 nibble부터 인덱스를 추출하고, HVX `vlut16`으로
+  16-entry FP16 centroid를 조회한 뒤 FP16 scale을 곱한다. 기존 그래프의
+  unpack·centroid 선택·scale 곱을 하나의 native decoder 연산으로 대체한다.
+- 두 행씩 벡터 처리하며 홀수 마지막 행은 유효한 64byte만 읽는다. 입력과
+  출력의 정렬을 가정하지 않고, QHPI 실행 slice별로 겹치지 않는 행을 처리한다.
+- encoder, packed cache ABI, query/output 회전, QK·global softmax·AV와
+  calibration은 유지한다. **복원과 attention을 하나의 커널로 합친 것은 아니다.**
+  FP16 tile 중간 결과는 여전히 존재하며 과거 KV를 처리하는 점근적 연산량도
+  그대로다. 같은 작업을 훨씬 적은 벡터 명령과 graph op로 수행하는 변경이다.
+- x86 library는 offline context 준비에, Hexagon library는 실제 HTP 실행에
+  사용한다. runner는 context를 읽기 전에 package를 등록한다. 배포 manifest의
+  DSP library SHA256을 push와 run 양쪽에서 검사한다.
+- QAIRT 2.48, Hexagon SDK 6.6 및 V81 compiler가 필요하다. SDK 소스나
+  라이브러리는 저장소에 포함하지 않았다. 빌드·기기 검증·변환·배포 명령은
+  `scripts/llm/turboquant/README.md`의 Native 절에 있다.
+
+### 15.2 수치 및 구조 검증
+
+- standalone HTP decoder를 KV 길이 1/3/127/128/255/256/1023에서 실행했다.
+  256종 packed byte, 난수, 0 및 작은/큰 FP16 scale을 포함한 실제 기기 결과는
+  `FP16(FP16(centroid) * FP16(scale))` oracle과 **100% bit-exact**였다.
+  이것은 테스트한 유한 입력의 결과이지 모든 실수 입력에 대한 오차 보장이 아니다.
+- 동일 HVX 코드의 host libnative 검사는 정렬되지 않은 I/O, 홀수 tail 및
+  canary 영역을 포함해 통과했다. ONNX 테스트에는 독립적인 정수 unpack/LUT
+  reference function을 붙이지만, 배포 모델에는 붙이지 않아 converter가
+  native op를 다시 일반 그래프로 펼치지 않도록 했다.
+- attention DLC 21개가 raw UINT8 packed / FP16 scale I/O, native decoder의
+  FP16 출력, 기존 decoder 노드 제거, FP16 회전 attention 및 16-bit KV 쓰기
+  검사를 모두 통과했다. 최대 단일 FP16 복원 tile은 **512KiB**로 유지된다.
+- format-2 encoder는 수정하지 않았다. §14.2의 **기존 encoder scale 기준
+  실패(0.2564% > 0.2%)는 해결하지 않았으며**, native decoder 통과와 구분한다.
+  centroid와 곱셈의 FP16 반올림을 포함하므로 end-to-end PPL도 별도 평가한다.
+
+### 15.3 실기기 성능: 긴 문맥 decode 목표 도달
+
+S26/SM8850, Qwen3-1.7B W4A16, CL1024, 같은 runner·가중치·burst 설정에서
+구성 및 입력 조건당 **1회** 측정했다. baseline 두 바이너리의 기기 SHA256은
+기존 배포 manifest와 일치한다. profiling은 끄고 모델 로딩은 TTFT에서 제외했다.
+별도 warmup 제외, 온도 통제, 실행 순서 교차나 분산 추정은 하지 않았다.
+성능 실행은 재시도하거나 과거 측정과 평균하지 않았다.
+
+주요 조건은 **897토큰 prompt + 128토큰 생성**이다. 마지막 생성 토큰을
+제외한 127개의 decode 입력까지 KV에 저장하여 캐시가 정확히 1024에 도달하며,
+세 구성 모두 127개 decode step 전체가 C1024를 사용한다.
+
+| 지표 | int16 KV baseline | 기존 TQ-Graph | TQ-Native LUT |
+|---|---:|---:|---:|
+| TTFT | 318.2ms | 718.4ms | 567.2ms |
+| prefill | 2820.63 tok/s | 1249.20 tok/s | 1584.24 tok/s |
+| decode | 34.756 tok/s | 13.893 tok/s | **38.150 tok/s** |
+| decode 시간/token | 28.772ms | 71.979ms | **26.212ms** |
+| host KV 저장소 | 112.000MiB | 28.875MiB | 28.875MiB |
+| resident graph I/O buffer | 263.179MiB | 222.197MiB | 222.197MiB |
+| 종료 VmRSS | 391.676MiB | 295.582MiB | 291.953MiB |
+| 프로세스 VmHWM | 605.016MiB | 605.352MiB | 605.289MiB |
+| PPL, 4 window / 4092토큰 | 20.108306* | 20.388335* | 20.498138 |
+
+`*` PPL만 변경하지 않은 기존 바이너리의 측정값을 재사용했다. 성능은 세 구성
+모두 이번에 새로 1회씩 측정했다. Native PPL은 4개 window에서 각각
+12.654283 / 23.697976 / 21.626364 / 27.222334이며, 합산 NLL로 PPL을 계산했다.
+기존 graph 대비 **+0.539%**, int16 대비 **+1.939%**다. standalone FP16 LUT
+oracle과 bit-exact인 것은 기존 compiled graph 및 전체 모델과 bit-exact임을
+뜻하지 않는다. 명시적인 FP16 LUT 연산 및 compiler 실행 계획 변경의 수치
+영향을 분리한 ablation은 하지 않았다. 이 네 window로 일반적인 품질 동등성을
+주장하지 않는다.
+
+- 긴 문맥 decode는 기존 graph 대비 **2.746배**, int16 대비 **9.77%** 높은
+  처리량이다. 이번 배포 구성의 단회 측정에서는 int16 목표에 도달했지만,
+  반복 측정 없는 결과이므로 안정적인 우위나 다른 길이·기기의 우위를 보장하지 않는다.
+- TTFT와 prefill은 기존 graph보다 좋아졌으나 **int16보다 여전히 느리다**.
+- host KV는 int16 대비 74.22% 작고 기존 graph와 동일하다. 종료 VmRSS는
+  줄었지만 **프로세스 peak VmHWM은 사실상 그대로**다. 이 수치들은 NPU 전체
+  메모리나 peak HTP 메모리 절감률을 나타내지 않는다.
+- 35토큰 prompt + 128토큰 생성의 별도 단회 결과는 아래와 같다. TQ 두 구성은
+  C128 93step / C256 34step, int16은 C1024 고정이다. **버킷화한 int16과의
+  비교가 아니므로**, 짧은 문맥의 차이를 decoder kernel만의 효과로 해석하지 않는다.
+
+| 짧은 입력 지표 | int16 KV baseline | 기존 TQ-Graph | TQ-Native LUT |
+|---|---:|---:|---:|
+| TTFT | 42.0ms | 60.9ms | 58.9ms |
+| prefill | 837.29 tok/s | 578.62 tok/s | 597.78 tok/s |
+| decode | 35.049 tok/s | 44.327 tok/s | **54.427 tok/s** |
+
+### 15.4 개선 원인과 남은 비용
+
+긴 입력의 비계측 성능 실행에서 평균 decode 단계의 host prepare / QNN 호출
+합계 / commit은 int16 **5.034 / 22.892 / 0.273ms**, 기존 graph
+**2.901 / 66.410 / 0.055ms**, Native **1.136 / 24.475 / 0.014ms**다.
+따라서 Native가 int16보다 빠른 **end-to-end** 결과에는 작은 packed cache의
+host I/O 이점도 포함된다. QNN 호출 시간만 보면 아직 int16보다 약 1.58ms
+느리며, native attention 계산 자체가 int16보다 빠르다고 주장하지 않는다.
+
+별도 C1024 detailed profile에서는 다음을 확인했다. 이 진단 실행의 느려진
+TTFT/decode 시간은 위 성능 수치에 포함하지 않았다.
+
+| part | graph accelerator execute | Native accelerator execute | graph 복원 op cycle 비중 | Native 복원 op cycle 비중 |
+|---|---:|---:|---:|---:|
+| 2 | 19.851ms | 7.002ms | 84.5% | 46.5% |
+| 3 | 20.553ms | 7.105ms | 84.4% | 46.6% |
+| 4 | 20.475ms | 10.095ms | 80.5% | 39.1% |
+
+Native decoder 실행 이벤트는 각각 80/80/64개로, 28개 레이어 × K/V × 4개
+tile에 해당한다. 복원 경로의 op cycle 합계는 545,751,309 → 82,453,336으로
+약 **84.9% 감소**했다. 단, op cycle의 합계·비중은 벽시계 시간의 비중이 아니다.
+복원 경로에는 decoder 외에 tile slice/layout 등도 포함하며, Native Decode4
+자체의 cycle 합계는 51,106,047이다. 복원과 attention 사이의 FP16 tile,
+layout 전환, QK/AV 연산 및 host I/O는 여전히 남아 있다.
+
+EOS 11번째 토큰 정지, 2회 세션 reset의 동일 token ID, 600토큰 생성 중 최소
+버킷 선택과 128→256→512→1024 전환, 긴 성능 실행의 1024 캐시 경계가 모두
+통과했다. 별도 기능 실행의 시간은 성능 표에서 제외했다. TurboQuant 단위
+테스트 **238개** 및 변경 파일 pre-commit 검사(mypy 포함)도 통과했다.
+
+### 15.5 산출물
+
+`~/.qaihm/tmp/turboquant/` 아래에 원본 및 이번 결과를 함께 보존했다.
+
+- `qwen3_1_7b_native_lut_buckets/`, device bundle `native_lut_buckets`:
+  non-KV part 1만 기존 번들에서 재사용하고 attention part 2/3/4를 교체했다.
+  각 part의 7개 그래프가 weight-shared context에 묶여 있다.
+- `native_decoder_hvx_20260918/`: 실제 사용한 prepare/DSP package와 manifest.
+  DSP library SHA256은
+  `a7c004fa9f824b5646913c565d88a95c0f6440eb35ee6f0c92c575aa21b68b3c`다.
+- `native_hvx_validation_20260918/correctness.json`: standalone 기기 수치 검증.
+- `reports/comparison_native_lut_buckets.json`: 조건·성능·PPL·profile·기능 및
+  수치 기준의 통합 요약. `summarize_native_results.py`로 원본에서 재생성한다.
+- `reports/perf_{baseline_int16_native_control,graph_native_control,native_lut}_{short,long}_once.json`:
+  총 6개 단회 성능 원본. `profile_*_long.json`과 분리했다.
+- `reports/quality_native_lut_buckets.json`, `reports/score_native_lut_w{0,1,2,3}.json`:
+  PPL 합산 및 window별 원본.
+- `reports/boundary_native_lut_buckets.json`,
+  `reports/generation_native_lut_{reset,eos,switches}.json`: 구조·기능 검사.
+- 기존 graph와 int16 번들은 수정하지 않았으며, `--native-decoder-package`를
+  지정하지 않으면 기존 graph decoder가 사용된다. §14.2의 encoder 수치 한계가
+  남아 있으므로 새 경로는 opt-in으로 유지한다.
+
+## 16. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

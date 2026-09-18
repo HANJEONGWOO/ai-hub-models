@@ -152,3 +152,76 @@ target is not met. No bucketed int16 baseline was tested. PPL was 20.388335
 (baseline 20.108306), and the standalone scale-encoder tolerance gate still
 fails. The profile remains opt-in. See design §14 for the one-run comparison,
 memory overhead, correctness checks and remaining packed-KV restore bottleneck.
+
+## Native unpack + LUT decoder (HTP V81, opt-in)
+
+`--native-decoder-package` replaces only each rotated KV tile's decoder with
+the `TurboQuantNative::Decode4` QHPI op. Its HVX kernel unpacks MSB-first nibbles,
+uses a 16-entry halfword LUT, and multiplies by the stored FP16 effective scale.
+The format-2 cache ABI, encoder, query/output rotations, QK/softmax/AV operations,
+and calibrated attention grids are unchanged. This is **not** a fused attention
+kernel. The original graph decoder remains the default when the flag is absent.
+
+The x86 library provides offline preparation and a scalar implementation; the
+V81 library executes vector instructions on HTP. Neither SDK source nor SDK
+libraries are vendored. QHPI from QAIRT 2.48 and a V81-capable Hexagon compiler
+are required. `--test-hvx` additionally uses the SDK's host libnative simulator.
+
+```bash
+python scripts/llm/turboquant/native_decoder/build.py \
+    --out ~/.qaihm/tmp/turboquant/native_decoder_v81 --test-hvx
+PYTHONPATH=src python scripts/llm/turboquant/validate_native_decoder.py all \
+    --package ~/.qaihm/tmp/turboquant/native_decoder_v81 \
+    --work-dir ~/.qaihm/tmp/turboquant/native_decoder_validation \
+    --tokens 1 3 127 128 255 256 1023
+PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
+    --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
+    --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_native_lut_buckets \
+    --context-length 1024 --context-buckets 128 256 512 1024 \
+    --profile k4_v4_scaled --attention-tile 256 --rotated-attention \
+    --native-decoder-package ~/.qaihm/tmp/turboquant/native_decoder_v81
+PYTHONPATH=src python scripts/llm/turboquant/verify_rotated_attention.py \
+    --bundle ~/.qaihm/tmp/turboquant/qwen3_1_7b_native_lut_buckets \
+    --report ~/.qaihm/tmp/turboquant/reports/boundary_native_lut.json
+bash scripts/llm/turboquant/qnn_runner/build_android.sh \
+    ~/.qaihm/tmp/turboquant/qnn_runner/native-decoder
+PYTHONPATH=src python scripts/llm/turboquant/run_device_llm.py push \
+    --bundle-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_native_lut_buckets \
+    --runner ~/.qaihm/tmp/turboquant/qnn_runner/native-decoder/qnn-llm-runner \
+    --name native_lut_buckets
+```
+
+`push` includes the DSP library and its checksum in the bundle. `run` verifies
+that checksum and registers the package **before** loading context binaries.
+Normal non-native bundles require no package registration. Use the preceding
+generation commands with the new bundle name and **new report paths**; measure
+35-token and 897-token prompts with 128 generated tokens once each. Functional,
+quality, and detailed-profile runs must be reported separately.
+
+For memory-bounded builds, `--skip-context` separates DLC conversion from
+`--context-only` finalization, which checks metadata before reusing DLCs.
+`assemble_native_bundle.py` can combine separately finalized parts with a base
+bundle, but refuses to reuse any old part that contains graph-decoder KV I/O.
+
+The native LUT intentionally rounds centroids and products to FP16. An ONNX
+function used only in tests (`with_reference_decoder`) supplies an independent
+oracle; it is never embedded in deployed models. Native decoder correctness
+does not resolve the existing format-2 **encoder** scale tolerance failure
+described in design §14.2. End-to-end PPL must still be checked.
+
+On S26/SM8850, the one-run **897-token prompt + 128-token generation** result
+was **38.15 tok/s**, versus 13.89 for the unchanged graph decoder and 34.76 for
+the int16 KV baseline: 2.746x over graph and 9.77% over int16. All decode steps
+used C1024. Native TTFT was 567.2ms (graph 718.4ms, int16 318.2ms); prefill is
+still slower than int16. Native's QNN-call time alone is also slightly slower
+than int16; the end-to-end win includes smaller host KV I/O.
+
+Host KV remains 28.875MiB. PPL over four windows was **20.498138**, versus
+20.388335 for graph and 20.108306 for int16 (unchanged binaries' prior PPL).
+This is not numerically identical to the compiled graph path. The 35-token
+prompt's native decode was 54.43 tok/s, but the int16 control was not bucketed.
+Tests, EOS/reset/bucket transitions, the CL1024 boundary and the isolated HTP
+decoder passed; the inherited encoder tolerance failure remains unresolved.
+See design §15 and `reports/comparison_native_lut_buckets.json` for all metrics,
+source reports, single-run limitations and the distinction between decoder
+optimization and fused attention.

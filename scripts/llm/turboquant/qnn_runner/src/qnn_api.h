@@ -79,6 +79,8 @@ class QnnRuntime {
 
   // Votes the HTP into performance mode with sleep disabled; returns false if unsupported.
   bool setBurstPower();
+  // Register execution kernels before loading any dependent context binary.
+  void registerOpPackage(const std::string& path, const std::string& provider);
   // Must be called before any context is created: HTP binds detailed profiling at load time.
   void enableDetailedProfiling();
   Qnn_ProfileHandle_t profile() const { return profile_; }

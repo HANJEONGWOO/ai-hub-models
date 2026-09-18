@@ -169,6 +169,12 @@ QnnRuntime::~QnnRuntime() {
   if (backendLib_) dlclose(backendLib_);
 }
 
+void QnnRuntime::registerOpPackage(const std::string& path, const std::string& provider) {
+  if (!api_->backendRegisterOpPackage) fail("backend does not support custom op packages");
+  const auto err = api_->backendRegisterOpPackage(backend_, path.c_str(), provider.c_str(), nullptr);
+  if (err != QNN_SUCCESS) fail("register op package " + path, err);
+}
+
 bool QnnRuntime::setBurstPower() {
   if (!api_->deviceGetInfrastructure) return false;
   QnnDevice_Infrastructure_t infra = nullptr;

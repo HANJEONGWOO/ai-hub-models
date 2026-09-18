@@ -93,9 +93,31 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                 errors.append(f"Rotated attention is not FP16: {op.name}")
         for tile in layer["tiles"]:
             for kind in ("key", "value"):
-                if tile[f"{kind}_restored"] not in info.producer:
+                restored = tile[f"{kind}_restored"]
+                if layer.get("decoder") == "native_unpack_lut_v1":
+                    prefix = f"tq_{kind}_{number}_tile{tile['start']}_"
+                    native = info.producer.get(prefix + "native_fp16")
+                    if (
+                        native is None
+                        or native.op_type != "Decode4"
+                        or [t.dtype for t in native.inputs]
+                        != ["Uint_8", "Float_16", "Float_16"]
+                        or [t.dtype for t in native.outputs] != ["Float_16"]
+                        or not any(
+                            "packageName: TurboQuantNative" in p for p in native.params
+                        )
+                    ):
+                        errors.append(f"Missing/incorrect native decoder: {prefix}")
+                    # Converter removes the no-op FP16/FP32 source-model cast.
+                    if kind == "value":
+                        restored = prefix + "native_fp16"
+                if restored not in info.producer:
                     errors.append(f"Missing {kind} tile {number}/{tile['start']}")
         for op in info.ops:
+            if layer.get("decoder") == "native_unpack_lut_v1" and re.match(
+                rf"tq_(key|value)_{number}_tile\d+_dec_", op.name
+            ):
+                errors.append(f"Graph decoder remains beside native decoder: {op.name}")
             if re.match(
                 rf"tq_(key|value)_{number}_tile\d+_dec_", op.name
             ) and op.op_type in {
@@ -132,6 +154,7 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
         "past_tokens": layers[0]["past_tokens"],
         "new_tokens": layers[0]["new_tokens"],
         "max_rotated_intermediate_bytes": max(sizes, default=0),
+        "native_decoder_ops": sum(op.op_type == "Decode4" for op in info.ops),
         "violations": errors,
     }
 

@@ -36,6 +36,9 @@ from qai_hub_models.models.templates.llm.turboquant.config import get_profile
 from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
     apply_kv_profile,
 )
+from qai_hub_models.models.templates.llm.turboquant.native_decoder import (
+    use_native_decoder,
+)
 from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
     tile_kv_attention,
 )
@@ -118,6 +121,8 @@ def apply_profile(
         result = tile_kv_attention(
             result, config, args.attention_tile, rotated=args.rotated_attention
         )
+    if args.native_decoder_package:
+        result = use_native_decoder(result, config)
     # Initializers keep their external-data location, so expose the weights file here.
     for data in onnx_path.parent.glob("*.data"):
         link = out / data.name
@@ -138,6 +143,7 @@ def apply_profile(
         "kv_paths": len(report["kv_paths"]),
         "attention_tile": args.attention_tile,
         "rotated_attention": args.rotated_attention,
+        "native_decoder": bool(args.native_decoder_package),
     }
     return new_onnx, new_encodings, summary
 
@@ -183,6 +189,14 @@ def convert_graph(
                 str(onnx_path),
                 "--quantization_overrides",
                 str(encodings),
+                *(
+                    [
+                        "--op_package_config",
+                        str(Path(__file__).with_name("native_decoder") / "Decode4.xml"),
+                    ]
+                    if args.native_decoder_package
+                    else []
+                ),
                 *shape_args,
                 "--output_path",
                 str(float_dlc),
@@ -263,6 +277,14 @@ def build_context(
             str(args.sdk / "lib/x86_64-linux-clang/libQnnHtp.so"),
             "--model",
             str(args.sdk / "lib/x86_64-linux-clang/libQnnModelDlc.so"),
+            *(
+                [
+                    "--op_packages",
+                    f"{args.native_decoder_package / 'x86_64-linux-clang/libTurboQuantNative.so'}:TurboQuantInterfaceProvider",
+                ]
+                if args.native_decoder_package
+                else []
+            ),
             "--dlc_path",
             ",".join(str(out / f"{n}.dlc") for n in names),
             "--binary_file",
@@ -298,6 +320,11 @@ def main() -> None:
     parser.add_argument("--context-buckets", type=int, nargs="+", default=[])
     parser.add_argument("--rotated-attention", action="store_true")
     parser.add_argument(
+        "--native-decoder-package",
+        type=Path,
+        help="Opt-in built QHPI Decode4 package directory; requires rotated tiled attention",
+    )
+    parser.add_argument(
         "--attention-tile",
         type=int,
         default=0,
@@ -308,9 +335,16 @@ def main() -> None:
         "--sequence-lengths", type=int, nargs="+", default=list(SEQUENCE_LENGTHS)
     )
     parser.add_argument("--skip-context", action="store_true")
+    parser.add_argument(
+        "--context-only",
+        action="store_true",
+        help="Finalize previously converted graphs without reconversion",
+    )
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     args = parser.parse_args()
+    if args.context_only and args.skip_context:
+        parser.error("--context-only and --skip-context are mutually exclusive")
     if args.attention_tile < 0:
         parser.error("--attention-tile must be nonnegative")
     if args.attention_tile and args.profile not in ("k4_v4", "k4_v4_scaled"):
@@ -319,6 +353,15 @@ def main() -> None:
         args.profile != "k4_v4_scaled" or not args.attention_tile
     ):
         parser.error("--rotated-attention requires k4_v4_scaled and --attention-tile")
+    if args.native_decoder_package:
+        args.native_decoder_package = args.native_decoder_package.expanduser().resolve()
+        if not args.rotated_attention:
+            parser.error("--native-decoder-package requires --rotated-attention")
+        for target in ("x86_64-linux-clang", "hexagon-v81"):
+            if not (
+                args.native_decoder_package / target / "libTurboQuantNative.so"
+            ).is_file():
+                parser.error(f"Missing native decoder library for {target}")
     buckets = sorted({*args.context_buckets, args.context_length})
     if any(c <= 1 or c > args.context_length for c in buckets):
         parser.error("context buckets must be in [2, context-length]")
@@ -332,6 +375,22 @@ def main() -> None:
     report_path = out / "convert_report.json"
     report = json.loads(report_path.read_text()) if report_path.exists() else {}
     config = get_profile(args.profile)
+    if args.context_only:
+        native_manifest = (
+            json.loads((args.native_decoder_package / "manifest.json").read_text())
+            if args.native_decoder_package
+            else None
+        )
+        expected = {
+            "config_hash": config.config_hash(),
+            "attention_tile": args.attention_tile,
+            "rotated_attention": args.rotated_attention,
+            "context_buckets": buckets,
+            "native_decoder": native_manifest,
+        }
+        for key, value in expected.items():
+            if report.get(key) != value:
+                raise ValueError(f"--context-only metadata mismatch: {key}")
     report.update(
         {
             "context_length": args.context_length,
@@ -342,6 +401,11 @@ def main() -> None:
             "attention_tile": args.attention_tile,
             "rotated_attention": args.rotated_attention,
             "context_buckets": buckets,
+            "native_decoder": json.loads(
+                (args.native_decoder_package / "manifest.json").read_text()
+            )
+            if args.native_decoder_package
+            else None,
         }
     )
     report.setdefault("parts", {})
@@ -361,11 +425,19 @@ def main() -> None:
                 if seq_len >= context:
                     continue
                 name = graph_name(seq_len, context, part_id, num_parts)
-                entry["graphs"][name] = convert_graph(
-                    graph_args, onnx_path, encodings, name, seq_len, out, env
-                )
+                if args.context_only:
+                    entry["graphs"][name] = report["parts"][part_name]["graphs"][name]
+                    if not (out / f"{name}.dlc").is_file():
+                        raise FileNotFoundError(out / f"{name}.dlc")
+                else:
+                    entry["graphs"][name] = convert_graph(
+                        graph_args, onnx_path, encodings, name, seq_len, out, env
+                    )
                 names.append(name)
-                print(f"{part_name}: converted {name}", flush=True)
+                print(
+                    f"{part_name}: {'reused DLC' if args.context_only else 'converted'} {name}",
+                    flush=True,
+                )
         if not args.skip_context:
             entry["context_s"] = build_context(args, names, part_name, out, env)
             print(f"{part_name}: context {entry['context_s']:.0f}s", flush=True)

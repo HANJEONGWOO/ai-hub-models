@@ -29,6 +29,8 @@ using Clock = std::chrono::steady_clock;
 struct Args {
   std::string backend = "libQnnHtp.so";
   std::string system = "libQnnSystem.so";
+  std::string opPackage;
+  std::string opPackageProvider = "TurboQuantInterfaceProvider";
   std::vector<std::string> bins;
   int contextLength = 1024;
   std::vector<int> contextBuckets;
@@ -78,6 +80,8 @@ Args parseArgs(int argc, char** argv) {
   auto get = [&](const char* k, const std::string& def) { return kv.count(k) ? kv[k] : def; };
   a.backend = get("--backend", a.backend);
   a.system = get("--system", a.system);
+  a.opPackage = get("--op-package", "");
+  a.opPackageProvider = get("--op-package-provider", a.opPackageProvider);
   a.bins = split(get("--bins", ""), ',');
   a.contextLength = std::stoi(get("--context-length", std::to_string(a.contextLength)));
   for (const auto& c : split(get("--context-buckets", ""), ',')) a.contextBuckets.push_back(std::stoi(c));
@@ -275,6 +279,7 @@ int main(int argc, char** argv) {
     if (tokens.empty()) throw std::runtime_error("token file is empty");
 
     tqrun::QnnRuntime rt(args.backend, args.system);
+    if (!args.opPackage.empty()) rt.registerOpPackage(args.opPackage, args.opPackageProvider);
     memSamples.push_back("{\"at\": \"runtime\", \"mem\": " + memJson(readProcStatus()) + "}");
     const bool burst = args.burst && rt.setBurstPower();
     if (args.profilePrefill || args.profileDecodeStep >= 0) rt.enableDetailedProfiling();
@@ -396,6 +401,7 @@ int main(int argc, char** argv) {
     report.num("context_length", C);
     report.num("prompt_tokens", static_cast<double>(promptCount));
     report.str("backend_api", rt.backendVersion());
+    if (!args.opPackage.empty()) report.str("op_package", args.opPackage);
     report.raw("burst_power", burst ? "true" : "false");
     std::string bins = "[";
     for (size_t i = 0; i < session.contexts().size(); ++i) {
