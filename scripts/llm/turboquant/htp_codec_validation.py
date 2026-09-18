@@ -40,6 +40,7 @@ import onnxruntime as ort
 
 from qai_hub_models.models.templates.llm.turboquant.config import (
     KVCodecSpec,
+    Rotation,
     get_profile,
 )
 from qai_hub_models.models.templates.llm.turboquant.export import (
@@ -111,9 +112,9 @@ def graph_specs(
 
 
 def codec_for(
-    which: str, profile: str = PROFILE
+    which: str, profile: str = PROFILE, rotation: Rotation | None = None
 ) -> tuple[KVCodecSpec, PolarQuantReference]:
-    config = get_profile(profile)
+    config = get_profile(profile, rotation)
     spec = getattr(config, which)
     return spec, PolarQuantReference(
         spec,
@@ -198,7 +199,9 @@ def cmd_build(args: argparse.Namespace) -> None:
         (work / sub).mkdir(parents=True, exist_ok=True)
     snapshot = np.load(args.snapshot)
     env = qairt_env(args.sdk, args.qnn_python)
-    config = get_profile(args.profile)
+    config = get_profile(
+        args.profile, Rotation(args.rotation) if args.rotation else None
+    )
     manifest: dict[str, Any] = {
         "profile": args.profile,
         "range_scale": args.range_scale,
@@ -215,7 +218,7 @@ def cmd_build(args: argparse.Namespace) -> None:
 
     for g in graph_specs(tuple(args.tokens), tuple(args.operations), args.profile):
         name = g["name"]
-        spec, codec = codec_for(g["which"], args.profile)
+        spec, codec = codec_for(g["which"], args.profile, config.rotation)
         builder = build_encode_model if g["op"] == "encode" else build_decode_model
         model = builder(
             config,
@@ -555,7 +558,8 @@ def cmd_compare(args: argparse.Namespace) -> None:
     manifest = json.loads((work / "manifest.json").read_text())
     runs = json.loads((work / "device_runs.json").read_text())
     profile = manifest["profile"]
-    if get_profile(profile).config_hash() != manifest["config_hash"]:
+    rotation = Rotation(manifest["config"]["rotation"])
+    if get_profile(profile, rotation).config_hash() != manifest["config_hash"]:
         raise ValueError("Validation manifest and current codec config differ.")
     report: dict[str, Any] = {
         "scope": "S26 HTP execution of standalone codec graphs (P2); not full-model integration",
@@ -567,7 +571,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
     all_passed = True
     lead = (HEADS, 1) if manifest.get("head_major", False) else (1, HEADS)
     for name, info in manifest["graphs"].items():
-        spec, codec = codec_for(info["which"], profile)
+        spec, codec = codec_for(info["which"], profile, rotation)
         tokens = info["tokens"]
         entry: dict[str, Any] = {"cases": {}, "profiles": {}}
         for level in PROFILING_LEVELS:
@@ -633,6 +637,7 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--profile", choices=["k4_v4", "k4_v4_scaled"], default=PROFILE)
+    parser.add_argument("--rotation", choices=[r.value for r in Rotation])
     parser.add_argument(
         "--range-scale",
         type=float,

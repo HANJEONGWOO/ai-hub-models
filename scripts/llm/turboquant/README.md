@@ -10,6 +10,29 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+**The default PolarQuant rotation is now `dense_qr`, with QJL off.** Both
+`get_profile(...)` and `PolarQuantReference(...)` select it when rotation is
+omitted. K/V remain 4-bit for `k4_v4[_scaled]`; Native LUT, norm correction,
+tile size and buckets are independent options and are not changed by rotation.
+Dense QR is generated once on the host (K seed 42, V seed 542), then embedded
+as graph constants; no QR or RNG executes per token on the device. The actual
+float32 matrix digests are included in the config hash.
+
+For the current `k4_v4_scaled` export profile, **Native Decode4 is also the
+default**, together with rotated attention and 256-token tiles. No Native
+enable flag is needed. `--no-native-decoder` explicitly selects the graph
+decoder while keeping those attention defaults. Baselines and legacy raw-norm
+profiles keep their existing paths; context-bucket defaults are unchanged.
+The default package is `~/.qaihm/tmp/turboquant/native_decoder_hvx_20260918`;
+override it with `--native-decoder-package` or `TURBOQUANT_NATIVE_DECODER_PACKAGE`.
+Missing libraries cause an error, not an automatic build or silent fallback.
+
+The older results/examples below use explicit `--rotation fwht`. Use a **new
+bundle directory** for dense models: existing binaries do not change with Python
+defaults, and FWHT/dense packed cache states are not interchangeable. CLI
+conversion, standalone validation and host evaluation accept `--rotation fwht`
+for historical reproduction. Uncompressed baselines are unchanged.
+
 | Script | Purpose | Needs |
 |---|---|---|
 | `generate_constants.py` | Freeze codebooks and FWHT signs from turboquant_plus at the pinned commit; `--check` verifies `constants.py` | turboquant_plus checkout |
@@ -33,6 +56,7 @@ tokens per KV tensor:
 
 ```bash
 PYTHONPATH=src python scripts/llm/turboquant/htp_codec_validation.py all \
+    --rotation fwht \
     --work-dir ~/.qaihm/tmp/turboquant/p2_optimized_hub_1023 \
     --snapshot ~/.qaihm/tmp/turboquant/qwen3_1_7b_kv_snapshot.npz \
     --tokens 1023 --operations decode --head-major
@@ -70,7 +94,7 @@ memory/latency. Partial AV products introduce extra rounding, so validate PPL.
 PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
     --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
     --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_k4_v4_tiled256_int8_cl1024 \
-    --context-length 1024 --profile k4_v4 --attention-tile 256
+    --context-length 1024 --profile k4_v4 --rotation fwht --attention-tile 256
 PYTHONPATH=src python scripts/llm/turboquant/verify_tiled_attention.py \
     --bundle ~/.qaihm/tmp/turboquant/qwen3_1_7b_k4_v4_tiled256_int8_cl1024 \
     --report ~/.qaihm/tmp/turboquant/reports/boundary_k4_v4_tiled256.json
@@ -115,7 +139,8 @@ PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
     --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
     --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_rotated_scaled_buckets \
     --context-length 1024 --context-buckets 128 256 512 1024 \
-    --profile k4_v4_scaled --attention-tile 256 --rotated-attention
+    --profile k4_v4_scaled --rotation fwht --attention-tile 256 --rotated-attention \
+    --no-native-decoder
 PYTHONPATH=src python scripts/llm/turboquant/verify_rotated_attention.py \
     --bundle ~/.qaihm/tmp/turboquant/qwen3_1_7b_rotated_scaled_buckets \
     --report ~/.qaihm/tmp/turboquant/reports/boundary_rotated_scaled_buckets.json
@@ -153,14 +178,15 @@ target is not met. No bucketed int16 baseline was tested. PPL was 20.388335
 fails. The profile remains opt-in. See design §14 for the one-run comparison,
 memory overhead, correctness checks and remaining packed-KV restore bottleneck.
 
-## Native unpack + LUT decoder (HTP V81, opt-in)
+## Native unpack + LUT decoder (HTP V81, default for k4_v4_scaled)
 
-`--native-decoder-package` replaces only each rotated KV tile's decoder with
+Native decoding replaces only each rotated KV tile's decoder with
 the `TurboQuantNative::Decode4` QHPI op. Its HVX kernel unpacks MSB-first nibbles,
 uses a 16-entry halfword LUT, and multiplies by the stored FP16 effective scale.
 The format-2 cache ABI, encoder, query/output rotations, QK/softmax/AV operations,
 and calibrated attention grids are unchanged. This is **not** a fused attention
-kernel. The original graph decoder remains the default when the flag is absent.
+kernel. Use `--native-decoder-package` to override the built package location,
+or `--no-native-decoder` to explicitly use the original graph decoder.
 
 The x86 library provides offline preparation and a scalar implementation; the
 V81 library executes vector instructions on HTP. Neither SDK source nor SDK
@@ -178,7 +204,7 @@ PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
     --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
     --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_native_lut_buckets \
     --context-length 1024 --context-buckets 128 256 512 1024 \
-    --profile k4_v4_scaled --attention-tile 256 --rotated-attention \
+    --profile k4_v4_scaled --rotation fwht --attention-tile 256 --rotated-attention \
     --native-decoder-package ~/.qaihm/tmp/turboquant/native_decoder_v81
 PYTHONPATH=src python scripts/llm/turboquant/verify_rotated_attention.py \
     --bundle ~/.qaihm/tmp/turboquant/qwen3_1_7b_native_lut_buckets \
@@ -201,7 +227,8 @@ quality, and detailed-profile runs must be reported separately.
 For memory-bounded builds, `--skip-context` separates DLC conversion from
 `--context-only` finalization, which checks metadata before reusing DLCs.
 `assemble_native_bundle.py` can combine separately finalized parts with a base
-bundle, but refuses to reuse any old part that contains graph-decoder KV I/O.
+bundle (including a partial base), but refuses incomplete/mismatched part sets
+or reuse of any old part that contains graph-decoder KV I/O.
 
 The native LUT intentionally rounds centroids and products to FP16. An ONNX
 function used only in tests (`with_reference_decoder`) supplies an independent
@@ -225,3 +252,38 @@ decoder passed; the inherited encoder tolerance failure remains unresolved.
 See design §15 and `reports/comparison_native_lut_buckets.json` for all metrics,
 source reports, single-run limitations and the distinction between decoder
 optimization and fused attention.
+
+## Dense rotation + Native decoder (default rotation)
+
+Dense QR and Native decoding are selected by default for `k4_v4_scaled`:
+
+```bash
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 python scripts/llm/turboquant/convert_parts.py \
+    --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
+    --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_dense_native_new \
+    --context-length 1024 --context-buckets 128 256 512 1024 \
+    --profile k4_v4_scaled
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 python scripts/llm/turboquant/verify_rotated_attention.py \
+    --bundle ~/.qaihm/tmp/turboquant/qwen3_1_7b_dense_native_new \
+    --report ~/.qaihm/tmp/turboquant/reports/boundary_dense_native_new.json
+```
+
+The verifier checks actual rotation constants as well as FP16 attention, native
+decoders and tile sizes. The previous FWHT export also used dense MatMul ops;
+this change replaces the matrix values/distribution, not an O(d log d) device
+butterfly with O(d²) work. It is still QJL-off PolarQuant, not the full
+QJL-enabled TurboQuant algorithm. See design §16 for the three-way comparison.
+
+On S26, the one-run 897+128 result was **38.08 tok/s** for dense+Native,
+**39.11** for unchanged FWHT+Native, and **35.66** for int16 KV. Dense's TTFT
+was 563.26ms (FWHT 522.93ms, int16 303.25ms). Host KV remains 28.875MiB,
+versus int16's 112MiB. Fresh four-window PPL was **20.607753 / 20.498138 /
+20.108306**, respectively. This change did not improve measured quality or
+throughput over FWHT; no statistical speed difference is claimed from one run.
+
+All 21 attention graphs passed the audit and changed only rotation constants
+in the source graphs. Reset, EOS, bucket switching and the CL1024 boundary
+passed. The dense encoder's effective-scale gate still fails: maximum error
+0.2752% versus the unchanged 0.2% tolerance. It is not hidden by the successful
+Native decoder checks. See `reports/comparison_dense_native_buckets.json` and
+`summarize_rotation_results.py` for the complete metrics and source reports.

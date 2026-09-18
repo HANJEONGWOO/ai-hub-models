@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
-"""Opt-in QHPI decoder replacement; the format-2 cache ABI is unchanged."""
+"""Default QHPI decoder for k4_v4_scaled exports; the format-2 cache ABI is unchanged."""
 
 from __future__ import annotations
 

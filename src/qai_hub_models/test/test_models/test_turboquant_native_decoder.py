@@ -12,7 +12,7 @@ import numpy as np
 import onnx
 import pytest
 
-from qai_hub_models.models.templates.llm.turboquant.config import get_profile
+from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_profile
 from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
     apply_kv_profile,
 )
@@ -37,8 +37,11 @@ from qai_hub_models.test.test_models.test_turboquant_tiled_attention import (
 @pytest.mark.parametrize("seq", [1, 3])
 @pytest.mark.parametrize("tile", [1, 7, 256])
 @pytest.mark.parametrize("valid", [0, 13, 32])
-def test_native_replacement(seq: int, tile: int, valid: int) -> None:
-    config = get_profile("k4_v4_scaled")
+@pytest.mark.parametrize("rotation", list(Rotation))
+def test_native_replacement(
+    seq: int, tile: int, valid: int, rotation: Rotation
+) -> None:
+    config = get_profile("k4_v4_scaled", rotation)
     model, encodings = attention_part(seq)
     tiled = tile_kv_attention(
         apply_kv_profile(model, encodings, config, seq, CONTEXT),

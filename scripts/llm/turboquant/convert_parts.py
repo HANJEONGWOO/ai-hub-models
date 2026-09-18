@@ -32,7 +32,7 @@ from typing import Any
 
 import onnx
 
-from qai_hub_models.models.templates.llm.turboquant.config import get_profile
+from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_profile
 from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
     apply_kv_profile,
 )
@@ -45,6 +45,12 @@ from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
 
 DEFAULT_SDK = Path("~/qairt/2.48.0.260626").expanduser()
 DEFAULT_QNN_PYTHON = Path("~/qnn-venv/bin/python").expanduser()
+DEFAULT_NATIVE_DECODER_PACKAGE = Path(
+    os.environ.get(
+        "TURBOQUANT_NATIVE_DECODER_PACKAGE",
+        "~/.qaihm/tmp/turboquant/native_decoder_hvx_20260918",
+    )
+).expanduser()
 SOC_MODEL = 87
 DSP_ARCH = "v81"
 SEQUENCE_LENGTHS = (128, 1)
@@ -108,7 +114,9 @@ def apply_profile(
     out: Path,
 ) -> tuple[Path, Path, dict[str, Any]]:
     """Apply the profile to this graph; baseline graphs are converted as exported."""
-    config = get_profile(args.profile)
+    config = get_profile(
+        args.profile, Rotation(args.rotation) if args.rotation else None
+    )
     model = onnx.load(str(onnx_path), load_external_data=False)
     if not config.modifies_graph or not any(
         i.name.startswith("past_") for i in model.graph.input
@@ -317,18 +325,40 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--profile", default="baseline_int8")
+    parser.add_argument(
+        "--rotation",
+        choices=[r.value for r in Rotation],
+        help="PolarQuant rotation (default: dense_qr); fwht reproduces old bundles.",
+    )
     parser.add_argument("--context-buckets", type=int, nargs="+", default=[])
-    parser.add_argument("--rotated-attention", action="store_true")
+    parser.add_argument(
+        "--rotated-attention",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Defaults to enabled for k4_v4_scaled; disabled for other profiles.",
+    )
+    parser.add_argument(
+        "--native-decoder",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use Native Decode4 by default for k4_v4_scaled; "
+            "--no-native-decoder selects the graph decoder."
+        ),
+    )
     parser.add_argument(
         "--native-decoder-package",
         type=Path,
-        help="Opt-in built QHPI Decode4 package directory; requires rotated tiled attention",
+        help=(
+            "Override the default built QHPI Decode4 package directory "
+            "(or set TURBOQUANT_NATIVE_DECODER_PACKAGE)."
+        ),
     )
     parser.add_argument(
         "--attention-tile",
         type=int,
-        default=0,
-        help="Opt-in two-pass KV restore/attention tiling; 0 keeps the full restore.",
+        default=None,
+        help="KV tile size (default: 256 for k4_v4_scaled, 0 for other profiles).",
     )
     parser.add_argument("--parts", type=int, nargs="*", default=[])
     parser.add_argument(
@@ -343,6 +373,24 @@ def main() -> None:
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     args = parser.parse_args()
+    scaled = args.profile == "k4_v4_scaled"
+    if args.native_decoder is None:
+        args.native_decoder = scaled
+    if args.native_decoder and not scaled:
+        parser.error("Native Decode4 requires the k4_v4_scaled profile")
+    if args.attention_tile is None:
+        args.attention_tile = 256 if scaled else 0
+    if args.rotated_attention is None:
+        args.rotated_attention = scaled
+    if args.native_decoder_package and (not args.native_decoder or not scaled):
+        parser.error(
+            "--native-decoder-package requires k4_v4_scaled "
+            "and an enabled native decoder"
+        )
+    if scaled and args.native_decoder:
+        args.native_decoder_package = (
+            args.native_decoder_package or DEFAULT_NATIVE_DECODER_PACKAGE
+        )
     if args.context_only and args.skip_context:
         parser.error("--context-only and --skip-context are mutually exclusive")
     if args.attention_tile < 0:
@@ -361,7 +409,15 @@ def main() -> None:
             if not (
                 args.native_decoder_package / target / "libTurboQuantNative.so"
             ).is_file():
-                parser.error(f"Missing native decoder library for {target}")
+                parser.error(
+                    f"Missing native decoder library for {target} in "
+                    f"{args.native_decoder_package}; specify --native-decoder-package "
+                    "or explicitly use --no-native-decoder."
+                )
+        if not (args.native_decoder_package / "manifest.json").is_file():
+            parser.error(
+                f"Missing native decoder manifest in {args.native_decoder_package}"
+            )
     buckets = sorted({*args.context_buckets, args.context_length})
     if any(c <= 1 or c > args.context_length for c in buckets):
         parser.error("context buckets must be in [2, context-length]")
@@ -374,8 +430,10 @@ def main() -> None:
     num_parts = len(manifest["parts"])
     report_path = out / "convert_report.json"
     report = json.loads(report_path.read_text()) if report_path.exists() else {}
-    config = get_profile(args.profile)
-    if args.context_only:
+    config = get_profile(
+        args.profile, Rotation(args.rotation) if args.rotation else None
+    )
+    if report or args.context_only:
         native_manifest = (
             json.loads((args.native_decoder_package / "manifest.json").read_text())
             if args.native_decoder_package
@@ -390,7 +448,10 @@ def main() -> None:
         }
         for key, value in expected.items():
             if report.get(key) != value:
-                raise ValueError(f"--context-only metadata mismatch: {key}")
+                raise ValueError(
+                    f"Existing bundle metadata mismatch: {key}; use a new output "
+                    "directory for a different rotation or compilation configuration."
+                )
     report.update(
         {
             "context_length": args.context_length,

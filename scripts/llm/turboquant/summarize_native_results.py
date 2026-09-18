@@ -89,12 +89,12 @@ def profile(path: Path) -> list[dict]:
     return results
 
 
-def invariants(root: Path) -> dict:
+def invariants(root: Path, stem: str = "native_lut") -> dict:
     paths = {
-        "reset": root / "generation_native_lut_reset.json",
-        "eos": root / "generation_native_lut_eos.json",
-        "switches": root / "generation_native_lut_switches.json",
-        "boundary": root / "perf_native_lut_long_once.json",
+        "reset": root / f"generation_{stem}_reset.json",
+        "eos": root / f"generation_{stem}_eos.json",
+        "switches": root / f"generation_{stem}_switches.json",
+        "boundary": root / f"perf_{stem}_long_once.json",
     }
     data = {name: read(path) for name, path in paths.items()}
     sessions = data["reset"]["sessions"]

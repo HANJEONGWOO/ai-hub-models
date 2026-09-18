@@ -1,6 +1,6 @@
 # Qwen3 TurboQuant KV-cache — 설계(ABI·수치 계약)와 P0–P3 결과
 
-> §11 이후 codec 성능 수정은 §12, tiled KV/attention 구현은 §13에 기록한다.
+> 현재 기본 회전은 dense QR이며 QJL은 off다(§16). §15까지의 실측은 WHT 경로의 이력이다.
 
 작성일: 2026-09-15 · 작업 브랜치: `turboquant-kv-cache` (기준 commit `2a895603e`)
 
@@ -64,8 +64,8 @@
 
 | 이름 | 회전 | QJL | 용도 |
 |---|---|---|---|
-| `Rotation.FWHT` (기본) | `R = D2·H·D1`, 역방향 `D1·H·D2`, `H`는 Sylvester 순서·`1/sqrt(128)` 정규화 | 없음 | 실사용 codec, NPU 그래프 |
-| `Rotation.DENSE_QR` | 참조 `PolarQuant`와 같은 Haar QR(`default_rng(seed)`, sign·det 보정) | 없음 | 참조 클래스와의 대조 oracle 전용 |
+| `Rotation.FWHT` (명시적 선택) | `R = D2·H·D1`, 역방향 `D1·H·D2`, `H`는 Sylvester 순서·`1/sqrt(128)` 정규화 | 없음 | 이전 실측 재현, `--rotation fwht` |
+| `Rotation.DENSE_QR` (기본) | 참조 `PolarQuant`와 같은 Haar QR(`default_rng(seed)`, sign·det 보정) | 없음 | 실사용 codec·NPU 그래프·Python oracle |
 | QJL | — | — | 1차 범위 밖. `get_profile("qjl_reference")`는 `NotImplementedError` |
 
 참조 Python `PolarQuant`는 dense QR만 사용하며 FWHT 구성은 참조 repo에 클래스로 존재하지 않는다. FWHT codec은 참조 `rotation.random_rotation_fast`/`apply_fast_rotation*` 조각을 조합한 것이고, 이 조합을 참조 조각과 직접 대조했다(§4.4).
@@ -74,7 +74,7 @@
 
 - codebook: 참조 `codebook.optimal_centroids(bits, 128)`(N(0, 1/d) Gaussian 근사 Lloyd, quantile 초기화, **정확히 100회 반복**). 4-bit 최외곽 centroid는 0.24021009724443104이다. `turbo4-resurrection.md`의 표(0.1739)는 반복 0회 초기값이고, 수렴 Lloyd-Max(0.241529)와도 다르다. 둘 다 사용하지 않는다.
 - FWHT sign: `random_rotation_fast(128, np.random.default_rng(seed))`에서 `signs1`을 먼저, `signs2`를 나중에 뽑는다. seed 정책은 참조 `KVCacheCompressor`를 따라 K=42, V=542이다.
-- 모든 상수는 float64 hex로 고정하고 sha256을 기록한다. runtime에 RNG나 scipy를 다시 실행하지 않는다.
+- codebook/FWHT 상수는 float64 hex로 고정하고 sha256을 기록한다. Dense QR은 host에서 생성·캐시하고 실제 export float32 행렬의 sha256을 기록한다. NPU runtime에서는 QR/RNG를 실행하지 않는다.
 
 | 상수 | sha256 |
 |---|---|
@@ -275,12 +275,14 @@ python -m pytest src/qai_hub_models/test/test_models/test_turboquant_codec.py \
 
 # PC 참조 평가와 KV snapshot (GPU 사용, HF 캐시 필요)
 HF_HUB_OFFLINE=1 PYTHONPATH=src python scripts/llm/turboquant/evaluate_qwen3_kv.py \
+    --rotation fwht \
     --model Qwen/Qwen3-1.7B --num-windows 4 \
     --report /tmp/claude/turboquant/qwen3_1_7b_eval.json \
     --snapshot ~/.qaihm/tmp/turboquant/qwen3_1_7b_kv_snapshot.npz
 
 # P2: 빌드 → S26 실행 → 비교 (adb 장치, QAIRT 2.48 필요)
 PYTHONPATH=src python scripts/llm/turboquant/htp_codec_validation.py all \
+    --rotation fwht \
     --work-dir ~/.qaihm/tmp/turboquant/p2 \
     --snapshot ~/.qaihm/tmp/turboquant/qwen3_1_7b_kv_snapshot.npz
 ```
@@ -295,7 +297,7 @@ HF_HUB_OFFLINE=1 PYTHONPATH=src python scripts/llm/turboquant/split_checkpoint.p
 # 프로파일별 변환 (baseline_int8 | baseline_int16_kv | k4_v4); part 한 그래프당 약 2분
 PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
     --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
-    --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_k4_v4_cl1024 --context-length 1024 --profile k4_v4
+    --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_k4_v4_cl1024 --context-length 1024 --profile k4_v4 --rotation fwht
 
 # runner 빌드 (NDK r26c, QAIRT 헤더)
 bash scripts/llm/turboquant/qnn_runner/build_android.sh
@@ -323,7 +325,7 @@ PYTHONPATH=src python scripts/llm/turboquant/run_device_llm.py run --name k4_v4_
 for p in baseline_int16_kv k4_v4; do
   PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
       --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
-      --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_${p}_cl1024 --context-length 1024 --profile $p
+      --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_${p}_cl1024 --context-length 1024 --profile $p --rotation fwht
   # KV 양자화 경계 검증 (dlc-info 기반, 위반 시 종료 코드 1)
   PYTHONPATH=src python scripts/llm/turboquant/verify_kv_boundary.py \
       --bundle ~/.qaihm/tmp/turboquant/qwen3_1_7b_${p}_cl1024 \
@@ -634,7 +636,7 @@ attention의 fused/tiled HTP 구현이며, 그 성능은 이번 결과로 입증
 PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
     --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
     --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_k4_v4_optimized_cl1024 \
-    --context-length 1024 --profile k4_v4
+    --context-length 1024 --profile k4_v4 --rotation fwht
 PYTHONPATH=src python scripts/llm/turboquant/run_device_llm.py push \
     --bundle-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_k4_v4_optimized_cl1024 \
     --name k4_v4_optimized_cl1024
@@ -849,7 +851,7 @@ FP16에 들어가야 하는 값은 원래 norm이 아니라 **effective scale**�
   decoder와 detailed HTP 실행은 통과했다. scale에 norm 보정이 합쳐지면서
   추가 FP16 반올림이 생긴다. 이 수치 한계를 보존하고 전체 모델 PPL을 별도로
   평가한다. 기존 norm/decoder tolerance는 완화하지 않는다.
-- `htp_codec_validation.py build/all --profile k4_v4_scaled --range-scale 0.5`로
+- `htp_codec_validation.py build/all --profile k4_v4_scaled --rotation fwht --range-scale 0.5`로
   같은 종류의 bounded probe를 만들 수 있다. `compare`는 저장된 manifest의
   profile과 config hash를 사용하므로 format-2 결과를 format-1 oracle로 잘못
   해석하지 않는다. 기존 기기 출력을 재비교해도 위 실패가 그대로 재현됐다.
@@ -1103,6 +1105,152 @@ EOS 11번째 토큰 정지, 2회 세션 reset의 동일 token ID, 600토큰 생�
   지정하지 않으면 기존 graph decoder가 사용된다. §14.2의 encoder 수치 한계가
   남아 있으므로 새 경로는 opt-in으로 유지한다.
 
-## 16. 출처
+## 16. Dense QR 기본값과 Native 경로 비교
+
+### 16.1 변경 범위
+
+2026-09-18부터 별도 지정이 없으면 `TurboQuantConfig`, `get_profile(...)`,
+`PolarQuantReference` 및 변환/host 평가 도구는 **dense QR**을 사용한다.
+WHT는 `--rotation fwht` 또는 `get_profile(name, Rotation.FWHT)`로 명시적으로
+선택한다. 기본 export에 TurboQuant를 강제로 활성화한 것은 아니며,
+`baseline_int16_kv`와 `baseline_int8`의 동작·기존 config hash는 유지한다.
+
+후속 기본값 설정: 최신 `k4_v4_scaled` 변환은 Native decoder, rotated
+attention, tile 256도 옵션 생략 시 자동 선택한다. graph decoder는
+`--no-native-decoder`로 명시적으로 선택한다. Native package가 없으면 오류로
+중단하며 자동 빌드나 fallback은 하지 않는다. baseline·legacy raw-norm
+프로필과 context bucket 기본값은 변경하지 않는다. 이 기본값 설정 후에는
+추가 테스트·빌드·기기 실행·측정을 하지 않았으며, 아래 결과는 앞선 실측이다.
+
+이번 비교의 알고리즘 변경은 회전 행렬뿐이다. K/V 각 4-bit, QJL off,
+norm correction on, format-2 FP16 effective scale, Native unpack/LUT,
+tile 256, rotated attention 및 C128/256/512/1024 버킷을 유지한다.
+QJL을 추가하거나 K를 3-bit로 줄이지 않았다.
+
+- K seed 42, V seed 542로 Gaussian 행렬을 생성하고 QR의 column sign과
+  determinant를 보정한다. host에서 한 번 계산·캐시하고 상수로 export한다.
+  NPU의 토큰 처리 경로에는 QR/RNG가 없다.
+- 종전 WHT도 export 시 `D2 H D1`을 **dense MatMul**로 내렸으므로,
+  이번 변경은 NPU butterfly 구현을 dense 연산으로 교체한 것이 아니다.
+  Native decoder는 회전과 무관하게 index→centroid→scale만 수행하므로
+  이전 DSP library를 변경 없이 재사용한다.
+- LAPACK 차이를 추적하도록 실제 export float32 `R`의 SHA256을 config에
+  기록한다. K는 `7e76eadbc9e5aec69be63829c8068ca5618b203ee09d3eaf4918ee6be9e0d016`,
+  V는 `a89dbff3a12d727d4b9decbc82e1e81490165fde94a1efc12f649bf11b054309`이다.
+- dense `k4_v4_scaled` config hash:
+  `a1bd2907c7f1352c7e3472d7022dcb4c11cf6cf85b361f5316a0d155697c3c62`.
+  이전 WHT config hash `94bf3075...`와 구분한다. packed ABI 크기는 같아도
+  회전이 다른 cache state는 호환되지 않으며 host state 로드는 이를 거부한다.
+- 변환 도구는 기존 출력 폴더의 rotation/config hash 또는 컴파일 설정이
+  다르면 중단한다. 기존 바이너리가 새 Python 기본값으로 자동 변경되지는 않는다.
+
+### 16.2 수치 검사
+
+- 단위 테스트 **268개 통과**: dense 기본값, 기존 WHT golden 유지, 두 회전의
+  Native attention oracle, cache 교차 로드 거부, rotation 상수 변조 검출,
+  기존 번들 덮어쓰기 방지 및 분할 빌드 조립 검사를 포함한다.
+- `verify_reference_dense_default.json`: 고정 참조 commit 대비 K/V dense QR
+  행렬 최대 절대오차 0, 3/4-bit index 불일치 0, 복원 상대오차 0.
+  이것은 float64 CPU 참조 대조이며 NPU bit-exact 주장과는 다르다.
+- 28개 그래프/4개 context binary 빌드 완료. attention을 포함하는 **21개
+  그래프 전부** rotation 상수·FP16 QK/AV·Native Decode4·scale I/O 검사를
+  통과했다. Native decoder는 총 840개, 최대 FP16 KV tile은 524,288byte다.
+  각 source graph는 회전 상수와 그 이름을 제외하면 기존 WHT+Native와
+  직렬화 결과가 동일하다. KV가 없는 part1 binary도 이전과 SHA256이 같다.
+  tile 크기는 tensor 단위 상한이며 전체 NPU peak memory 측정값은 아니다.
+- `p2_dense_scaled_20260918/p2_report.json`: 실제 HTP에서 K/V encode의
+  T1/T128, head-major, 실제 KV 두 layer와 합성 range 입력을 검사했다.
+  4개 그래프 모두 accelerator 프로파일에서 누락 op이 없고 설명되지 않는
+  index 불일치는 0이다. 하지만 **T128 effective-scale 허용오차 gate는 실패**다.
+  최대 상대오차 0.275200%(실제 KV만 최대 0.247664%)로 고정 기준 0.2%를 넘는다.
+  기존 WHT의 scale gate 실패(0.256412%, §14.2)와 마찬가지로 encoder의
+  FP16 수치 한계가 남아 있다. 기준을 완화하거나 Native decoder 성공으로
+  encoder 검사를 통과 처리하지 않았다. 합성 입력은 `--range-scale 0.5`의
+  제한된 범위이며 전체 FP16 입력 범위 검증은 아니다.
+
+### 16.3 3개 구성 실기기 비교 (각 조건 1회)
+
+Qwen3-1.7B W4A16, S26/SM8850, capacity 1024, burst power,
+profiling off, 생성 128개(순수 decode step 127개)로 측정했다.
+각 구성마다 35-token 입력과 897-token 입력을 **각각 1회** 실행했다.
+반복 평균이나 좋은 실행 선택은 없고, 이전 성능 값을 재사용하지 않았다.
+TTFT는 모델 로딩을 제외한다. 성능 실행 순서는 각 입력 조건에서
+int16 → WHT+Native → dense+Native이며, 온도 통제나 분산 추정은 없다.
+PPL도 세 구성 모두 같은 WikiText 4×1024 window를 새로 채점했다(4,092 tokens).
+리포트에 실제 선택한 입력 파일과 SHA256을 기록해 동일 입력 여부를 검증한다.
+
+긴 입력(897 prompt + 128 generation): 모든 decode는 **C1024**를 사용했다.
+
+| 지표 | int16 KV | 최신 WHT+Native | dense+Native (새 기본 회전) |
+|---|---:|---:|---:|
+| TTFT | 303.25 ms | 522.93 ms | 563.26 ms |
+| prefill | 2,959.76 tok/s | 1,716.59 tok/s | 1,595.34 tok/s |
+| decode | 35.6603 tok/s | 39.1088 tok/s | 38.0792 tok/s |
+| decode/token | 28.0424 ms | 25.5697 ms | 26.2610 ms |
+| host KV 저장소 | 112.000 MiB | 28.875 MiB | 28.875 MiB |
+| resident graph I/O buffers | 263.179 MiB | 222.197 MiB | 222.197 MiB |
+| 종료 VmRSS | 391.461 MiB | 292.020 MiB | 292.352 MiB |
+| 프로세스 VmHWM | 605.105 MiB | 605.563 MiB | 605.492 MiB |
+| PPL (4 window, 낮을수록 좋음) | 20.108306 | 20.498138 | 20.607753 |
+
+짧은 입력(35 prompt + 128 generation):
+
+| 지표 | int16 KV | WHT+Native | dense+Native |
+|---|---:|---:|---:|
+| TTFT | 43.686 ms | 59.208 ms | 59.080 ms |
+| prefill | 805.42 tok/s | 594.97 tok/s | 596.20 tok/s |
+| decode | 34.9665 tok/s | 54.4383 tok/s | 54.3845 tok/s |
+| 종료 VmRSS | 388.934 MiB | 292.219 MiB | 292.359 MiB |
+
+짧은 입력의 int16은 고정 C1024, 두 TurboQuant는 context bucket을 사용한다.
+따라서 짧은 입력에서 int16 대비 55.5% 빠르다는 결과를 회전 알고리즘만의
+속도 차이로 해석하면 안 된다. 긴 입력에서도 prefill의 버킷 사용은 다르다.
+
+해석:
+
+- Dense의 긴 문맥 end-to-end decode는 int16 대비 **6.78% 빠르고**,
+  기존 WHT+Native 대비 **2.63% 느린** 관측값이다. 짧은 문맥의 두 Native
+  경로는 54.44/54.38 tok/s로 비슷하다. 1회 측정으로 유의한 차이나
+  dense 회전 자체의 실행 비용을 확정하지 않는다. 두 회전 모두 MatMul 경로다.
+- 긴 문맥 평균 decode QNN 호출은 int16/WHT/dense 각각
+  **22.710 / 24.259 / 24.508 ms**, host prepare는
+  **4.739 / 0.919 / 1.146 ms**다. Dense의 end-to-end 이득에도
+  압축된 host KV I/O가 기여하며, NPU 호출 자체가 int16보다 빠르다는 뜻은 아니다.
+- Dense는 host KV를 int16 대비 **74.22% 줄이지만**, TTFT/prefill은
+  여전히 int16보다 느리다. 종료 RSS는 낮아도 프로세스 최고 RSS(VmHWM)는
+  약 605 MiB로 비슷하다. 이 값들은 NPU peak memory 계측이 아니다.
+- Dense PPL은 WHT보다 **0.53%**, int16보다 **2.48%** 높다.
+  이번 회전 변경이 품질을 개선했다고 주장하지 않는다. QJL은 적용하지 않았다.
+- Reset(2회, 8-token 출력 동일), EOS(11-token 종료), 600-token 생성 중
+  C128→256→512→1024 전환, 긴 성능 실행의 cache length 1024 경계 검사를
+  통과했다. 이 진단 실행들의 timing은 위 성능 수치에 포함하지 않았다.
+
+### 16.4 산출물과 재현
+
+기준 디렉터리: `~/.qaihm/tmp/turboquant/`.
+
+- 최종 번들: `qwen3_1_7b_dense_native_buckets_final/`, 기기 이름 `dense_native_buckets`.
+  `qwen3_1_7b_dense_native_buckets/`는 part1+2 빌드 디렉터리이므로 최종 번들이 아니다.
+- 기존 비교군은 `qwen3_1_7b_baseline_int16_kv_cl1024/`와
+  `qwen3_1_7b_native_lut_buckets/`의 변경 없는 context binaries다.
+- 종합 결과: `reports/comparison_dense_native_buckets.json`.
+- 성능 원본: `reports/perf_{baseline_int16_dense_control,fwht_native_dense_control,dense_native}_{short,long}_once.json`.
+- 품질 원본: `reports/score_{baseline_int16_dense_control,fwht_native_dense_control,dense_native}_w{0,1,2,3}.json`.
+- 구조/기능: `reports/boundary_dense_native.json`,
+  `reports/generation_dense_native_{reset,eos,switches}.json`.
+- 변경 없는 DSP library:
+  `native_decoder_hvx_20260918/hexagon-v81/libTurboQuantNative.so`, SHA256
+  `a7c004fa9f824b5646913c565d88a95c0f6440eb35ee6f0c92c575aa21b68b3c`.
+
+새 모델 변환 명령은 tools README의 Dense 절을 사용한다(회전 옵션 생략).
+성능 실행을 다시 하지 않고 기존 원본을 집계하려면:
+
+```bash
+PYTHONPATH=src python scripts/llm/turboquant/summarize_rotation_results.py \
+    --reports ~/.qaihm/tmp/turboquant/reports \
+    --out ~/.qaihm/tmp/turboquant/reports/comparison_dense_native_buckets.json
+```
+
+## 17. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

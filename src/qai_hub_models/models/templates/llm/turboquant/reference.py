@@ -14,7 +14,7 @@ Re-implements turboquant_plus ``PolarQuant`` numerics (commit in
 ``Rotation.FWHT`` composes the reference ``random_rotation_fast`` pieces
 (forward ``D2 H D1``, inverse ``D1 H D2``, ``H`` Sylvester-ordered and scaled by
 ``1/sqrt(n)``). ``Rotation.DENSE_QR`` is the Haar rotation the reference class
-itself uses and exists only to cross-check against that class.
+itself uses and is the default for both the oracle and exported graphs.
 """
 
 from __future__ import annotations
@@ -127,6 +127,7 @@ class DenseQRRotation:
         det_sign, _ = np.linalg.slogdet(q)
         if det_sign < 0:
             q[:, 0] = -q[:, 0]
+        q.setflags(write=False)
         self.q = q
         self.block_size = block_size
 
@@ -140,6 +141,7 @@ class DenseQRRotation:
         return self.q
 
 
+@cache
 def make_rotation(
     rotation: Rotation, seed: int, block_size: int
 ) -> FWHTRotation | DenseQRRotation:
@@ -160,7 +162,7 @@ class PolarQuantReference:
         self,
         spec: KVCodecSpec,
         block_size: int = 128,
-        rotation: Rotation = Rotation.FWHT,
+        rotation: Rotation = Rotation.DENSE_QR,
         norm_correction: bool = True,
         precomputed_norm: bool = False,
     ) -> None:

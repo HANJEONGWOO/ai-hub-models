@@ -11,6 +11,7 @@ pin the oracle to the reference without needing that repo in CI.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from qai_hub_models.models.templates.llm.turboquant.reference import (
     fwht,
     load_boundaries,
     load_codebook,
+    make_rotation,
     nearest_centroid_indices,
 )
 
@@ -138,7 +140,7 @@ def test_nearest_boundary_matches_argmin() -> None:
 def test_oracle_matches_golden(golden: dict[str, Any], case: str) -> None:
     g = golden["cases"][case]
     spec = KVCodecSpec(CodecKind.POLAR, bits=g["bits"], seed=g["seed"])
-    codec = PolarQuantReference(spec, D)
+    codec = PolarQuantReference(spec, D, rotation=Rotation.FWHT)
     x = np.array(golden["inputs"])
     idx, norms = codec.encode(x)
     np.testing.assert_array_equal(idx, np.array(g["indices"]))
@@ -199,7 +201,7 @@ def test_quality_regression_bound() -> None:
     """Unit Gaussian d=128, seed-42 FWHT, norm correction: reference mean 9.188e-3."""
     x = np.random.default_rng(123).standard_normal((20000, D))
     x /= np.linalg.norm(x, axis=1, keepdims=True)
-    codec = PolarQuantReference(K4, D)
+    codec = PolarQuantReference(K4, D, rotation=Rotation.FWHT)
     err = np.sum((x - codec.decode(*codec.encode(x))) ** 2, axis=1)
     assert abs(err.mean() - 9.188e-3) / 9.188e-3 < 0.02
 
@@ -301,7 +303,38 @@ def test_config_hash_is_stable_and_sensitive() -> None:
     )
     data = same.to_dict()
     assert data["qjl"] is False
-    assert data["key"]["signs_sha256"] != data["value"]["signs_sha256"]
+    assert data["key"]["rotation_f32_sha256"] != data["value"]["rotation_f32_sha256"]
+
+
+def test_dense_default_and_legacy_hash_compatibility() -> None:
+    dense = get_profile("k4_v4_scaled")
+    legacy = get_profile("k4_v4_scaled", Rotation.FWHT)
+    assert dense.rotation == Rotation.DENSE_QR
+    assert dense.key == legacy.key and dense.value == legacy.value
+    assert dense.precomputed_norm and dense.norm_correction
+    assert dense.to_dict()["qjl"] is False
+    assert dense.config_hash() != legacy.config_hash()
+    # These identities come from the pre-dense on-device comparison bundles.
+    assert legacy.config_hash() == (
+        "94bf3075bfa7443d6aa34f804809f2662d45a7d262019fa9f5c670868a2b142d"
+    )
+    assert get_profile("baseline_int16_kv").config_hash() == (
+        "26072b4c1cb6c7388a6ba8ae2e499046dfc25ffee3230b8d2f542c0d207a2e00"
+    )
+    for name, spec in (("key", dense.key), ("value", dense.value)):
+        matrix = make_rotation(dense.rotation, spec.seed, D).matrix()
+        assert not matrix.flags.writeable
+        digest = hashlib.sha256(matrix.astype("<f4").tobytes()).hexdigest()
+        assert dense.to_dict()[name]["rotation_f32_sha256"] == digest
+        assert "signs_sha256" not in dense.to_dict()[name]
+        np.testing.assert_allclose(matrix @ matrix.T, np.eye(D), atol=1e-12)
+        assert not np.allclose(matrix, FWHTRotation(spec.seed, D).matrix())
+
+
+def test_dense_accepts_seed_without_frozen_fwht_signs() -> None:
+    spec = KVCodecSpec(CodecKind.POLAR, bits=4, seed=7)
+    config = TurboQuantConfig("custom", spec, V4)
+    assert config.to_dict()["key"]["rotation_f32_sha256"]
 
 
 def test_config_rejects_unsupported_settings() -> None:
@@ -312,7 +345,12 @@ def test_config_rejects_unsupported_settings() -> None:
     with pytest.raises(ValueError, match="no bits"):
         KVCodecSpec(CodecKind.INT16, bits=4)
     with pytest.raises(ValueError, match="FWHT signs"):
-        TurboQuantConfig("x", KVCodecSpec(CodecKind.POLAR, bits=4, seed=7), V4)
+        TurboQuantConfig(
+            "x",
+            KVCodecSpec(CodecKind.POLAR, bits=4, seed=7),
+            V4,
+            rotation=Rotation.FWHT,
+        )
     with pytest.raises(ValueError, match="codebook"):
         TurboQuantConfig("x", K4, V4, block_size=64)
     with pytest.raises(ValueError, match="bit order"):

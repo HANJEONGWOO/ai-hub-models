@@ -12,7 +12,7 @@ import onnxruntime as ort
 import pytest
 
 from qai_hub_models.models.templates.llm.turboquant.cache import TurboQuantKVCache
-from qai_hub_models.models.templates.llm.turboquant.config import get_profile
+from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_profile
 from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
     apply_kv_profile,
 )
@@ -57,10 +57,12 @@ def test_scaled_numeric_checker_preserves_tolerances() -> None:
     assert not compare_decode(codec, packed, scales, decoded * 1.01, HTP_FP16)["passed"]
 
 
-def test_effective_scale_not_raw_norm_must_fit_storage() -> None:
-    codec = PolarQuantReference(CONFIG.key, D, precomputed_norm=True)
-    values = np.zeros((1, D))
-    values[0, 0] = 65000
+@pytest.mark.parametrize("rotation", list(Rotation))
+def test_effective_scale_not_raw_norm_must_fit_storage(rotation: Rotation) -> None:
+    codec = PolarQuantReference(CONFIG.key, D, rotation, precomputed_norm=True)
+    # Construct the adversarial direction in rotated coordinates so the
+    # overflow test does not depend on WHT spreading a one-hot vector evenly.
+    values = codec.rotation.inverse(np.ones((1, D)) / np.sqrt(D)) * 65000
     _, scales = codec.encode(values)
     assert np.linalg.norm(values) < np.finfo(np.float16).max
     assert scales.max() > np.finfo(np.float16).max

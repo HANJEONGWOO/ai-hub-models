@@ -313,7 +313,9 @@ def cmd_run(args: argparse.Namespace) -> None:
     if runtime.get("config_hash"):
         report["config_hash"] = runtime["config_hash"]
     report["assets"] = {
-        k: assets[k] for k in ("context_length", "prompt", "prompt_tokens")
+        "tokens_file": tokens,
+        "tokens_sha256": sha256_file(assets_dir / tokens),
+        **{k: assets[k] for k in ("context_length", "prompt", "prompt_tokens")},
     }
     if args.mode == "generate":
         tokenizer = AutoTokenizer.from_pretrained(assets["checkpoint_dir"])

@@ -5,7 +5,7 @@
 """Opt-in TurboQuant KV-cache codec configuration.
 
 A config is immutable and hashable, and ``config_hash()`` covers every field
-plus the digests of the frozen codebooks and FWHT signs it selects, so it can
+plus the digests of the codebooks and rotation constants it selects, so it can
 key model instance caches and artifact directories.
 """
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
 
@@ -44,7 +44,7 @@ class CodecKind(Enum):
 
 class Rotation(Enum):
     FWHT = "fwht"
-    # Haar QR rotation used by the reference PolarQuant class; oracle only.
+    # Haar QR rotation used by the reference PolarQuant class and default export.
     DENSE_QR = "dense_qr"
 
 
@@ -97,7 +97,7 @@ class TurboQuantConfig:
     key: KVCodecSpec
     value: KVCodecSpec
     block_size: int = 128
-    rotation: Rotation = Rotation.FWHT
+    rotation: Rotation = Rotation.DENSE_QR
     norm_correction: bool = True
     norm_dtype: str = "float16"
     bit_order: str = "msb_first"
@@ -124,7 +124,10 @@ class TurboQuantConfig:
                     f"No frozen {spec.bits}-bit codebook for block size "
                     f"{self.block_size}; regenerate constants.py first."
                 )
-            if (spec.seed, self.block_size) not in FWHT_SIGNS:
+            if (
+                self.rotation == Rotation.FWHT
+                and (spec.seed, self.block_size) not in FWHT_SIGNS
+            ):
                 raise ValueError(
                     f"No frozen FWHT signs for seed {spec.seed}, block size "
                     f"{self.block_size}; regenerate constants.py first."
@@ -185,9 +188,24 @@ class TurboQuantConfig:
                 data[name]["codebook_sha256"] = CODEBOOK_SHA256[
                     (spec.bits, self.block_size)
                 ]
-                data[name]["signs_sha256"] = FWHT_SIGNS_SHA256[
-                    (spec.seed, self.block_size)
-                ]
+                if self.rotation == Rotation.FWHT:
+                    # Keep historical FWHT hashes/cache identities unchanged.
+                    data[name]["signs_sha256"] = FWHT_SIGNS_SHA256[
+                        (spec.seed, self.block_size)
+                    ]
+                else:
+                    # Hash the actual exported R, not just its seed: QR can
+                    # depend on the host LAPACK build. R.T is derived from R.
+                    from qai_hub_models.models.templates.llm.turboquant.reference import (
+                        make_rotation,
+                    )
+
+                    matrix = make_rotation(
+                        self.rotation, spec.seed, self.block_size
+                    ).matrix()
+                    data[name]["rotation_f32_sha256"] = hashlib.sha256(
+                        matrix.astype("<f4").tobytes()
+                    ).hexdigest()
         return data
 
     def config_hash(self) -> str:
@@ -202,8 +220,13 @@ def _polar(bits: int, seed: int) -> KVCodecSpec:
 # "k8" names the repo's affine int8 K path, not an 8-bit TurboQuant codec.
 # 3-bit profiles have a host oracle only (no HTP graph).
 PROFILES: dict[str, TurboQuantConfig] = {
-    "baseline_int8": TurboQuantConfig("baseline_int8", BASELINE, BASELINE),
-    "baseline_int16_kv": TurboQuantConfig("baseline_int16_kv", INT16, INT16),
+    # Baselines do not rotate; retain their historical metadata/hash.
+    "baseline_int8": TurboQuantConfig(
+        "baseline_int8", BASELINE, BASELINE, rotation=Rotation.FWHT
+    ),
+    "baseline_int16_kv": TurboQuantConfig(
+        "baseline_int16_kv", INT16, INT16, rotation=Rotation.FWHT
+    ),
     "k4_v4": TurboQuantConfig("k4_v4", _polar(4, KEY_SEED), _polar(4, VALUE_SEED)),
     "k4_v4_scaled": TurboQuantConfig(
         "k4_v4_scaled",
@@ -217,7 +240,8 @@ PROFILES: dict[str, TurboQuantConfig] = {
 }
 
 
-def get_profile(name: str) -> TurboQuantConfig:
+def get_profile(name: str, rotation: Rotation | None = None) -> TurboQuantConfig:
+    """Get a profile; an explicit rotation reproduces historical FWHT bundles."""
     if name == "qjl_reference":
         raise NotImplementedError(
             "qjl_reference is a research option outside the first milestone; "
@@ -227,4 +251,5 @@ def get_profile(name: str) -> TurboQuantConfig:
         raise ValueError(
             f"Unknown TurboQuant profile '{name}'. Choose from {sorted(PROFILES)}."
         )
-    return PROFILES[name]
+    config = PROFILES[name]
+    return replace(config, rotation=rotation) if rotation is not None else config

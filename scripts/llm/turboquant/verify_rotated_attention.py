@@ -7,14 +7,70 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import onnx
+from onnx import numpy_helper
 from verify_kv_boundary import INT8_TYPES, WIDE_TYPES, parse_dlcinfo, walk_back
+
+from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_profile
+from qai_hub_models.models.templates.llm.turboquant.reference import make_rotation
+
+
+def rotation_only_change(left: onnx.GraphProto, right: onnx.GraphProto) -> bool:
+    """Compare all source graph structure/weights except audited rotation constants."""
+    normalized = []
+    for original in (left, right):
+        graph = onnx.GraphProto()
+        graph.CopyFrom(original)
+        keep = [t for t in graph.initializer if not t.name.startswith("tq_rotation")]
+        graph.ClearField("initializer")
+        graph.initializer.extend(keep)
+        for node in graph.node:
+            for i, name in enumerate(node.input):
+                if name.startswith("tq_rotation"):
+                    node.input[i] = name.replace("_fwht_", "_rotation_").replace(
+                        "_dense_qr_", "_rotation_"
+                    )
+        normalized.append(graph.SerializeToString())
+    return normalized[0] == normalized[1]
+
+
+def verify_rotations(graph: onnx.GraphProto, config: dict[str, Any]) -> list[str]:
+    """Check source constants against the recorded rotation, seed and matrix hash."""
+    errors = []
+    actual = {
+        t.name: numpy_helper.to_array(t)
+        for t in graph.initializer
+        if t.name.startswith("tq_rotation")
+    }
+    expected = set()
+    rotation = Rotation(config["rotation"])
+    d = config["block_size"]
+    for kind in ("key", "value"):
+        spec = config[kind]
+        matrix = make_rotation(rotation, spec["seed"], d).matrix().astype("<f4")
+        if rotation == Rotation.DENSE_QR and hashlib.sha256(
+            matrix.tobytes()
+        ).hexdigest() != spec.get("rotation_f32_sha256"):
+            errors.append(f"Dense matrix digest mismatch: {kind}")
+        # K only needs the forward R.T; V additionally needs inverse R.
+        for transpose in (True,) if kind == "key" else (False, True):
+            suffix = "_t" if transpose else ""
+            name = f"tq_rotation{suffix}_{rotation.value}_s{spec['seed']}_d{d}"
+            expected.add(name)
+            value = matrix.T if transpose else matrix
+            if name not in actual or not np.array_equal(actual[name], value):
+                errors.append(f"Incorrect/missing rotation constant: {name}")
+    if set(actual) != expected:
+        errors.append("Unexpected rotation constants in source graph.")
+    return errors
 
 
 def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
@@ -140,10 +196,18 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                     if elements > layer["kv_heads"] * layer["tile_tokens"] * 128:
                         errors.append(f"Oversized rotated KV tile: {t.name}")
     graph = onnx.load(bundle / f"{name}.onnx", load_external_data=False).graph
+    conversion = json.loads((bundle / "convert_report.json").read_text())
+    config = conversion["config"]
+    current = get_profile(conversion["profile"], Rotation(config["rotation"]))
+    if current.config_hash() != conversion["config_hash"]:
+        errors.append("Bundle rotation/config hash does not match current constants.")
+    errors.extend(verify_rotations(graph, config))
+    inverse_name = (
+        f"tq_rotation_{config['rotation']}_s{config['value']['seed']}"
+        f"_d{config['block_size']}"
+    )
     inverses = [
-        n
-        for n in graph.node
-        if n.op_type == "MatMul" and n.input[1].startswith("tq_rotation_fwht_s542_")
+        n for n in graph.node if n.op_type == "MatMul" and n.input[1] == inverse_name
     ]
     if len(inverses) != sum(x["query_heads"] for x in layers):
         errors.append("Inverse V rotation is not once per query head.")
@@ -155,6 +219,7 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
         "new_tokens": layers[0]["new_tokens"],
         "max_rotated_intermediate_bytes": max(sizes, default=0),
         "native_decoder_ops": sum(op.op_type == "Decode4" for op in info.ops),
+        "rotation": config["rotation"],
         "violations": errors,
     }
 
@@ -164,6 +229,7 @@ def main() -> None:
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--graphs", nargs="*", default=[])
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--reference-bundle", type=Path)
     args = parser.parse_args()
     bundle = args.bundle.expanduser()
     names = args.graphs or sorted(
@@ -173,6 +239,19 @@ def main() -> None:
     for name in names:
         try:
             results[name] = verify_graph(bundle, name)
+            if args.reference_bundle:
+                graphs = [
+                    onnx.load(
+                        path.expanduser() / f"{name}.onnx", load_external_data=False
+                    ).graph
+                    for path in (bundle, args.reference_bundle)
+                ]
+                same = rotation_only_change(*graphs)
+                results[name]["rotation_only_source_change"] = same
+                if not same:
+                    results[name]["violations"].append(
+                        "Source graph changed beyond rotation."
+                    )
         except (ValueError, OSError, KeyError) as error:
             results[name] = {"violations": [str(error)]}
         print(

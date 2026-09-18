@@ -38,6 +38,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache, DynamicLayer
 
 from qai_hub_models.models.templates.llm.turboquant.config import (
+    Rotation,
     TurboQuantConfig,
     get_profile,
 )
@@ -208,6 +209,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--profiles", nargs="+", default=["k4_v4", "k8_v3", "k4_v3"])
+    parser.add_argument("--rotation", choices=[r.value for r in Rotation])
     parser.add_argument("--num-windows", type=int, default=4)
     parser.add_argument("--window", type=int, default=1024)
     parser.add_argument("--chunk", type=int, default=128)
@@ -215,6 +217,10 @@ def main() -> None:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--snapshot", type=Path, required=True)
     args = parser.parse_args()
+    rotation = Rotation(args.rotation) if args.rotation else None
+    configs = {
+        name: get_profile(name, rotation) for name in {*args.profiles, "k4_v4", "k4_v3"}
+    }
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -224,7 +230,7 @@ def main() -> None:
     model.eval()
     num_layers = model.config.num_hidden_layers
     for profile in args.profiles:
-        get_profile(profile).validate_for_model(
+        configs[profile].validate_for_model(
             num_layers, model.config.num_key_value_heads, model.config.head_dim
         )
 
@@ -256,7 +262,7 @@ def main() -> None:
 
         if w == 0:
             report["kv_statistics"] = {
-                profile: kv_statistics(base_cache, get_profile(profile))
+                profile: kv_statistics(base_cache, configs[profile])
                 for profile in ("k4_v4", "k4_v3")
             }
             args.snapshot.expanduser().parent.mkdir(parents=True, exist_ok=True)
@@ -275,7 +281,7 @@ def main() -> None:
         del base_cache
 
         for profile in args.profiles:
-            cache = PackedPastCache(get_profile(profile), num_layers)
+            cache = PackedPastCache(configs[profile], num_layers)
             lp = run_window(model, tokens, args.chunk, cache)[:-1]
             s = sums[profile]
             s["nll"] += float(-lp.gather(1, targets[:, None]).sum())
@@ -289,7 +295,8 @@ def main() -> None:
     for profile, s in sums.items():
         ppl = math.exp(s["nll"] / s["n"])
         report["profiles"][profile] = {
-            "config_hash": get_profile(profile).config_hash(),
+            "config_hash": configs[profile].config_hash(),
+            "config": configs[profile].to_dict(),
             "ppl": ppl,
             "ppl_delta_pct_vs_float_kv": 100
             * (ppl / report["baseline_float_kv_ppl"] - 1),
