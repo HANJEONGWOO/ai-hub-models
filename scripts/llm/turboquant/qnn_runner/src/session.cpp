@@ -25,8 +25,8 @@ double since(Clock::time_point start) {
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error(what); }
 
-const std::regex kKvIn(R"((past_(key|value)_\d+|tq_(key|value)_\d+_(packed|norm|scale))_in)");
-const std::regex kKvOut(R"((past_(key|value)_\d+|tq_(key|value)_\d+_(packed|norm|scale))_out)");
+const std::regex kKvIn(R"((past_(key|value)_\d+|tq_(key|value)_\d+_(packed|norm|scale|qjlscale))_in)");
+const std::regex kKvOut(R"((past_(key|value)_\d+|tq_(key|value)_\d+_(packed|norm|scale|qjlscale))_out)");
 
 // Token axis of a KV tensor: hub keys are (heads, 1, head_dim, tokens); everything else is -2.
 int tokenAxis(const std::string& base, size_t rank) {

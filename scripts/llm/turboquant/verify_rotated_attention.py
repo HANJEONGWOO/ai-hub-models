@@ -61,7 +61,9 @@ def verify_rotations(graph: onnx.GraphProto, config: dict[str, Any]) -> list[str
         ).hexdigest() != spec.get("rotation_f32_sha256"):
             errors.append(f"Dense matrix digest mismatch: {kind}")
         # K only needs the forward R.T; V additionally needs inverse R.
-        for transpose in (True,) if kind == "key" else (False, True):
+        for transpose in (
+            (True,) if kind == "key" and not config.get("qjl") else (False, True)
+        ):
             suffix = "_t" if transpose else ""
             name = f"tq_rotation{suffix}_{rotation.value}_s{spec['seed']}_d{d}"
             expected.add(name)
@@ -132,7 +134,8 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
             op
             for op in info.ops
             if re.fullmatch(
-                rf"tq_attn_{number}_tile\d+_head\d+_q\d+_(score|partial)", op.name
+                rf"tq_attn_{number}_tile\d+_head\d+_q\d+_({'score_mse' if layer.get('qjl') else 'score'}|partial)",
+                op.name,
             )
         ]
         if len(queries) != layer["query_heads"] or len(products) != 2 * layer[
@@ -147,6 +150,68 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                 "Float_16",
             ]:
                 errors.append(f"Rotated attention is not FP16: {op.name}")
+        if layer.get("qjl"):
+            qjl_queries = [
+                op
+                for op in info.ops
+                if re.fullmatch(rf"tq_attn_{number}_head\d+_q\d+_rotated_qjl", op.name)
+            ]
+            if len(qjl_queries) != layer["query_heads"] or any(
+                op.op_type not in ("MatMul", "FullyConnected")
+                or [t.dtype for t in op.inputs] != ["Float_16", "Float_16"]
+                for op in qjl_queries
+            ):
+                errors.append(
+                    f"Missing/non-FP16 QJL query projections in layer {number}"
+                )
+            for side, table, tokens in (
+                ("input", "input", layer["past_tokens"]),
+                ("output", "output", layer["new_tokens"]),
+            ):
+                tensor = layer["qjl"][f"scale_{side}"]
+                row = info.io_tables[table].get(tensor)
+                if (
+                    row is None
+                    or row["dtype"] != "Float_16"
+                    or "No encoding" not in row["encoding"]
+                ):
+                    errors.append(f"Invalid QJL scale I/O: {tensor}: {row}")
+                elif [int(d.strip()) for d in row["dims"].strip("[]").split(",")] != [
+                    layer["kv_heads"],
+                    1,
+                    tokens,
+                    1,
+                ]:
+                    errors.append(f"Invalid QJL scale shape: {tensor}")
+            corrections = [
+                op
+                for op in info.ops
+                if re.fullmatch(
+                    rf"tq_attn_{number}_tile\d+_head\d+_q\d+_score_qjl_correction",
+                    op.name,
+                )
+            ]
+            if len(corrections) != layer["query_heads"] * len(layer["tiles"]):
+                errors.append(f"Missing QJL score products in layer {number}")
+            if any(
+                op.op_type != "MatMul"
+                or [t.dtype for t in op.inputs] != ["Float_16", "Float_16"]
+                for op in corrections
+            ):
+                errors.append(f"Non-FP16 QJL score products in layer {number}")
+            for suffix in ["qjl_base_native_fp16"] + [
+                f"tile{t['start']}_qjl_decoded16" for t in layer["tiles"]
+            ]:
+                op = info.producer.get(f"tq_key_{number}_{suffix}")
+                if (
+                    op is None
+                    or op.op_type != "Decode4"
+                    or [t.dtype for t in op.inputs]
+                    != ["Uint_8", "Float_16", "Float_16"]
+                ):
+                    errors.append(
+                        f"Missing QJL Native decoder: layer {number}/{suffix}"
+                    )
         for tile in layer["tiles"]:
             for kind in ("key", "value"):
                 restored = tile[f"{kind}_restored"]
@@ -202,6 +267,44 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
     if current.config_hash() != conversion["config_hash"]:
         errors.append("Bundle rotation/config hash does not match current constants.")
     errors.extend(verify_rotations(graph, config))
+    if config.get("qjl"):
+        from qai_hub_models.models.templates.llm.turboquant.qjl import projection
+        from qai_hub_models.models.templates.llm.turboquant.reference import (
+            load_codebook,
+        )
+
+        constants = {
+            t.name: numpy_helper.to_array(t)
+            for t in graph.initializer
+            if t.name.startswith(("tq_qjl_", "tq_native_key3_"))
+        }
+        expected = {
+            "tq_qjl_projection_t": projection(
+                128, config["key"]["seed"] + 1000
+            ).T.astype(np.float32),
+            "tq_qjl_coefficient": np.array(
+                np.sqrt(np.pi / 2) / np.sqrt(128), dtype=np.float32
+            ),
+            "tq_qjl_sign_lut_fp16": np.repeat(
+                np.array([-1, 1], dtype=np.float16), 8
+            ).reshape(1, 1, 1, 16),
+            "tq_native_key3_centroids_fp16": np.tile(load_codebook(3, 128), 2)
+            .astype(np.float16)
+            .reshape(1, 1, 1, 16),
+        }
+        for key, value in expected.items():
+            if key not in constants or not np.array_equal(constants[key], value):
+                errors.append(f"QJL constant mismatch: {key}")
+        kinverse = f"tq_rotation_{config['rotation']}_s{config['key']['seed']}_d128"
+        inverses = [
+            n for n in graph.node if n.op_type == "MatMul" and n.input[1] == kinverse
+        ]
+        if len(inverses) != len(layers) or any(
+            not n.name.endswith("_qjl_mse_key") for n in inverses
+        ):
+            errors.append(
+                "QJL inverse K rotation must occur only once per new-token encoder."
+            )
     inverse_name = (
         f"tq_rotation_{config['rotation']}_s{config['value']['seed']}"
         f"_d{config['block_size']}"

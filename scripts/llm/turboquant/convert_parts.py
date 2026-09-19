@@ -39,6 +39,7 @@ from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
 from qai_hub_models.models.templates.llm.turboquant.native_decoder import (
     use_native_decoder,
 )
+from qai_hub_models.models.templates.llm.turboquant.qjl import add_qjl_attention
 from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
     tile_kv_attention,
 )
@@ -76,7 +77,7 @@ def input_shape(
         return [int(onnx_dims[0]), 1, int(onnx_dims[2]), past]
     if re.fullmatch(r"past_value_\d+_in", name):
         return [int(onnx_dims[0]), 1, past, int(onnx_dims[3])]
-    if re.fullmatch(r"tq_(key|value)_\d+_(packed|norm|scale)_in", name):
+    if re.fullmatch(r"tq_(key|value)_\d+_(packed|norm|scale|qjlscale)_in", name):
         return [int(onnx_dims[0]), 1, past, int(onnx_dims[3])]
     if len(onnx_dims) == 3:
         return [1, seq_len, int(onnx_dims[2])]
@@ -131,6 +132,8 @@ def apply_profile(
         )
     if args.native_decoder_package:
         result = use_native_decoder(result, config)
+    if config.qjl:
+        result = add_qjl_attention(result, config)
     # Initializers keep their external-data location, so expose the weights file here.
     for data in onnx_path.parent.glob("*.data"):
         link = out / data.name
@@ -335,14 +338,14 @@ def main() -> None:
         "--rotated-attention",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Defaults to enabled for k4_v4_scaled; disabled for other profiles.",
+        help="Defaults to enabled for scaled K4/V4 and K3+QJL/V4 profiles.",
     )
     parser.add_argument(
         "--native-decoder",
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Use Native Decode4 by default for k4_v4_scaled; "
+            "Use Native Decode4 by default for scaled K4/V4 and K3+QJL/V4; "
             "--no-native-decoder selects the graph decoder."
         ),
     )
@@ -358,7 +361,7 @@ def main() -> None:
         "--attention-tile",
         type=int,
         default=None,
-        help="KV tile size (default: 256 for k4_v4_scaled, 0 for other profiles).",
+        help="KV tile size (default: 256 for supported scaled profiles, 0 otherwise).",
     )
     parser.add_argument("--parts", type=int, nargs="*", default=[])
     parser.add_argument(
@@ -373,18 +376,18 @@ def main() -> None:
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     args = parser.parse_args()
-    scaled = args.profile == "k4_v4_scaled"
+    scaled = args.profile in ("k4_v4_scaled", "k3qjl_v4_scaled")
     if args.native_decoder is None:
         args.native_decoder = scaled
     if args.native_decoder and not scaled:
-        parser.error("Native Decode4 requires the k4_v4_scaled profile")
+        parser.error("Native Decode4 requires k4_v4_scaled or k3qjl_v4_scaled")
     if args.attention_tile is None:
         args.attention_tile = 256 if scaled else 0
     if args.rotated_attention is None:
         args.rotated_attention = scaled
     if args.native_decoder_package and (not args.native_decoder or not scaled):
         parser.error(
-            "--native-decoder-package requires k4_v4_scaled "
+            "--native-decoder-package requires a supported scaled profile "
             "and an enabled native decoder"
         )
     if scaled and args.native_decoder:
@@ -395,12 +398,20 @@ def main() -> None:
         parser.error("--context-only and --skip-context are mutually exclusive")
     if args.attention_tile < 0:
         parser.error("--attention-tile must be nonnegative")
-    if args.attention_tile and args.profile not in ("k4_v4", "k4_v4_scaled"):
-        parser.error("--attention-tile requires a k4_v4 profile")
-    if args.rotated_attention and (
-        args.profile != "k4_v4_scaled" or not args.attention_tile
+    if args.attention_tile and args.profile not in (
+        "k4_v4",
+        "k4_v4_scaled",
+        "k3qjl_v4_scaled",
     ):
-        parser.error("--rotated-attention requires k4_v4_scaled and --attention-tile")
+        parser.error("--attention-tile requires a k4_v4 or k3qjl_v4_scaled profile")
+    if args.rotated_attention and (not scaled or not args.attention_tile):
+        parser.error(
+            "--rotated-attention requires a supported scaled profile and --attention-tile"
+        )
+    if args.profile == "k3qjl_v4_scaled" and not (
+        args.native_decoder and args.rotated_attention and args.attention_tile
+    ):
+        parser.error("k3qjl_v4_scaled requires native rotated tiled attention")
     if args.native_decoder_package:
         args.native_decoder_package = args.native_decoder_package.expanduser().resolve()
         if not args.rotated_attention:

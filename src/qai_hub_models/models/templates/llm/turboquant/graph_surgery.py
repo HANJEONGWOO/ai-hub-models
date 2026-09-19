@@ -602,7 +602,9 @@ def apply_kv_profile(
             num_kv_heads=heads,
             past_tokens=past,
             new_tokens=seq_len,
-            packed_bytes=packed_nbytes(d, spec.bits),
+            packed_bytes=packed_nbytes(
+                d, 4 if config.qjl and kind == "key" else spec.bits
+            ),
         )
         result.codec_io.append(io)
         restored, ins, outs = _insert_codec(decode, encode, config, spec, io, opset)

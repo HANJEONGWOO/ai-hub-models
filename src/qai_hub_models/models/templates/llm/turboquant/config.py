@@ -91,7 +91,7 @@ INT16 = KVCodecSpec(CodecKind.INT16)
 
 @dataclass(frozen=True)
 class TurboQuantConfig:
-    """QJL-off PolarQuant KV codec settings. See ``tutorials/llm/turboquant_design.md``."""
+    """PolarQuant KV codec settings with opt-in K3+1 orthogonal QJL."""
 
     profile: str
     key: KVCodecSpec
@@ -103,6 +103,7 @@ class TurboQuantConfig:
     bit_order: str = "msb_first"
     format_version: int = FORMAT_VERSION
     precomputed_norm: bool = False
+    qjl: bool = False
     reference_commit: str = field(default=REFERENCE_COMMIT)
 
     def __post_init__(self) -> None:
@@ -110,12 +111,23 @@ class TurboQuantConfig:
             raise ValueError(f"Unsupported norm dtype {self.norm_dtype}.")
         if self.bit_order != "msb_first":
             raise ValueError(f"Unsupported bit order {self.bit_order}.")
-        expected_version = 2 if self.precomputed_norm else FORMAT_VERSION
+        expected_version = (
+            3 if self.qjl else 2 if self.precomputed_norm else FORMAT_VERSION
+        )
         if self.format_version != expected_version:
             raise ValueError(
                 f"Config format version {self.format_version} does not match "
                 f"this norm representation ({expected_version})."
             )
+        if self.qjl and (
+            not self.precomputed_norm
+            or not self.norm_correction
+            or self.key.bits != 3
+            or self.value.bits != 4
+            or self.rotation != Rotation.DENSE_QR
+            or self.norm_dtype != "float16"
+        ):
+            raise ValueError("QJL requires dense K3+1/V4 with precomputed FP16 scales.")
         for spec in self.codecs:
             if not spec.is_polar:
                 continue
@@ -178,11 +190,30 @@ class TurboQuantConfig:
             "norm_correction": self.norm_correction,
             "norm_dtype": self.norm_dtype,
             "bit_order": self.bit_order,
-            "qjl": False,
+            "qjl": self.qjl,
             "reference_commit": self.reference_commit,
         }
         if self.precomputed_norm:
             data["norm_representation"] = "effective_scale"
+        if self.qjl:
+            from qai_hub_models.models.templates.llm.turboquant.qjl import projection
+
+            data["qjl_settings"] = {
+                "reference_commit": "7f601a135735842a7f12b6bf861561154c410ff4",
+                "keys_only": True,
+                "seed": self.key.seed + 1000,
+                "projection": "orthogonal_qr",
+                "coefficient": "sqrt(pi/2)/sqrt(d)",
+                "shrinkage": 1.0,
+                "packing": "nibble_low3_mse_high1_positive_sign",
+                "residual": "original_key_minus_native_fp16_mse_reconstruction",
+                "scale": "coefficient_times_residual_norm_fp16",
+                "projection_f32_sha256": hashlib.sha256(
+                    projection(self.block_size, self.key.seed + 1000)
+                    .astype("<f4")
+                    .tobytes()
+                ).hexdigest(),
+            }
         for name, spec in (("key", self.key), ("value", self.value)):
             if spec.is_polar:
                 data[name]["codebook_sha256"] = CODEBOOK_SHA256[
@@ -234,6 +265,14 @@ PROFILES: dict[str, TurboQuantConfig] = {
         _polar(4, VALUE_SEED),
         format_version=2,
         precomputed_norm=True,
+    ),
+    "k3qjl_v4_scaled": TurboQuantConfig(
+        "k3qjl_v4_scaled",
+        _polar(3, KEY_SEED),
+        _polar(4, VALUE_SEED),
+        format_version=3,
+        precomputed_norm=True,
+        qjl=True,
     ),
     "k8_v3": TurboQuantConfig("k8_v3", BASELINE, _polar(3, VALUE_SEED)),
     "k4_v3": TurboQuantConfig("k4_v3", _polar(4, KEY_SEED), _polar(3, VALUE_SEED)),

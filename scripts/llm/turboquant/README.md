@@ -27,6 +27,63 @@ The default package is `~/.qaihm/tmp/turboquant/native_decoder_hvx_20260918`;
 override it with `--native-decoder-package` or `TURBOQUANT_NATIVE_DECODER_PACKAGE`.
 Missing libraries cause an error, not an automatic build or silent fallback.
 
+## Orthogonal K-only QJL (K3+1 / V4)
+
+`--profile k3qjl_v4_scaled` enables the separate format-3 QJL path. Existing
+`k4_v4_scaled` defaults stay Dense+Native **without QJL**, for an unchanged
+comparison group. QJL requires Dense QR, Native Decode4, and rotated tiled
+attention; these are selected automatically for the new profile.
+
+- K uses three MSE index bits and one QJL sign bit per coordinate; V stays
+  four-bit MSE. Each stored nibble is `index | (positive_sign << 3)`.
+- Orthogonal QJL projection `S` uses seed 1042 (`K seed + 1000`), QR column-sign
+  correction, and **no determinant correction**. A zero projection maps to +1.
+- The append encoder forms `r = K - K_mse` using the actual Native FP16 MSE
+  decode. It stores `sqrt(pi/2)/sqrt(128) * ||r||` as `tq_key_L_qjlscale_out`.
+  There is no `2/pi` shrinkage. The QNN runner preserves this extra stream
+  across reset, append, and bucket switches; rebuild the runner for format 3.
+- Attention adds `(q @ S.T) @ (signs * qjlscale).T` per K tile, before the
+  existing mask and global softmax. Current uncompressed K gets zero correction.
+  No full residual K cache or per-past-token inverse rotation is constructed.
+- The same Native Decode4 package reads MSE indices using a repeated eight-entry
+  LUT and reads signs using a `[-1]*8 + [+1]*8` LUT. No DSP binary change is needed.
+  This is tiled graph composition, **not one fused packed-attention kernel**.
+- K payload remains 4-bit, but metadata grows by one FP16 scalar per K vector.
+  Qwen3-1.7B / C1024 host KV is 29.3125 MiB versus 28.875 MiB without QJL.
+  This is host KV storage, not peak NPU memory.
+
+```bash
+PYTHONPATH=src python scripts/llm/turboquant/convert_parts.py \
+    --split-dir ~/.qaihm/tmp/turboquant/qwen3_1_7b_w4a16_split \
+    --out ~/.qaihm/tmp/turboquant/qwen3_1_7b_qjl_native_new \
+    --profile k3qjl_v4_scaled --context-buckets 128 256 512 1024
+bash scripts/llm/turboquant/qnn_runner/build_android.sh \
+    ~/.qaihm/tmp/turboquant/qnn_runner/qjl
+```
+
+Use `validate_qjl_encoder.py` for reference/HTP encoder checks and
+`validate_native_decoder.py --lut qjl_sign` (or `--lut mse3`) for Native LUT
+correctness. `verify_rotated_attention.py` also audits QJL I/O, products,
+constants, and tile sizes. The generic Python `TurboQuantKVCache` rejects
+format 3 instead of silently dropping QJL; use `QJLKeyReference` for its CPU
+oracle and the dedicated QNN runner for LLM execution.
+
+The standalone 2026-09-19 probe passed the QJL stage at the unchanged 0.2%
+scale tolerance and 0.001 normalized sign-boundary tolerance. The MSE stage
+still failed two T128 real-KV cases (maximum scale error 0.21314%); the overall
+encoder gate therefore remains failed. Numerical validation and end-to-end
+performance/PPL are reported separately.
+
+`benchmark_qjl_once.py` stages the int16 / Dense+Native / QJL bundles and runs
+one performance session per configuration and input condition (35 or 897 prompt
+tokens, plus 128 generated tokens). Reset/EOS/bucket diagnostics and four
+WikiText score windows are separate. It refuses existing report/attempt files;
+use a fresh report directory and unique `--device-prefix` for a new experiment.
+Run `push`, then `functional`, review those results, then run `performance` and
+`quality`. Audit the final QJL bundle with `verify_rotated_attention.py` into
+`REPORTS/boundary_qjl_native.json` before using `summarize_qjl_results.py`.
+Design §17 records the measured results, limitations, and artifact paths.
+
 The older results/examples below use explicit `--rotation fwht`. Use a **new
 bundle directory** for dense models: existing binaries do not change with Python
 defaults, and FWHT/dense packed cache states are not interchangeable. CLI

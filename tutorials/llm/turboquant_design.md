@@ -1251,6 +1251,194 @@ PYTHONPATH=src python scripts/llm/turboquant/summarize_rotation_results.py \
     --out ~/.qaihm/tmp/turboquant/reports/comparison_dense_native_buckets.json
 ```
 
-## 17. 출처
+## 17. Orthogonal K-only QJL: K3+1 / V4
+
+### 17.1 알고리즘과 저장 형식
+
+`k3qjl_v4_scaled`는 별도의 **format 3** 실험 profile이다. 기존
+`k4_v4_scaled`의 Dense+Native 기본값과 설정 해시는 바꾸지 않는다.
+사용자가 선택한 총 비트 예산은 K 3-bit MSE + QJL 1-bit, V 4-bit MSE다.
+norm/scale 메타데이터는 이 4-bit 예산에 포함하지 않는다.
+따라서 K4 MSE와의 비교는 동일 payload 예산의 알고리즘 비교이며,
+같은 K4 MSE에 QJL만 더한 ablation은 아니다. QJL 추가와 MSE 비트 축소의
+영향이 함께 포함되므로 성능/품질 변화를 QJL 한 가지 효과로 단정하지 않는다.
+
+참조는 `turboquant_plus/turboquant/qjl.py`, checkout
+`7f601a135735842a7f12b6bf861561154c410ff4`이며 파일 SHA256은
+`2a9fcda9de3de4c2edcf7272369c513904d15336d8bd337a1ae90de0b730ee2c`다.
+Gaussian 행렬의 QR 분해 후 R 대각 부호로 Q의 열 부호를 보정한다.
+PolarQuant 회전과 달리 **determinant +1 보정은 하지 않는다**.
+QJL seed는 K seed + 1000 = 1042다.
+
+새 K를 저장할 때:
+
+1. Dense MSE 회전 R로 3-bit 인덱스와 FP16 effective scale을 계산한다.
+2. Native Decode4로 실제 저장값을 복원하여 `r = K - K_mse`를 계산한다.
+3. 직교행렬 S로 `sign(S r)`를 구한다. 정확히 0이면 +1로 처리한다.
+4. `a = sqrt(pi/2) / sqrt(d) * ||r||`를 FP16으로 저장한다.
+
+복원은 `K_hat = K_mse + a * S.T @ signs`다. 요청한 고전적 계수를
+그대로 사용하며 `2/pi` shrinkage는 적용하지 않는다. 기준 코드와의
+알고리즘 일치를 목표로 하되, 실제 기기에서는 저장 scale, centroid,
+곱셈, 회전의 FP16 반올림이 추가된다. 논문의 모든 이론 조건/커널을
+그대로 재현했다거나 이 유한 차원 구현이 정확히 불편향이라고 주장하지 않는다.
+
+K의 각 nibble은 `mse_index | (positive_sign << 3)`로 저장한다.
+기존 K packed payload 크기를 유지하고 `tq_key_L_qjlscale_{in,out}`만
+추가한다. Qwen3-1.7B, 28 layers, 8 KV heads, D128, C1024 기준:
+
+| 구성 | K/V payload | vector별 메타데이터 | host KV |
+|---|---|---|---:|
+| int16 KV | K16 / V16 | 별도 codec scale 없음 | 112 MiB |
+| Dense+Native | K4 / V4 | K FP16 1개, V FP16 1개 | 28.875 MiB |
+| Dense+Native+QJL | K3+1 / V4 | K FP16 2개, V FP16 1개 | 29.3125 MiB |
+
+QNN runner는 추가 stream을 기존 KV와 동일하게 append/reset/복사하며,
+bucket 전환 시에도 동일한 token axis를 사용한다. 일반 Python
+`TurboQuantKVCache`는 format 3을 아직 지원하지 않으며 오류를 내도록 했다.
+QJL을 누락하고 실행하는 fallback은 없다. CPU oracle은 `QJLKeyReference`다.
+
+### 17.2 attention 계산과 검증
+
+기존 rotated-domain MSE score에
+`(q @ S.T) @ (signs * a).T`를 **타일마다** 더한 다음 기존 mask/global
+softmax를 적용한다. 현재 graph의 새 K는 압축하지 않은 경로를 그대로 쓰므로
+QJL correction을 0으로 채운다. V는 기존 4-bit MSE/AV/output inverse rotation
+경로를 유지한다.
+
+과거 전체 K나 QJL residual을 원래 좌표계로 복원하지 않는다. K 역회전은
+새 토큰 encoder에서 잔차를 계산할 때 한 번만 수행한다. Native Decode4
+라이브러리 자체는 변경하지 않고 LUT를 바꿔 사용한다:
+
+- MSE K: 8-entry 3-bit centroid를 두 번 반복한 16-entry LUT.
+- QJL K: `[-1]*8 + [+1]*8` LUT.
+- MSE V: 기존 16-entry 4-bit LUT.
+
+따라서 이것은 Native decoder를 사용하는 tiled graph이며, unpack과 QK/AV
+전체를 단일 커널로 합친 fused attention은 아니다. 추가 query projection,
+QJL 타일 decode, score MatMul/Add 비용이 있다.
+
+참조 QJL 행렬·부호는 CPU에서 정확히 일치했고 복원 오차 최대값은
+`8.881784197001252e-16`이다. 두 새 Native LUT는 HTP에서 길이
+1/3/127/128/255/256/1023 및 모든 byte pattern을 검사해 모두 FP16 oracle과
+bit-exact였다. 관련 원본은 `~/.qaihm/tmp/turboquant/` 아래의
+`qjl_{sign,mse3}_decoder_20260919/correctness.json`이다.
+
+단독 encoder 검증(`qjl_encoder_20260919/correctness.json`)은 실제 KV
+layer0/layer27와 0.5배 synthetic range, T1/T128을 사용했다. QJL 단계는
+설명되지 않는 부호 오류 0개, 잔차 scale 최대 상대 오차 0.19731%로 기존
+0.2% 기준을 통과했다. 그러나 MSE effective scale은 두 T128 실제 KV
+case에서 0.21314% / 0.20707%로 기준을 넘었다. **전체 encoder gate는 실패**이며
+허용오차를 완화하지 않았다. 기존 V4 encoder의 알려진 제한도 해결했다고
+주장하지 않는다. 이 수치 gate와 LLM 성능/PPL 결과는 구분해야 한다.
+
+### 17.3 실기기 비교 결과 (2026-09-19)
+
+S26 Ultra / SM8850 HTP V81, Qwen3-1.7B W4A16, 최대 context 1024에서
+int16 KV / 기존 Dense+Native K4/V4 / 새 Dense+Native K3+QJL/V4를 비교했다.
+int16은 모델 전체가 FP16이라는 뜻이 아니라 **KV가 uFxp_16인 baseline**이다.
+같은 runner와 burst 설정을 사용했으며, 두 TurboQuant의 Native DSP library도
+동일하다. 기존 int16/Dense context 바이너리를 수정하지 않고 새 이름으로
+배포했다. 입력 SHA256과 config hash도 원본 리포트에서 확인했다.
+
+성능은 구성 및 입력 조건당 **1회**, 총 6회다. profiling은 끄고 로딩은
+TTFT에서 제외했다. warmup 제외, 온도 통제, 실행 순서 교차, 분산 추정은
+하지 않았다. 기능 진단과 PPL 실행 시간은 성능 표에 포함하지 않는다.
+PPL도 세 구성 모두 이번에 같은 1024-token WikiText window 4개를 새로
+측정했으며, window별 평균 PPL이 아니라 합산 NLL / 4092로 계산했다.
+
+주요 조건은 **897-token prompt + 128-token 생성**이다. 마지막 생성 토큰은
+다시 입력하지 않으므로 캐시는 정확히 1024에 도달하고, 127개 decode step은
+모두 C1024를 사용한다.
+
+| 지표 | int16 KV baseline | 기존 Dense+Native K4/V4 | Dense+Native K3+QJL/V4 |
+|---|---:|---:|---:|
+| TTFT | 304.176 ms | 526.543 ms | 574.604 ms |
+| prefill | 2950.761 tok/s | 1704.871 tok/s | 1562.162 tok/s |
+| decode | 35.8169 tok/s | 38.1123 tok/s | 33.1602 tok/s |
+| decode/token | 27.920 ms | 26.238 ms | 30.157 ms |
+| host KV 저장소 | 112.000 MiB | 28.875 MiB | 29.3125 MiB |
+| resident graph I/O buffer | 263.179 MiB | 222.197 MiB | 223.782 MiB |
+| 종료 VmRSS | 391.262 MiB | 280.035 MiB | 300.508 MiB |
+| 프로세스 VmHWM | 605.055 MiB | 605.246 MiB | 604.980 MiB |
+| PPL, 4 window / 4092토큰 | 20.108306 | 20.607753 | 34.721674 |
+
+짧은 조건은 **35-token prompt + 128-token 생성**이다.
+
+| 지표 | int16 KV baseline | 기존 Dense+Native K4/V4 | Dense+Native K3+QJL/V4 |
+|---|---:|---:|---:|
+| TTFT | 40.483 ms | 62.317 ms | 59.540 ms |
+| prefill | 868.493 tok/s | 565.178 tok/s | 591.528 tok/s |
+| decode | 34.9560 tok/s | 54.5074 tok/s | 51.6818 tok/s |
+
+짧은 조건에서 int16은 고정 C1024이고 두 TurboQuant는 C128 93step /
+C256 34step이다. 버킷화한 int16과의 비교가 아니므로 짧은 문맥 차이를
+Native/QJL 커널만의 효과로 해석하지 않는다. 긴 조건의 prefill도 버킷
+사용이 다르다.
+
+해석과 제한:
+
+- QJL 구성의 긴 문맥 decode는 기존 TurboQuant 대비 **12.99%**,
+  int16 대비 **7.42%** 낮다. 기존 TurboQuant는 int16 대비 6.41% 높다.
+  모두 단회 관측값이며 통계적으로 안정적인 차이라고 주장하지 않는다.
+- 긴 문맥 평균 host prepare / QNN 호출 / commit은 int16
+  **4.691 / 22.641 / 0.223 ms**, 기존 TurboQuant
+  **1.126 / 24.511 / 0.015 ms**, QJL
+  **1.043 / 28.631 / 0.015 ms**다. 관측된 지연 증가는 주로 QNN 호출에
+  있다. QJL에는 새 K 잔차 encoder, query projection, 타일 sign decode와
+  score 보정이 추가되지만, 별도 op profiling 없이 각 연산의 기여도를
+  확정하지 않는다.
+- QJL host KV는 int16 대비 **73.83%** 작다. 기존 TurboQuant보다
+  0.4375 MiB 늘어난 것은 추가 FP16 K 잔차 scale 때문이다.
+  종료 RSS는 줄어도 프로세스 VmHWM은 세 구성 모두 약 605 MiB다.
+  host KV / RSS / VmHWM을 NPU 전체 또는 peak HTP 메모리로 해석하지 않는다.
+- **QJL PPL은 34.721674로 기존 TurboQuant보다 크게 나빠졌다.**
+  이번 결과는 속도나 품질 개선을 보여주지 않는다. K4→K3 비트 축소,
+  고전적 QJL 보정 및 배포 FP16 연산의 영향을 분리한 ablation은 하지
+  않았으므로 원인을 한 항목으로 단정하지 않는다. 특히 §17.2의 작은
+  scale 오차만으로 이 PPL 증가를 설명했다고 주장하지 않는다.
+  기본 profile은 기존 Dense+Native K4/V4로 유지하고 QJL은 실험형으로 둔다.
+- Reset 2회/8-token 출력 동일, EOS 10번째 토큰 종료, 600-token 생성 중
+  C128→256→512→1024 전환 및 긴 성능 실행의 1024 캐시 경계 검사를 통과했다.
+  최종 attention DLC 21개 구조 감사도 통과했다. Native op는 총 1456개이며
+  encoder MSE 복원과 타일 QJL sign decode도 포함한다. 최대 단일 FP16 KV
+  타일은 512 KiB다. 이는 전체 동시 할당량이나 peak memory가 아니다.
+- TurboQuant 단위 테스트 **285개**와 변경 파일 pre-commit(mypy 포함)이
+  통과했다. 이 결과는 **전체 HTP encoder 수치 gate 실패**를 대체하지 않는다.
+
+### 17.4 산출물과 재현
+
+기준 디렉터리: `~/.qaihm/tmp/turboquant/`.
+
+- 최종 QJL 번들: `qwen3_1_7b_qjl_native_20260919_final/`.
+  `*_v3_part2/`는 part1+2, `*_v3_part3/`, `*_v3_part4/`는 각 part의
+  빌드 산출물이다. 최종 번들만 배포/평가에 사용했다.
+- 비교군: `qwen3_1_7b_baseline_int16_kv_cl1024/`,
+  `qwen3_1_7b_dense_native_buckets_final/`.
+- 기기 번들 이름: `qjl_compare_20260919_{baseline_int16,dense_native,qjl_native}`.
+  공통 runner: `qnn_runner/qjl-20260919/qnn-llm-runner`.
+- 종합 결과: `reports/qjl_20260919_v3/comparison_qjl.json`.
+  같은 디렉터리의 `experiment.json`에 runner SHA256과 구성 해시를 기록했다.
+- 성능 원본: `perf_{baseline_int16,dense_native,qjl_native}_{short,long}_once.json`.
+  품질 원본: `score_{baseline_int16,dense_native,qjl_native}_w{0,1,2,3}.json`.
+- 구조/기능: `boundary_qjl_native.json`,
+  `generation_qjl_native_{reset,eos,switches}.json`.
+- 수치 진단: `qjl_encoder_20260919/correctness.json`,
+  `qjl_{sign,mse3}_decoder_20260919/correctness.json`.
+
+새 성능 실험은 `benchmark_qjl_once.py`에 위의 세 번들, runner, assets,
+새 `--reports` 및 고유 `--device-prefix`를 지정해 `push` → `functional`
+순서로 실행한다. 기능 결과를 확인한 뒤 `performance` → `quality`를 실행한다.
+스크립트는 기존 리포트나 시도 로그를 덮어쓰지 않는다. 원본 리포트만
+다시 집계하려면 (기존 요약을 보존하도록 새 출력 이름 사용):
+
+```bash
+PYTHONPATH=src python scripts/llm/turboquant/summarize_qjl_results.py \
+    --reports ~/.qaihm/tmp/turboquant/reports/qjl_20260919_v3 \
+    --encoder-report ~/.qaihm/tmp/turboquant/qjl_encoder_20260919/correctness.json \
+    --out ~/.qaihm/tmp/turboquant/reports/qjl_20260919_v3/comparison_recheck.json
+```
+
+## 18. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

@@ -5,7 +5,7 @@
 // Split delta-KV LLM session over QNN context binaries.
 //
 // Graph I/O roles come from tensor names, so TurboQuant packed KV streams
-// (tq_<kind>_<layer>_{packed,norm}_{in,out}) are handled like int8 KV streams.
+// (tq_<kind>_<layer>_{packed,norm,scale,qjlscale}_{in,out}) are handled like int8 KV streams.
 // The "pyref" layout reproduces ai-hub-models HubCompatibleGenerator inputs:
 // tokens and past KV right-aligned, pad tokens in front, mask clipped to maskMin.
 #pragma once

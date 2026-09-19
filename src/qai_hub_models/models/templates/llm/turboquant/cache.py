@@ -76,6 +76,10 @@ class PackedKVStore:
         capacity: int,
         batch_size: int,
     ) -> None:
+        if config.qjl:
+            raise NotImplementedError(
+                "Use QJLKeyReference or the QNN session for format-3 QJL storage."
+            )
         self.spec = spec
         self.head_dim = head_dim
         self.capacity = capacity

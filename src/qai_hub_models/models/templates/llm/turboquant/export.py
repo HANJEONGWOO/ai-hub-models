@@ -75,7 +75,7 @@ class Subgraph:
 
 
 def _check_supported(spec: KVCodecSpec, config: TurboQuantConfig) -> None:
-    if not spec.is_polar or spec.bits != 4:
+    if not spec.is_polar or (spec.bits != 4 and not (config.qjl and spec.bits == 3)):
         raise NotImplementedError("ONNX lowering exists only for 4-bit PolarQuant.")
     if config.block_size % 2:
         raise ValueError("4-bit packing needs an even block size.")
@@ -260,7 +260,7 @@ def _select_centroid(
     block_size: int,
     prefix: str,
 ) -> str:
-    """Exact 16-entry lookup on integer indices, using symmetric affine pairs.
+    """Exact 8/16-entry lookup on integer indices, using symmetric affine pairs.
 
     The frozen codebook is symmetric. Fold indices to magnitudes 0..7, then
     select one of four lines, each interpolating two adjacent centroids.
@@ -268,23 +268,26 @@ def _select_centroid(
     all elementwise operations keep head_dim innermost. Where leaves depend
     on the input (constant-only leaves fail HTP detailed profiling).
     """
-    if bits != 4 or not np.array_equal(centroids, -centroids[::-1]):
-        raise ValueError("Affine-pair lookup requires a symmetric 4-bit codebook.")
+    if bits not in (3, 4) or not np.array_equal(centroids, -centroids[::-1]):
+        raise ValueError("Affine-pair lookup requires a symmetric 3/4-bit codebook.")
     p = prefix
 
     def scalar(name: str, value: float) -> str:
         return sg.const(name, np.array(value, dtype=np.float32))
 
-    middle = scalar("tq_index_middle", 7.5)
+    count = 1 << bits
+    middle = scalar(
+        "tq_index_middle" if bits == 4 else "tq_index_middle_b3", count / 2 - 0.5
+    )
     half = scalar("tq_half_f", 0.5)
     zero = scalar("tq_zero_f", 0.0)
     sg.node("Sub", [idx, middle], [f"{p}signed_index"])
     sg.node("Abs", [f"{p}signed_index"], [f"{p}abs_index"])
     sg.node("Sub", [f"{p}abs_index", half], [f"{p}magnitude_index"])
-    for pair in range(4):
+    for pair in range(count // 4):
         offset = 2 * pair
-        slope = centroids[8 + offset + 1] - centroids[8 + offset]
-        base = centroids[8 + offset] - offset * slope
+        slope = centroids[count // 2 + offset + 1] - centroids[count // 2 + offset]
+        base = centroids[count // 2 + offset] - offset * slope
         tag = f"tq_centroid_b{bits}_d{block_size}_pair{pair}"
         sg.node(
             "Mul",
@@ -296,14 +299,27 @@ def _select_centroid(
             [f"{p}pair{pair}_rise", scalar(tag + "_base", base)],
             [f"{p}pair{pair}"],
         )
-    for label, threshold, hi, lo in (
-        ("lower", 1.5, "pair1", "pair0"),
-        ("upper", 5.5, "pair3", "pair2"),
-        ("magnitude", 3.5, "upper", "lower"),
-    ):
+    branches = (
+        (
+            ("lower", 1.5, "pair1", "pair0"),
+            ("upper", 5.5, "pair3", "pair2"),
+            ("magnitude", 3.5, "upper", "lower"),
+        )
+        if bits == 4
+        else (("magnitude", 1.5, "pair1", "pair0"),)
+    )
+    for label, threshold, hi, lo in branches:
         sg.node(
             "Greater",
-            [f"{p}magnitude_index", scalar(f"tq_pair_threshold_{label}", threshold)],
+            [
+                f"{p}magnitude_index",
+                scalar(
+                    f"tq_pair_threshold_{label}"
+                    if bits == 4
+                    else f"tq_pair_threshold_b3_{label}",
+                    threshold,
+                ),
+            ],
             [f"{p}{label}_test"],
         )
         sg.node("Where", [f"{p}{label}_test", f"{p}{hi}", f"{p}{lo}"], [f"{p}{label}"])
@@ -371,7 +387,18 @@ def decode_subgraph(
         [f"{p}index_f"],
     )
     centroids = load_codebook(spec.bits, d).astype(np.float32)
-    y_hat = _select_centroid(sg, f"{p}index_f", centroids, spec.bits, d, p)
+    index_f = f"{p}index_f"
+    if spec.bits == 3:
+        eight = sg.const("tq_eight_f", np.array(8, dtype=np.float32))
+        sg.node("GreaterOrEqual", [index_f, eight], [f"{p}qjl_positive"])
+        sg.node("Sub", [index_f, eight], [f"{p}index_minus8"])
+        sg.node(
+            "Where",
+            [f"{p}qjl_positive", f"{p}index_minus8", index_f],
+            [f"{p}mse_index"],
+        )
+        index_f = f"{p}mse_index"
+    y_hat = _select_centroid(sg, index_f, centroids, spec.bits, d, p)
     y_unit = y_hat
     if config.norm_correction and not config.precomputed_norm:
         sg.node("Mul", [y_hat, y_hat], [f"{p}sq"])
@@ -404,6 +431,8 @@ def build_encode_model(
     head_major: bool = False,
 ) -> onnx.ModelProto:
     """Standalone ``x -> (packed, norm)`` graph."""
+    if config.qjl and spec == config.key:
+        raise ValueError("Use build_qjl_encode_model for the combined K3+1 encoder.")
     lead = (num_heads, 1) if head_major else (1, num_heads)
     sg = encode_subgraph(config, spec, "x", "packed", "norm", lead, num_tokens, "enc_")
     d = config.block_size
@@ -432,6 +461,10 @@ def build_decode_model(
     head_major: bool = False,
 ) -> onnx.ModelProto:
     """Standalone ``(packed, norm) -> x_hat`` graph."""
+    if config.qjl and spec == config.key:
+        raise ValueError(
+            "QJL K needs its residual scale; use QJLKeyReference or tiled attention."
+        )
     lead = (num_heads, 1) if head_major else (1, num_heads)
     sg = decode_subgraph(
         config, spec, "packed", "norm", "x_hat", lead, num_tokens, "dec_"

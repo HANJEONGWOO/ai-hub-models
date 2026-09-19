@@ -37,7 +37,15 @@ def build(args: argparse.Namespace) -> None:
     sdkbin = args.sdk / "bin/x86_64-linux-clang"
     env = qairt_env(args.sdk, args.qnn_python)
     centroids = np.array(
-        [float.fromhex(x) for x in CODEBOOK_HEX[4, 128]], dtype=np.float16
+        [float.fromhex(x) for x in CODEBOOK_HEX[3 if args.lut == "mse3" else 4, 128]],
+        dtype=np.float16,
+    )
+    if args.lut == "mse3":
+        centroids = np.tile(centroids, 2)
+    elif args.lut == "qjl_sign":
+        centroids = np.repeat(np.array([-1, 1], dtype=np.float16), 8)
+    (work / "lut.json").write_text(
+        json.dumps({"kind": args.lut, "values": centroids.tolist()}) + "\n"
     )
     for tokens in args.tokens:
         name = f"native_t{tokens}"
@@ -241,6 +249,7 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[3])
+    parser.add_argument("--lut", choices=["mse4", "mse3", "qjl_sign"], default="mse4")
     parser.add_argument(
         "--device-dir", default="/data/local/tmp/qaihm_turboquant/native_smoke_20260918"
     )

@@ -34,7 +34,7 @@ def use_native_decoder(
         not config.precomputed_norm
         or config.norm_dtype != "float16"
         or config.block_size != 128
-        or config.key.bits != 4
+        or (config.key.bits != 4 and not (config.qjl and config.key.bits == 3))
         or config.value.bits != 4
         or not result.attention_tiles
         or any(
@@ -53,6 +53,15 @@ def use_native_decoder(
             load_codebook(4, 128).astype(np.float16).reshape(1, 1, 1, 16), table_name
         )
     )
+    if config.qjl:
+        graph.initializer.append(
+            numpy_helper.from_array(
+                np.tile(load_codebook(3, 128), 2)
+                .astype(np.float16)
+                .reshape(1, 1, 1, 16),
+                "tq_native_key3_centroids_fp16",
+            )
+        )
     replacements = {}
     for layer in result.attention_tiles:
         layer["decoder"] = "native_unpack_lut_v1"
@@ -72,7 +81,13 @@ def use_native_decoder(
                     ),
                     helper.make_node(
                         NATIVE_OP,
-                        [prefix + "packed", scale16, table_name],
+                        [
+                            prefix + "packed",
+                            scale16,
+                            "tq_native_key3_centroids_fp16"
+                            if config.qjl and kind == "key"
+                            else table_name,
+                        ],
                         [output16],
                         domain=NATIVE_DOMAIN,
                         name=output16,

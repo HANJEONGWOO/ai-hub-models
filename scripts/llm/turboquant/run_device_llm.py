@@ -240,7 +240,10 @@ def cmd_run(args: argparse.Namespace) -> None:
         if args.mode == "generate"
         else assets["wikitext_windows"][0]
     )
-    tag = args.report.stem
+    remote_tag = getattr(args, "remote_report_tag", "")
+    tag = remote_tag or args.report.stem
+    if remote_tag and re.fullmatch(r"[A-Za-z0-9_.-]+", remote_tag) is None:
+        raise ValueError("Report tag must contain only letters, digits, _, . or -.")
     remote_report = f"{DEVICE_ROOT}/reports/{tag}.json"
     runner_args = [
         f"{DEVICE_ROOT}/bin/qnn-llm-runner",
@@ -293,13 +296,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     args.report.with_suffix(".log").write_text(out)
     if not rc or rc.group(1) != "0":
         raise RuntimeError(f"runner failed; log in {args.report.with_suffix('.log')}")
-    adb(args, "pull", remote_report, windows_path(args.report.parent))
+    adb(args, "pull", remote_report, windows_path(args.report))
     if args.dump_logits:
         adb(
             args,
             "pull",
             f"{DEVICE_ROOT}/reports/{tag}.logits.bin",
-            windows_path(args.report.parent),
+            windows_path(args.report.with_suffix(".logits.bin")),
         )
     report = json.loads(args.report.read_text())
     report["device"] = {
@@ -355,6 +358,11 @@ def main() -> None:
     run.add_argument("--profile-prefill", action="store_true")
     run.add_argument("--sessions", type=int, default=1)
     run.add_argument("--report", type=Path, required=True)
+    run.add_argument(
+        "--remote-report-tag",
+        default="",
+        help="Optional unique device-side filename prefix; local --report is unchanged.",
+    )
     args = parser.parse_args()
     args.sdk = args.sdk.expanduser()
     {"assets": cmd_assets, "push": cmd_push, "run": cmd_run}[args.stage](args)
