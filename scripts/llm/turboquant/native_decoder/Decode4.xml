@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: BSD-3-Clause -->
+<OpDefCollection PackageName="TurboQuantNative" Domain="turboquant" Version="1.0" UseQHPI="true">
+  <OpDefList>
+    <OpDef>
+      <Name>Decode4</Name>
+      <Description><Content>MSB-first packed 4-bit centroid indices times a precomputed FP16 scale. No inverse rotation.</Content></Description>
+      <Input>
+        <Name>packed</Name><Description><Content>Raw bytes [heads,1,tokens,64]</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_UINT_8</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,64</Text></Shape>
+      </Input>
+      <Input>
+        <Name>scale</Name><Description><Content>Effective scales [heads,1,tokens,1]</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,1</Text></Shape>
+      </Input>
+      <Input>
+        <Name>centroids</Name><Description><Content>16-entry centroid table [1,1,1,16]</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>1,1,1,16</Text></Shape>
+      </Input>
+      <Output>
+        <Name>decoded</Name><Description><Content>Rotated-domain KV tile [heads,1,tokens,128]</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,128</Text></Shape>
+      </Output>
+      <SupportedBackend>HTP</SupportedBackend>
+    </OpDef>
+  </OpDefList>
+</OpDefCollection>
