@@ -35,6 +35,7 @@ def main() -> None:
         },
     }
     hashes, inputs, packages = {}, {}, {}
+    current_policies = {}
     device = None
     for condition, prompt in (("short", 35), ("long", 897)):
         metrics = {}
@@ -51,6 +52,10 @@ def main() -> None:
             if group in hashes and hashes[group] != data["config_hash"]:
                 raise ValueError(f"Changed configuration: {path}")
             hashes[group] = data["config_hash"]
+            current_policy = data.get("quantize_current_kv", False)
+            if group in current_policies and current_policies[group] != current_policy:
+                raise ValueError(f"Changed current-KV policy: {path}")
+            current_policies[group] = current_policy
             if group != "baseline_int16":
                 packages[group] = data["native_decoder"]
             metrics[group] = performance(path, prompt)
@@ -63,9 +68,12 @@ def main() -> None:
         }
     if packages["dense_native"] != packages["qjl_native"]:
         raise ValueError("Different Native decoder packages")
+    if current_policies["dense_native"] != current_policies["qjl_native"]:
+        raise ValueError("Dense and QJL measurements use different current-KV policies")
     report.update(
         {
             "config_hashes": hashes,
+            "quantize_current_kv": current_policies,
             "input_sha256": inputs,
             "device": device,
             "native_decoder": packages["dense_native"],

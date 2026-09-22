@@ -30,6 +30,10 @@ def main() -> None:
     replaced = set()
     for source in sources[1:]:
         report = json.loads((source / "convert_report.json").read_text())
+        if report.get("quantize_current_kv", False) != base.get(
+            "quantize_current_kv", False
+        ):
+            raise ValueError(f"Incompatible quantize_current_kv: {source}")
         for key in (
             "config_hash",
             "context_length",

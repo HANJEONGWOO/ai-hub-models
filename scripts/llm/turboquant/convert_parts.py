@@ -33,6 +33,9 @@ from typing import Any
 import onnx
 
 from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_profile
+from qai_hub_models.models.templates.llm.turboquant.current_attention import (
+    quantize_current_attention,
+)
 from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
     apply_kv_profile,
 )
@@ -134,6 +137,8 @@ def apply_profile(
         result = use_native_decoder(result, config)
     if config.qjl:
         result = add_qjl_attention(result, config)
+    if config.enabled and args.quantize_current_kv:
+        result = quantize_current_attention(result, config)
     # Initializers keep their external-data location, so expose the weights file here.
     for data in onnx_path.parent.glob("*.data"):
         link = out / data.name
@@ -155,6 +160,7 @@ def apply_profile(
         "attention_tile": args.attention_tile,
         "rotated_attention": args.rotated_attention,
         "native_decoder": bool(args.native_decoder_package),
+        "quantize_current_kv": bool(result.current_kv_attention),
     }
     return new_onnx, new_encodings, summary
 
@@ -335,6 +341,12 @@ def main() -> None:
     )
     parser.add_argument("--context-buckets", type=int, nargs="+", default=[])
     parser.add_argument(
+        "--quantize-current-kv",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use encoded current KV for attention (default); disable only for legacy comparisons.",
+    )
+    parser.add_argument(
         "--rotated-attention",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -444,6 +456,7 @@ def main() -> None:
     config = get_profile(
         args.profile, Rotation(args.rotation) if args.rotation else None
     )
+    current_kv = bool(config.enabled and args.quantize_current_kv)
     if report or args.context_only:
         native_manifest = (
             json.loads((args.native_decoder_package / "manifest.json").read_text())
@@ -456,9 +469,13 @@ def main() -> None:
             "rotated_attention": args.rotated_attention,
             "context_buckets": buckets,
             "native_decoder": native_manifest,
+            "quantize_current_kv": current_kv,
         }
         for key, value in expected.items():
-            if report.get(key) != value:
+            if (
+                report.get(key, False if key == "quantize_current_kv" else None)
+                != value
+            ):
                 raise ValueError(
                     f"Existing bundle metadata mismatch: {key}; use a new output "
                     "directory for a different rotation or compilation configuration."
@@ -470,6 +487,7 @@ def main() -> None:
             "profile": args.profile,
             "config": config.to_dict(),
             "config_hash": config.config_hash(),
+            "quantize_current_kv": current_kv,
             "attention_tile": args.attention_tile,
             "rotated_attention": args.rotated_attention,
             "context_buckets": buckets,

@@ -27,11 +27,35 @@ The default package is `~/.qaihm/tmp/turboquant/native_decoder_hvx_20260918`;
 override it with `--native-decoder-package` or `TURBOQUANT_NATIVE_DECODER_PACKAGE`.
 Missing libraries cause an error, not an automatic build or silent fallback.
 
+**Current-token KV is quantized before attention by default.** The final export
+pass reads the same packed outputs and stored-precision scales that the runner
+appends to cache. This applies to AR1 decode and all current tokens in AR128
+prefill; the causal mask and past/current ordering are unchanged. Dense rotation,
+Native decoding, K4/V4, and QJL-off remain the defaults. The encoder is shared
+with cache output, and each current K/V decode is shared across GQA heads/tiles.
+No extra full-past-cache restoration or host-side quantization is introduced.
+
+Use `--no-quantize-current-kv` only to reproduce the historical raw-current-KV
+path. The compilation policy is recorded as `quantize_current_kv` in bundle and
+runtime reports, separate from the unchanged codec/storage `config_hash`.
+Conversion and bundle assembly reject mixing these policies. Build into a new
+directory: existing context binaries do not change when Python defaults change.
+The host-only `evaluate_qwen3_kv.py` uses the same default current-token policy
+and legacy override, but remains a float64 codec oracle, not Native FP16 emulation.
+
+The 2026-09-22 device comparison is recorded in design §18: long-context decode
+38.112→37.931 tok/s, unchanged 28.875 MiB host KV, and **PPL 20.608→25.661**.
+Historical controls were reused; the new default was measured once per input
+condition. `benchmark_current_kv_once.py` runs that comparison with the stages
+`push`, `functional`, `performance`, `quality`, `summarize`. Review functional
+results before performance and quality. The previous encoder numerical gate
+limitation remains; current-token coverage is not a claim of quality neutrality.
+
 ## Orthogonal K-only QJL (K3+1 / V4)
 
 `--profile k3qjl_v4_scaled` enables the separate format-3 QJL path. Existing
-`k4_v4_scaled` defaults stay Dense+Native **without QJL**, for an unchanged
-comparison group. QJL requires Dense QR, Native Decode4, and rotated tiled
+`k4_v4_scaled` defaults stay Dense+Native **without QJL**. QJL requires Dense QR,
+Native Decode4, and rotated tiled
 attention; these are selected automatically for the new profile.
 
 - K uses three MSE index bits and one QJL sign bit per coordinate; V stays
@@ -43,7 +67,8 @@ attention; these are selected automatically for the new profile.
   There is no `2/pi` shrinkage. The QNN runner preserves this extra stream
   across reset, append, and bucket switches; rebuild the runner for format 3.
 - Attention adds `(q @ S.T) @ (signs * qjlscale).T` per K tile, before the
-  existing mask and global softmax. Current uncompressed K gets zero correction.
+  existing mask and global softmax. Current K uses its packed K3+1 reconstruction
+  and residual correction too (only the explicit legacy option leaves it raw).
   No full residual K cache or per-past-token inverse rotation is constructed.
 - The same Native Decode4 package reads MSE indices using a repeated eight-entry
   LUT and reads signs using a `[-1]*8 + [+1]*8` LUT. No DSP binary change is needed.
@@ -88,7 +113,9 @@ The older results/examples below use explicit `--rotation fwht`. Use a **new
 bundle directory** for dense models: existing binaries do not change with Python
 defaults, and FWHT/dense packed cache states are not interchangeable. CLI
 conversion, standalone validation and host evaluation accept `--rotation fwht`
-for historical reproduction. Uncompressed baselines are unchanged.
+for historical reproduction. Historical conversion/evaluation commands also need
+`--no-quantize-current-kv` to reproduce their raw-current-KV policy. Uncompressed
+baselines are unchanged.
 
 | Script | Purpose | Needs |
 |---|---|---|
