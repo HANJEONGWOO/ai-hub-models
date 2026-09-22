@@ -1439,6 +1439,153 @@ PYTHONPATH=src python scripts/llm/turboquant/summarize_qjl_results.py \
     --out ~/.qaihm/tmp/turboquant/reports/qjl_20260919_v3/comparison_recheck.json
 ```
 
-## 18. 출처
+## 18. 현재 토큰 KV도 양자화한 attention (2026-09-22)
+
+### 18.1 기본 동작과 구현
+
+§17까지의 측정은 과거 KV만 압축 복원하고, 현재 토큰/청크의 KV는 양자화
+전 값으로 attention에 넣은 결과다. 새 export 기본값은 현재 KV에도 같은
+양자화 오차와 저장 정밀도를 적용한다. AR1 decode뿐 아니라 AR128 prefill
+청크 전체에 적용하며, causal mask와 past→current 순서는 그대로다.
+
+`current_attention.py`의 최종 graph pass는 tiled/Native/QJL 처리 뒤 실행된다.
+
+- 현재 K/V를 만드는 기존 cache encoder는 한 번만 실행한다.
+- `tq_{key,value}_L_packed_out`와 FP16 `scale_out`을 그대로 Native Decode4에
+  연결한다. 이 출력은 동시에 host cache에 저장되므로 두 경로가 같은
+  indices/scale을 사용한다. encoder를 attention용으로 복제하지 않는다.
+- 현재 토큰의 회전-domain 복원값은 KV head별로 나누어 모든 GQA query head와
+  타일에 공유한다. 양자화 전 현재 K/V를 별도로 회전하던 분기는 제거된다.
+- QJL 선택 시 현재 K도 K3+1을 사용하고, 현재 잔차의 부호/scale에서 얻은
+  score correction을 더한다. 현재 V는 계속 4-bit MSE다.
+- encoder가 attention보다 먼저 실행되도록 DAG를 위상 정렬한다. 계층 간
+  의존관계는 유지하며, 순환·누락된 입력·미지원 consumer 패턴은 오류로 처리한다.
+- 과거 KV의 tiled/Native 처리, host cache ABI, 비트 예산, int16 baseline은
+  바꾸지 않는다. current KV decoder 추가는 attention 전체를 합친 fused op가 아니다.
+
+Dense QR + Native LUT + K4/V4 + QJL-off 기본값은 유지한다.
+`--quantize-current-kv`는 기본 활성화이며, 이전 방식 재현만
+`--no-quantize-current-kv`를 지정한다. 기존 바이너리는 자동으로 바뀌지 않는다.
+§1–17의 과거 변환/호스트 평가 명령을 재현할 때도 이 legacy 옵션이 필요하다.
+
+codec/storage `config_hash`는 그대로 유지하고, 실행 의미가 바뀌는 항목은
+별도 `quantize_current_kv` metadata로 기록한다. converter 재사용 검사와
+part assembler는 두 정책을 혼합하지 못하게 한다. 기기 runtime manifest와
+측정 JSON에도 이 항목을 기록하여 같은 storage hash를 가진 과거 결과와
+구분한다. 새 디렉터리에서 재빌드해야 한다.
+
+호스트 `evaluate_qwen3_kv.py`도 동일하게 현재 KV를 round-trip한 뒤 attention에
+사용하는 것이 기본이다. 같은 legacy 옵션을 제공하지만, HF float 모델과
+float64 codec을 사용하는 참조 평가이므로 Native FP16 LUT/product 반올림을
+모사하지 않는다. 이 호스트 cache에서 미구현 QJL을 지정하면 MSE-only로
+잘못 평가하지 않고 명시적으로 거부한다.
+
+### 18.2 검증 및 측정 방법
+
+독립 CPU attention oracle은 **출력 packed bytes와 저장 정밀도 scale을 다시
+복원한 현재 KV**를 사용한다. AR1/AR3/AR128, 빈 past/유효 past, causal mask,
+full/tiled/rotated/Native, Dense/FWHT 및 K-only QJL을 검증한다.
+기존 raw-current 경로와 출력이 같다는 검사는 올바른 기준이 아니다.
+`verify_rotated_attention.py`는 source 연결과 compiled current Native I/O를
+검사하여 raw current 분기가 남지 않았는지 확인한다.
+
+`benchmark_current_kv_once.py`는 수정된 기본 구성만 새로 측정한다.
+int16 및 기존 Dense+Native의 대조값은 §17의
+`reports/qjl_20260919_v3/` 원본을 재사용한다. 같은 runner SHA256, 기기,
+입력 token SHA256을 확인하며, 35/897 prompt + 128 generation 조건별 각
+1회, WikiText 4 windows 각 1회다. reset/EOS/bucket 진단은 별도 실행이다.
+성능 측정은 profiling off, TTFT에서 model load 제외 기준을 유지한다.
+날짜가 다른 단일 측정이므로 작은 차이의 통계적 유의성을 주장하지 않는다.
+
+기존 encoder의 0.2% 수치 gate 미통과 제한은 이번 연결 변경으로 해결됐다고
+간주하지 않는다. 현재 KV 양자화는 알고리즘 적용 범위를 바꾸므로 성능과
+PPL을 함께 비교해야 하며, 속도 개선 자체를 전제하지 않는다.
+
+### 18.3 측정 결과: 속도는 대체로 유지, PPL 악화
+
+Qwen3-1.7B W4A16 / S26 Ultra SM8850 / QAIRT 2.48 / Dense QR + Native LUT /
+K4/V4 / QJL-off. 앞의 두 열은 **2026-09-19 원본 재사용**, 마지막 열만
+**2026-09-22 새 측정**이다. 짧은/긴 문맥 각각 성능 세션 1회만 실행했다.
+기기·펌웨어, runner SHA256, Native 라이브러리 SHA256 및 입력 token SHA256이
+일치한다. 환경 온도 통제나 분산 추정은 없으므로 작은 차이를 확정적인
+성능 개선/회귀라고 해석하지 않는다.
+
+CL1024 긴 문맥: prompt 897 + 생성 128, decode 127 step 모두 C1024,
+종료 cache 길이 1024. PPL은 별도 WikiText 4×1024 window의 합산 NLL / 4092로 계산한다.
+
+| 지표 | int16 KV (과거) | 기존 TQ, 현재 KV 비양자화 (과거) | 현재 KV도 양자화 (신규) |
+|---|---:|---:|---:|
+| TTFT | 304.176 ms | 526.543 ms | 526.474 ms |
+| prefill | 2950.76 tok/s | 1704.87 tok/s | 1707.07 tok/s |
+| decode | 35.8169 tok/s | 38.1123 tok/s | 37.9306 tok/s |
+| decode/token | 27.9198 ms | 26.2382 ms | 26.3639 ms |
+| host KV 저장소 | 112.000 MiB | 28.875 MiB | 28.875 MiB |
+| resident I/O buffers | 263.179 MiB | 222.197 MiB | 222.197 MiB |
+| 종료 직전 VmRSS | 391.262 MiB | 280.035 MiB | 291.172 MiB |
+| 프로세스 VmHWM | 605.055 MiB | 605.246 MiB | 605.500 MiB |
+| PPL (4 windows, 낮을수록 좋음) | 20.1083 | 20.6078 | **25.6608** |
+
+짧은 문맥: prompt 35 + 생성 128. int16은 고정 C1024, 두 TQ 구성은
+decode C128 93 step / C256 34 step으로 동일하다.
+
+| 지표 | int16 KV (과거) | 기존 TQ (과거) | 현재 KV도 양자화 (신규) |
+|---|---:|---:|---:|
+| TTFT | 40.483 ms | 62.317 ms | 49.803 ms |
+| prefill | 868.49 tok/s | 565.18 tok/s | 708.65 tok/s |
+| decode | 34.9560 tok/s | 54.5074 tok/s | 53.2359 tok/s |
+| 종료 직전 VmRSS | 391.500 MiB | 291.621 MiB | 291.039 MiB |
+
+기존 TQ 대비 긴 문맥 decode는 **−0.48%**, prefill은 **+0.13%**이며 TTFT는
+거의 같다. 짧은 문맥 TTFT는 **−20.08%**, prefill은 **+25.38%**, decode는
+**−2.33%**다. host KV와 resident I/O 크기는 그대로다. 긴 문맥 종료 VmRSS는
+11.137 MiB 높게 관측됐지만, 이 값은 NPU/드라이버 전체 메모리나 peak 메모리가 아니다.
+
+품질은 **PPL +24.52%**(int16 대비 +27.61%)로 악화됐다. 새 결과의 합산
+NLL은 13278.39983이며 window별로 2690.68007 / 3606.04870 / 3295.07990 /
+3686.59116이다. 동일 입력의 네 window 모두 NLL이 증가했다.
+
+두 품질 평가 모두 AR128 청크 8개로 실행됐다. 기존 경로는 각 청크 내부의
+현재 128-token KV를 양자화하지 않았으며, 새 경로는 그 KV까지 양자화한다.
+따라서 기존 PPL을 모든 attention KV가 4-bit 양자화된 결과로 해석하면 안 된다.
+이번 결과는 그 예외 경로를 제거한 실제 수치다. 다만 악화량을 정상적인
+양자화 오차, 기존 encoder 수치 오차, W4A16 모델의 calibration 민감도로
+분리한 실험은 하지 않았으므로 원인을 한 가지로 단정하지 않는다.
+
+관측한 prefill QNN wall time 합은 짧은 문맥 60.401→47.967 ms, 긴 문맥
+509.754→499.596 ms다. 긴 문맥 host prepare 합은 12.368→19.381 ms로
+늘어 총 prefill 시간 차이는 작았다. Op-level profiling은 수행하지 않았고,
+QNN wall time을 순수 가속기 연산 시간이나 특정 연산 비용으로 간주하지 않는다.
+
+검증: TurboQuant **313 tests 통과**, 변경 파일 pre-commit/mypy 통과.
+최종 번들의 KV 그래프 **21개 모두 구조 검사 통과**, Native Decode4 1232개,
+최대 개별 FP16 past tile 512 KiB. 이는 동시 할당량/peak HTP 메모리가 아니다.
+기기 reset 2×8의 생성 ID 일치, EOS 11번째 토큰 종료, 600-token 생성의
+C128→256→512→1024 전환, 긴 문맥 cache 1024 경계가 모두 통과했다.
+새 QJL current-token 경로는 CPU oracle로 검증했으며, 이번 새 기기 성능/PPL
+측정은 기본 K4/V4 QJL-off 구성만 수행했다. 기존 encoder 수치 gate 실패는
+해결됐다고 주장하지 않는다.
+
+### 18.4 산출물
+
+기준 경로: `~/.qaihm/tmp/turboquant/`.
+
+- 최종 번들: `qwen3_1_7b_current_kv_native_20260922_final/`.
+- part 산출물: `..._part12/`(1+2), `..._part34/`(3), `..._part4/`(4).
+- 기기 번들: `current_kv_native_20260922`.
+- 공통 runner: `qnn_runner/qjl-20260919/qnn-llm-runner` (재빌드 없이 동일 바이너리).
+- 비교 요약: `reports/current_kv_20260922/comparison_current_kv.json`.
+- 성능 원본: 같은 폴더의 `perf_current_native_{short,long}_once.json`.
+- 품질 원본: `score_current_native_w{0,1,2,3}.json`.
+- 검증: `boundary_current_native.json`, `generation_current_native_{reset,eos,switches}.json`.
+- `experiment.json`에는 runner/번들 SHA256, 현재 KV 정책, 이전 결과 경로를 기록했다.
+
+`benchmark_current_kv_once.py`의 `push` → `functional` → 결과 확인 →
+`performance` → `quality` → `summarize`를 사용한다. `--bundle`, `--runner`,
+`--assets`, 새 `--reports`, `--previous-reports`를 지정한다.
+`push` 전에 `verify_rotated_attention.py`로 새 reports 폴더의
+`boundary_current_native.json`을 생성해야 한다. 기존 측정이나 시도 로그가
+있으면 거부하며, 과거 대조군을 다시 실행하지 않는다.
+
+## 19. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

@@ -263,6 +263,56 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
     graph = onnx.load(bundle / f"{name}.onnx", load_external_data=False).graph
     conversion = json.loads((bundle / "convert_report.json").read_text())
     config = conversion["config"]
+    current_entries = manifest.get("current_kv_attention", [])
+    if conversion.get("quantize_current_kv", False):
+        if len(current_entries) != len(manifest["codec_io"]):
+            errors.append("Missing current-token quantization manifest.")
+        source_ops = {o: n for n in graph.node for o in n.output}
+        for entry in current_entries:
+            prefix = f"tq_{entry['kind']}_{entry['layer']}_current_"
+            # Audit source connectivity as well as the compiled Native boundary.
+            for cat_name in entry["attention_concats"]:
+                cat = source_ops.get(cat_name)
+                if cat is None or not cat.input[1].startswith(prefix + "head"):
+                    errors.append(f"Unquantized current KV attention: {cat_name}")
+            if entry["decoder"] == "native":
+                decoder = info.producer.get(prefix + "native_fp16")
+                if (
+                    decoder is None
+                    or decoder.op_type != "Decode4"
+                    or [t.dtype for t in decoder.inputs]
+                    != ["Uint_8", "Float_16", "Float_16"]
+                    or decoder.inputs[0].name != entry["packed"]
+                    or [t.dtype for t in decoder.outputs] != ["Float_16"]
+                ):
+                    errors.append(f"Missing/incorrect current Native decoder: {prefix}")
+                source_decoder = source_ops.get(prefix + "native_fp16")
+                scale_cast = source_ops.get(prefix + "scale16")
+                if (
+                    source_decoder is None
+                    or source_decoder.input[0] != entry["packed"]
+                    or scale_cast is None
+                    or scale_cast.input[0] != entry["scale"]
+                ):
+                    errors.append(
+                        f"Current decoder does not reuse cache outputs: {prefix}"
+                    )
+            if entry.get("qjl"):
+                correction_heads = [
+                    node
+                    for node in graph.node
+                    if re.fullmatch(
+                        rf"tq_attn_{entry['layer']}_tile\d+_head\d+_q\d+_score_qjl_cat",
+                        node.output[0],
+                    )
+                ]
+                if not correction_heads or any(
+                    not n.input[1].startswith(prefix + "qjl_head")
+                    for n in correction_heads
+                ):
+                    errors.append(f"Current QJL correction is missing: {prefix}")
+    elif current_entries:
+        errors.append("Current-token policy disagrees with graph manifest.")
     current = get_profile(conversion["profile"], Rotation(config["rotation"]))
     if current.config_hash() != conversion["config_hash"]:
         errors.append("Bundle rotation/config hash does not match current constants.")
@@ -323,6 +373,8 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
         "max_rotated_intermediate_bytes": max(sizes, default=0),
         "native_decoder_ops": sum(op.op_type == "Decode4" for op in info.ops),
         "rotation": config["rotation"],
+        "quantize_current_kv": conversion.get("quantize_current_kv", False),
+        "current_kv_decoders": len(current_entries),
         "violations": errors,
     }
 

@@ -182,7 +182,13 @@ def cmd_push(args: argparse.Namespace) -> None:
     metadata = json.loads(conversion.read_text()) if conversion.exists() else {}
     runtime_metadata = {
         k: metadata[k]
-        for k in ("context_length", "context_buckets", "config_hash", "config")
+        for k in (
+            "context_length",
+            "context_buckets",
+            "config_hash",
+            "config",
+            "quantize_current_kv",
+        )
         if k in metadata
     }
     if native := metadata.get("native_decoder"):
@@ -315,6 +321,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         report["native_decoder"] = native
     if runtime.get("config_hash"):
         report["config_hash"] = runtime["config_hash"]
+    report["quantize_current_kv"] = runtime.get("quantize_current_kv", False)
     report["assets"] = {
         "tokens_file": tokens,
         "tokens_sha256": sha256_file(assets_dir / tokens),

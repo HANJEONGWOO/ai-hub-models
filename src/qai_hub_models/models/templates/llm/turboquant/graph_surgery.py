@@ -25,7 +25,10 @@ Codec input (both kinds)
     ``past_*_out`` is rebuilt for the cache (behind an encoding-less float guard
     for POLAR, on the shared 16-bit grid for INT16); tensors it shares with the
     attention path are duplicated so attention keeps the exported int8 path for
-    new tokens. On the read path the per-head slices stay on the cache's
+    new tokens in this initial pass. The default exporter subsequently applies
+    ``current_attention.quantize_current_attention`` after the optional tiled /
+    Native / QJL passes, replacing that current-token branch with decoded cache
+    outputs. On the read path the per-head slices stay on the cache's
     representation and QAIRT converts to int8 at the attention Concat consumed
     by the 16x8 MatMul, whose encoding is kept.
 
@@ -128,6 +131,7 @@ class SurgeryResult:
     edits: list[EncodingEdit] = field(default_factory=list)
     paths: list[KVPath] = field(default_factory=list)
     attention_tiles: list[dict[str, Any]] = field(default_factory=list)
+    current_kv_attention: list[dict[str, Any]] = field(default_factory=list)
 
     def report(self) -> dict[str, Any]:
         return {
@@ -135,6 +139,7 @@ class SurgeryResult:
             "encoding_edits": [e.to_dict() for e in self.edits],
             "kv_paths": [p.to_dict() for p in self.paths],
             "attention_tiles": self.attention_tiles,
+            "current_kv_attention": self.current_kv_attention,
         }
 
 

@@ -230,7 +230,8 @@ def add_qjl_attention(result: SurgeryResult, config: TurboQuantConfig) -> Surger
 
     The existing Native Decode4 kernel handles both low-three-bit centroids and
     high-one-bit signs using different 16-entry LUTs; no new DSP binary is needed.
-    Current K tokens remain uncompressed, so their correction is exactly zero.
+    This intermediate pass leaves current K uncompressed with zero correction;
+    the default export's final current_attention pass replaces both branches.
     """
     if (
         not config.qjl

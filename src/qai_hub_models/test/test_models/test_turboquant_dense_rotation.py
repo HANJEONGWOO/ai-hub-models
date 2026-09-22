@@ -104,7 +104,9 @@ def test_dense_default_cannot_overwrite_old_bundle(
     assert report.read_text() == original
 
 
-@pytest.mark.parametrize("bad", [None, "missing", "rotation", "graph", "package"])
+@pytest.mark.parametrize(
+    "bad", [None, "missing", "rotation", "graph", "package", "current"]
+)
 def test_assemble_partial_native_base(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: str | None
 ) -> None:
@@ -141,6 +143,8 @@ def test_assemble_partial_native_base(
                 report["parts"]["part3_of_3"]["graphs"] = {"wrong": {}}
             elif bad == "package":
                 report["native_decoder"] = {"sha256": "different"}
+            elif bad == "current":
+                report["quantize_current_kv"] = True
         (source / "convert_report.json").write_text(json.dumps(report))
     output = tmp_path / "combined"
     monkeypatch.setattr(

@@ -41,6 +41,7 @@ def main() -> None:
         "qjl_native": args.qjl_bundle,
     }
     hashes = {}
+    current_policies = {}
     expected_profiles = {
         "baseline_int16": "baseline_int16_kv",
         "dense_native": "k4_v4_scaled",
@@ -53,6 +54,11 @@ def main() -> None:
         if any(not (bundle / f"part{part}_of_4.bin").is_file() for part in range(1, 5)):
             raise FileNotFoundError(f"Incomplete four-part bundle: {bundle}")
         hashes[group] = metadata["config_hash"]
+        current_policies[group] = metadata.get("quantize_current_kv", False)
+    if current_policies["dense_native"] != current_policies["qjl_native"]:
+        raise ValueError(
+            "Dense and QJL bundles must use the same current-KV attention policy."
+        )
 
     def execute(command: list[str], log: Path) -> None:
         print("START", log.stem, flush=True)
@@ -69,6 +75,7 @@ def main() -> None:
         metadata = {
             "runner_sha256": hashlib.sha256(args.runner.read_bytes()).hexdigest(),
             "config_hashes": hashes,
+            "quantize_current_kv": current_policies,
             "groups": {k: str(v) for k, v in groups.items()},
         }
         with (args.reports / "experiment.json").open("x") as output:

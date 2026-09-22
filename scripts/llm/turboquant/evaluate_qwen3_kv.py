@@ -9,8 +9,10 @@ produces numerical reference values and KV snapshots for device validation; it
 is NOT an on-device or NPU result.
 
 Contract emulated (same as the delta-cache graphs): the prompt is fed in
-``--chunk``-token pieces; attention sees decoded packed KV for earlier chunks
-and exact KV for the current chunk, and only the new chunk is encoded.
+``--chunk``-token pieces; attention sees codec-round-tripped KV for both earlier
+and current chunks, and only the new chunk is encoded. The historical raw-current
+path is available with ``--no-quantize-current-kv``. This float64 oracle does not
+emulate the Native decoder's FP16 LUT/product arithmetic.
 Profiles whose K is BASELINE keep K in float here (the int8 KV of the deployed
 graph needs the quantized model), so ``k8_*`` rows are "float K" PC proxies.
 
@@ -72,18 +74,20 @@ def codec_roundtrip(
 
 
 class PackedPastLayer(DynamicLayer):
-    """Attention gets exact current KV; the stored past is the codec round trip."""
+    """Attention uses stored KV, including current tokens unless explicitly disabled."""
 
     def __init__(
         self,
         key_codec: PolarQuantReference | None,
         value_codec: PolarQuantReference | None,
         norm_dtype: str,
+        quantize_current_kv: bool = True,
     ) -> None:
         super().__init__()
         self.key_codec = key_codec
         self.value_codec = value_codec
         self.norm_dtype = norm_dtype
+        self.quantize_current_kv = quantize_current_kv
 
     def update(
         self,
@@ -94,8 +98,9 @@ class PackedPastLayer(DynamicLayer):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
-        attend_k = torch.cat([self.keys, key_states], dim=-2)
-        attend_v = torch.cat([self.values, value_states], dim=-2)
+        if not self.quantize_current_kv:
+            attend_k = torch.cat([self.keys, key_states], dim=-2)
+            attend_v = torch.cat([self.values, value_states], dim=-2)
         self.keys = torch.cat(
             [self.keys, codec_roundtrip(key_states, self.key_codec, self.norm_dtype)],
             dim=-2,
@@ -107,11 +112,25 @@ class PackedPastLayer(DynamicLayer):
             ],
             dim=-2,
         )
-        return attend_k, attend_v
+        return (
+            (self.keys, self.values)
+            if self.quantize_current_kv
+            else (attend_k, attend_v)
+        )
 
 
 class PackedPastCache(Cache):
-    def __init__(self, config: TurboQuantConfig, num_layers: int) -> None:
+    def __init__(
+        self,
+        config: TurboQuantConfig,
+        num_layers: int,
+        quantize_current_kv: bool = True,
+    ) -> None:
+        if config.qjl:
+            raise NotImplementedError(
+                "Use the QJL graph/Native oracle; this HF cache does not implement QJL."
+            )
+
         def make(spec_name: str) -> PolarQuantReference | None:
             spec = getattr(config, spec_name)
             if not spec.is_polar:
@@ -126,7 +145,9 @@ class PackedPastCache(Cache):
 
         super().__init__(
             layers=[
-                PackedPastLayer(make("key"), make("value"), config.norm_dtype)
+                PackedPastLayer(
+                    make("key"), make("value"), config.norm_dtype, quantize_current_kv
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -213,6 +234,9 @@ def main() -> None:
     parser.add_argument("--num-windows", type=int, default=4)
     parser.add_argument("--window", type=int, default=1024)
     parser.add_argument("--chunk", type=int, default=128)
+    parser.add_argument(
+        "--quantize-current-kv", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--snapshot", type=Path, required=True)
@@ -241,6 +265,7 @@ def main() -> None:
         "dtype": args.dtype,
         "window": args.window,
         "chunk": args.chunk,
+        "quantize_current_kv": args.quantize_current_kv,
         "num_windows": args.num_windows,
         "dataset": "Salesforce/wikitext wikitext-2-raw-v1 test, non-overlapping windows",
         "scope": "PC reference (HF float model + float64 codec oracle); not a device result",
@@ -281,7 +306,9 @@ def main() -> None:
         del base_cache
 
         for profile in args.profiles:
-            cache = PackedPastCache(configs[profile], num_layers)
+            cache = PackedPastCache(
+                configs[profile], num_layers, args.quantize_current_kv
+            )
             lp = run_window(model, tokens, args.chunk, cache)[:-1]
             s = sums[profile]
             s["nll"] += float(-lp.gather(1, targets[:, None]).sum())
