@@ -17,6 +17,28 @@ import pytest
 SCRIPTS = Path(__file__).resolve().parents[4] / "scripts/llm/turboquant"
 
 
+@pytest.mark.parametrize("module", ["run_device_llm", "htp_codec_validation"])
+def test_windows_path_resolves_storage_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: str
+) -> None:
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    runner = importlib.import_module(module)
+    target, link = tmp_path / "stored.bin", tmp_path / "bundle.bin"
+    target.write_bytes(b"compiled")
+    link.symlink_to(target)
+    calls: list[list[str]] = []
+
+    def convert_path(
+        cmd: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="D:\\stored.bin\n")
+
+    monkeypatch.setattr(runner.subprocess, "run", convert_path)
+    assert runner.windows_path(link) == "D:\\stored.bin"
+    assert calls == [["wslpath", "-w", str(target)]]
+
+
 def test_runner_bucket_selector(tmp_path: Path) -> None:
     compiler = shutil.which("c++")
     if compiler is None:

@@ -60,7 +60,10 @@ PROMPT = "What is gravity? Keep the answer under ten words."
 
 def windows_path(path: Path) -> str:
     return subprocess.run(
-        ["wslpath", "-w", str(path)], check=True, capture_output=True, text=True
+        ["wslpath", "-w", str(path.expanduser().resolve())],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 

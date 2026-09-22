@@ -10,6 +10,26 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Binary storage on WSL
+
+On this WSL machine, artifact directories are redirected with ordinary directory
+symlinks (no automatic copy/archive logic or new CLI options):
+
+| Existing path | Actual storage |
+|---|---|
+| `~/.qaihm/tmp/turboquant/` | `/mnt/d/ai-hub-models/binaries/turboquant/` |
+| `<repo>/export_assets/` | `/mnt/d/ai-hub-models/export_assets/` |
+
+Existing commands, final bundle links and report paths continue to work. New
+build outputs and downloads using these paths are written directly to D, along
+with their intermediate files and reports. The repo, venv and SDK stay unchanged.
+Windows ADB helpers resolve symlinks before converting paths with `wslpath`.
+The D drive must be mounted; explicitly choosing another output directory still
+uses that directory. These directory links are machine-local, not Git-tracked
+export defaults, and need setting up separately on a different machine.
+
+## Codec defaults
+
 **The default PolarQuant rotation is now `dense_qr`, with QJL off.** Both
 `get_profile(...)` and `PolarQuantReference(...)` select it when rotation is
 omitted. K/V remain 4-bit for `k4_v4[_scaled]`; Native LUT, norm correction,

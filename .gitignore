@@ -11,7 +11,8 @@ cli/qai_hub_models_cli/_version.py
 .Python
 /bench/
 build/
-export_assets/
+# Also ignore a machine-local symlink to external artifact storage.
+export_assets
 dist/
 pos_emb/
 ckpt/
