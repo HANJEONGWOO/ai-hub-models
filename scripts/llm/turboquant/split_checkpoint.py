@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import onnx
+from model_identity import checkpoint_identity, sha256_file
 
 
 def tensor_info(value: onnx.ValueInfoProto) -> dict[str, Any]:
@@ -55,6 +56,10 @@ def main() -> None:
     }
     for part_name, part_cls in collection_cls.parts.items():
         part = part_cls.from_pretrained(checkpoint=args.checkpoint)
+        if "model" not in manifest:
+            checkpoint = Path(part._presplit.checkpoint).expanduser().resolve()
+            manifest["resolved_checkpoint"] = str(checkpoint)
+            manifest["model"] = checkpoint_identity(checkpoint, args.model_id)
         bundle_dir = part.serialize_graph(part.graph_names[0], out)
         onnx_path = bundle_dir / f"{part_cls.__name__}.onnx"
         graph = onnx.load(str(onnx_path), load_external_data=False).graph
@@ -69,6 +74,10 @@ def main() -> None:
             "encodings_sha256": hashlib.sha256(encodings.read_bytes()).hexdigest()
             if encodings.exists()
             else None,
+            "onnx_sha256": sha256_file(onnx_path),
+            "data_sha256": {
+                p.name: sha256_file(p) for p in sorted(bundle_dir.glob("*.data"))
+            },
         }
         print(f"{part_name}: {bundle_dir}", flush=True)
 

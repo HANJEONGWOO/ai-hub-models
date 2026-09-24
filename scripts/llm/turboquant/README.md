@@ -28,6 +28,70 @@ The D drive must be mounted; explicitly choosing another output directory still
 uses that directory. These directory links are machine-local, not Git-tracked
 export defaults, and need setting up separately on a different machine.
 
+## Model selection: Qwen3-4B is opt-in
+
+`benchmark_model_once.py` supports `qwen3_1_7b` (the unchanged default) and
+`qwen3_4b` (explicit `--model-id` only). It prepares a W4A16 split checkpoint,
+builds **int16 KV** and **current Dense+Native K4/V4, QJL-off, current KV
+quantized** bundles, audits them, and measures both newly. It does not reuse
+1.7B metrics for the 4B comparison. Model definitions and global defaults are
+unchanged. Builds run one part/process at a time to limit peak host memory.
+
+Example (from the repo root; every stage must succeed before the next):
+
+```bash
+TQ_WORK=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_4b_experiment
+TQ_RUNNER=$HOME/.qaihm/tmp/turboquant/qnn_runner/model_compare/qnn-llm-runner
+bash scripts/llm/turboquant/qnn_runner/build_android.sh "$(dirname "$TQ_RUNNER")"
+for stage in prepare build audit push functional performance quality summarize; do
+    PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+        scripts/llm/turboquant/benchmark_model_once.py "$stage" \
+        --model-id qwen3_4b --work-dir "$TQ_WORK" --runner "$TQ_RUNNER" || break
+done
+```
+
+The stages can also be invoked individually for inspection. `build --groups
+baseline_int16 --parts 2` selects a group/part without enabling parallel builds.
+Build and measurement attempt logs are retained; an existing attempt log is
+never silently overwritten. Use a fresh experiment directory for a new complete
+comparison, and do not repeat successful performance sessions to pick a result.
+
+Conditions remain CL1024, short chat prompt or 897 prompt tokens followed by
+128 generated tokens, **one performance session per group/input condition**,
+plus separate reset/EOS/cache-bucket diagnostics and four 1024-token WikiText
+windows (4092 scored tokens in total). Int16 retains the historical fixed C1024
+policy; TurboQuant uses C128/256/512/1024. Only the long case has identical
+decode graph context lengths for both. Reports include TTFT, prefill/decode,
+host KV, end VmRSS, peak VmHWM and token-weighted PPL; results are written to
+`$TQ_WORK/reports/comparison.json`. A single run has no variance estimate.
+
+Split manifests record model identity and ONNX/external-weight hashes. Conversion,
+bundle assembly and benchmark stages reject mismatched model/checkpoint metadata;
+the on-device wrapper rejects the wrong tokenizer/RoPE asset set before execution.
+Qwen3-4B is validated as 36 layers, hidden size 2560, 32 query heads, 8 KV heads and
+**explicit head dimension 128** (not 2560/32). CL1024 host KV expectations are
+144 MiB for int16 and 37.125 MiB for K4/V4 with FP16 scales; these are layout
+checks, not total process or device memory estimates.
+
+The v6 4B checkpoint places `K / sqrt(128)` before attention. The rotated
+path preserves this attention scale as `(Q / sqrt(128)) @ R.T`, without
+scaling the whole past K cache; legacy unrotated tiles keep K-side division.
+Only positive constant scalar divisors are accepted. Cache guards are inserted
+before their first consumer, including the earlier RoPE layout nodes in this
+checkpoint. Neither adaptation changes the 1.7B codec defaults.
+
+On this machine the 4B checkpoint cache is also a directory link:
+`~/.qaihm/qai-hub-models/models/qwen3_4b` →
+`/mnt/d/ai-hub-models/checkpoints/qwen3_4b`. Other machines keep their configured
+checkpoint cache; `--checkpoint PATH` accepts an already downloaded local
+checkpoint. Compilation outputs use the chosen `--work-dir` directly.
+
+The completed Qwen3-4B device comparison (2026-09-23) is recorded in design
+§19: long-context decode **20.105→16.645 tok/s**, host KV **144→37.125 MiB**,
+and PPL **18.4237→21.7333** (int16→current TurboQuant). Both controls were
+built and measured anew, once per input condition. These results do not change
+the default model or establish a speed/quality advantage for the 4B codec.
+
 ## Codec defaults
 
 **The default PolarQuant rotation is now `dense_qr`, with QJL off.** Both

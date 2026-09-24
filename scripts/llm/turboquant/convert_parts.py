@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import onnx
+from model_identity import sha256_file
 
 from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_profile
 from qai_hub_models.models.templates.llm.turboquant.current_attention import (
@@ -471,6 +472,11 @@ def main() -> None:
             "native_decoder": native_manifest,
             "quantize_current_kv": current_kv,
         }
+        if "model" in manifest:
+            expected["model"] = manifest["model"]
+            expected["split_manifest_sha256"] = sha256_file(
+                split_dir / "split_manifest.json"
+            )
         for key, value in expected.items():
             if (
                 report.get(key, False if key == "quantize_current_kv" else None)
@@ -499,6 +505,10 @@ def main() -> None:
         }
     )
     report.setdefault("parts", {})
+    if "model" in manifest:
+        report["model"] = manifest["model"]
+        report["split_manifest_sha256"] = sha256_file(split_dir / "split_manifest.json")
+        report["num_parts"] = num_parts
 
     for part_id, (part_name, info) in enumerate(manifest["parts"].items(), start=1):
         if args.parts and part_id not in args.parts:

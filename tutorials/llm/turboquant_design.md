@@ -1586,6 +1586,117 @@ C128→256→512→1024 전환, 긴 문맥 cache 1024 경계가 모두 통과했
 `boundary_current_native.json`을 생성해야 한다. 기존 측정이나 시도 로그가
 있으면 거부하며, 과거 대조군을 다시 실행하지 않는다.
 
-## 19. 출처
+## 19. Qwen3-4B 명시적 선택 및 비교 (2026-09-23)
+
+### 19.1 변경 범위와 재현
+
+기본 모델은 **Qwen3-1.7B로 유지**한다. 새
+`scripts/llm/turboquant/benchmark_model_once.py`에서 `--model-id qwen3_4b`를
+명시할 때만 4B를 준비·빌드·측정한다. 모델 정의 자체나 Dense QR + Native LUT,
+K4/V4, QJL-off, 현재 KV 양자화 기본값은 변경하지 않았다.
+
+4B v6 W4A16 checkpoint의 구조는 36 layers, hidden size 2560, Q heads 32,
+KV heads 8, **head dimension 128**이다. head dimension을 2560/32로 추정하면
+안 된다. 다음 두 실제 그래프 차이를 지원했다.
+
+- 4B의 attention 앞 `K / sqrt(128)`를 인식한다. rotated attention에서는
+  `(Q / sqrt(128)) @ R.T`로 동일 스케일을 적용하며, 전체 과거 K를 다시
+  스케일링하지 않는다. 양의 상수 scalar divisor만 허용한다.
+- cache guard를 마지막 cache output 앞이 아니라 실제 최초 소비 노드 앞에
+  배치한다. 4B RoPE layout 경로에서 발생하던 ONNX 전방 참조를 제거한다.
+
+int16 compiled audit도 wide K Concat 뒤의 int8 Convert → static scalar Div
+→ QK 경로를 검사한다. 임의 elementwise 연산이나 이른 cache narrowing을
+허용하는 변경은 아니다. split/model/config/tokenizer/RoPE, 입력 token,
+runner/Native 및 바이너리 SHA256을 기록하고, 다른 모델의 번들·asset 혼합을
+거부한다. 기존 1.7B 경로는 회귀 테스트로 유지한다.
+
+재현 단계는 `prepare` → `build` → `audit` → `push` → `functional` →
+결과 확인 → `performance` → `quality` → `summarize`이며 명령 예시는
+[도구 README](../../scripts/llm/turboquant/README.md#model-selection-qwen3-4b-is-opt-in)에
+있다. RAM 사용을 제한하기 위해 group/part를 순차 빌드한다. 이번 빌드는
+WSL 27 GiB RAM + 24 GiB swap에서 완료했으며, 마지막 context 저장 중 **WSL 전체
+swap 사용 약 15 GiB**를 관측했다. 이는 정밀한 peak 측정이나 모델 전용
+메모리 값은 아니며, swap 8 GiB 환경에서 같은 빌드의 성공을 보장하지 않는다.
+
+### 19.2 측정 조건과 결과
+
+**두 구성 모두 이번에 새로 빌드하고 측정**했다. 과거 1.7B 수치를 대조군으로
+사용하지 않는다. Qwen3-4B W4A16 / S26 Ultra SM8850 / QAIRT 2.48 / HTP v81,
+동일 checkpoint·입력·기기·runner를 사용했다. int16은 KV 저장 형식이 int16인
+대조군이며, 모든 attention 연산이 int16이라는 뜻은 아니다.
+
+짧은 입력 35 + 생성 128, 긴 입력 897 + 생성 128에 대해 구성/조건별 성능
+세션은 **각 1회**다. profiling off, TTFT에서 모델 로딩 제외, 별도 warmup 제외
+없음, 온도 통제·분산 추정 없음 조건이다. reset/EOS/600-token 생성과 최초
+int16 8-token loading smoke는 별도 진단이며 성능 표에 섞지 않는다.
+
+CL1024 긴 문맥은 두 구성 모두 decode 127 step 전체가 C1024이고 종료 cache가
+1024 tokens이다. PPL은 별도 WikiText 4×1024 windows, AR128 청크 8개/window,
+총 4092 scored tokens의 합산 NLL로 계산했다.
+
+| 지표 | int16 KV | 현재 TurboQuant |
+|---|---:|---:|
+| TTFT | 595.385 ms | 911.087 ms |
+| prefill | 1507.63 tok/s | 984.99 tok/s |
+| decode | 20.1048 tok/s | 16.6455 tok/s |
+| decode/token | 49.7393 ms | 60.0763 ms |
+| host KV 저장소 | 144.000 MiB | 37.125 MiB |
+| resident I/O buffers | 327.557 MiB | 253.240 MiB |
+| 종료 직전 VmRSS | 489.461 MiB | 327.477 MiB |
+| 프로세스 VmHWM | 985.641 MiB | 1047.063 MiB |
+| PPL (4 windows, 낮을수록 좋음) | 18.4237 | 21.7333 |
+
+짧은 문맥에서는 int16은 고정 C1024이고 TQ는 decode C128 93 step / C256 34
+step이다. 따라서 아래 decode 차이는 동일 graph context 길이 비교가 아니다.
+
+| 지표 | int16 KV | 현재 TurboQuant |
+|---|---:|---:|
+| TTFT | 73.365 ms | 90.434 ms |
+| prefill | 478.65 tok/s | 388.44 tok/s |
+| decode | 19.9857 tok/s | 22.2143 tok/s |
+| 종료 직전 VmRSS | 489.441 MiB | 306.621 MiB |
+
+긴 문맥에서 TQ는 host KV **−74.22%**, 종료 VmRSS **−33.09%**이지만,
+decode **−17.21%**, prefill **−34.67%**, TTFT **+53.02%**로 관측됐다.
+짧은 문맥 decode는 **+11.15%**지만 버킷 정책의 이점이 포함된 단일 측정이다.
+메모리 절감만으로 4B에서도 속도 우위를 전제할 수 없다. 프로세스 VmHWM은
+오히려 높았으며, host KV/VmRSS/VmHWM은 전체 NPU·드라이버 메모리와 다르다.
+
+긴 문맥에서 token당 평균 host prepare는 6.162→2.846 ms로 감소했지만,
+QNN part 호출 wall time 합은 42.828→55.393 ms로 증가했다. 따라서 관측된
+host 복사 절약이 QNN 실행 구간 증가를 상쇄하지 못했다. Op-level profiling을
+하지 않았으므로 그 증가를 Native decoder, rotation 또는 attention 중
+하나의 연산 비용으로 단정하지 않는다.
+
+PPL은 **+17.96%**이고 네 window 모두 NLL이 증가했다. 합산 NLL은
+11922.60067→12598.62901이다. 이는 4B 적용 가능성을 검증한 결과이지 품질
+동등성을 입증한 결과는 아니다. 기존 encoder 수치 gate 미통과 제한도
+해결됐다고 주장하지 않으며, 정상 양자화 오차와 encoder 오차의 기여를
+분리하는 추가 실험은 이번 범위에 포함하지 않았다.
+
+검증: **378 tests 통과**. int16의 AR1/AR128 전체 36 layers와 TQ의 모든
+bucket/AR 전체 36 layers가 compiled 구조 검사를 통과했다. 두 구성 모두
+reset 2×8의 생성 ID 일치, EOS 종료(int16 12번째/TQ 8번째 토큰), 600-token
+생성 및 cache 위치 검사를 통과했다. TQ는 C128→256→512→1024를 전환했다.
+
+### 19.3 산출물
+
+실험 경로: `/mnt/d/ai-hub-models/binaries/turboquant/qwen3_4b_20260922/`.
+디렉터리 날짜는 준비 시작일이고 기기 측정은 2026-09-23에 완료했다.
+
+- `split/`, `assets/`, `baseline_int16/`, `turboquant/`: 입력과 빌드 산출물.
+- `reports/comparison.json`: 검증된 전체 비교 요약.
+- `reports/experiment.json`: 실험 설정과 해시.
+- `reports/perf_{baseline_int16,turboquant}_{short,long}_once.json`: 성능 원본.
+- `reports/score_{baseline_int16,turboquant}_w{0,1,2,3}.json`: 품질 원본.
+- `reports/boundary_{baseline_int16,turboquant}.json`: 최종 전체 구조 검사.
+- `reports/generation_{baseline_int16,turboquant}_{reset,eos,switches}.json`: 기능 검사.
+
+초기 진단 로그도 보존했다. `early_baseline_part2_ar128.json`의 실패는 앞서
+설명한 4B scalar-Div 경로를 구 verifier가 인식하지 못한 결과이며, 최종
+판정은 전체 레이어를 검사한 `boundary_baseline_int16.json`이다.
+
+## 20. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

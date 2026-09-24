@@ -44,8 +44,13 @@ from qai_hub_models.test.test_models import test_turboquant_tiled_attention as f
 
 @pytest.mark.parametrize("mode", ["full", "tiled", "rotated", "native", "qjl", "fwht"])
 @pytest.mark.parametrize(("seq", "valid"), [(1, 0), (3, 13), (128, 0)])
+@pytest.mark.parametrize("key_divisor", [None, float(np.sqrt(128))])
 def test_current_cache_values_feed_attention(
-    mode: str, seq: int, valid: int, monkeypatch: pytest.MonkeyPatch
+    mode: str,
+    seq: int,
+    valid: int,
+    monkeypatch: pytest.MonkeyPatch,
+    key_divisor: float | None,
 ) -> None:
     context = max(35, seq + 17)
     monkeypatch.setattr(fixture, "CONTEXT", context)
@@ -57,7 +62,7 @@ def test_current_cache_values_feed_attention(
         else "k4_v4_scaled",
         Rotation.FWHT if mode == "fwht" else Rotation.DENSE_QR,
     )
-    model, enc = fixture.attention_part(seq)
+    model, enc = fixture.attention_part(seq, key_divisor)
     before = apply_kv_profile(model, enc, config, seq, context)
     native = mode in ("native", "qjl", "fwht")
     if mode != "full":
@@ -91,7 +96,7 @@ def test_current_cache_values_feed_attention(
     qref = QJLKeyReference(config) if config.qjl else None
     past_kv = {}
     for kind, ref in refs.items():
-        x = rng.normal(size=(2, 1, context - seq, 128))
+        x = rng.normal(size=(fixture.HEADS, 1, context - seq, fixture.D))
         x[:, :, : context - seq - valid] = 0
         if kind == "key" and qref:
             packed, scale, qscale = qref.encode(x)
@@ -139,15 +144,18 @@ def test_current_cache_values_feed_attention(
                 else ref.decode(indices, scale)
             )
         assert not np.allclose(current_kv[kind], data[f"new_{kind}"])
-    for h in range(2):
+    for h in range(fixture.HEADS):
         k = np.concatenate(
             (past_kv["key"][h : h + 1], current_kv["key"][h : h + 1]), axis=2
         )
         v = np.concatenate(
             (past_kv["value"][h : h + 1], current_kv["value"][h : h + 1]), axis=2
         )
-        for g in range(2):
-            scores = data[f"h{h}g{g}_q"] @ k.swapaxes(-1, -2) + data["mask"]
+        for g in range(fixture.GROUPS):
+            scores = (
+                data[f"h{h}g{g}_q"] @ (k / (key_divisor or 1)).swapaxes(-1, -2)
+                + data["mask"]
+            )
             probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
             probs /= probs.sum(axis=-1, keepdims=True)
             np.testing.assert_allclose(
@@ -161,6 +169,18 @@ def test_current_cache_values_feed_attention(
     assert len(result.current_kv_attention) == 2
     with pytest.raises(ValueError, match="applied once"):
         quantize_current_attention(result, config)
+
+
+@pytest.mark.parametrize("seq", [1, 128])
+def test_qwen3_4b_native_current_attention(
+    seq: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cover all 32 query heads sharing eight KV heads, in decode and prefill."""
+    monkeypatch.setattr(fixture, "HEADS", 8)
+    monkeypatch.setattr(fixture, "GROUPS", 4)
+    test_current_cache_values_feed_attention(
+        "native", seq, 13, monkeypatch, float(np.sqrt(128))
+    )
 
 
 @pytest.mark.parametrize("legacy", [False, True])

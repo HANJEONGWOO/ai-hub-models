@@ -30,7 +30,9 @@ HEADS, GROUPS, D, CONTEXT = 2, 2, 128, 35
 CONFIG = get_profile("k4_v4")
 
 
-def attention_part(seq: int) -> tuple[onnx.ModelProto, dict[str, Any]]:
+def attention_part(
+    seq: int, key_divisor: float | None = None
+) -> tuple[onnx.ModelProto, dict[str, Any]]:
     sg, qks, softmaxes, avs = Subgraph(), Subgraph(), Subgraph(), Subgraph()
     acts = []
     inputs = []
@@ -101,10 +103,16 @@ def attention_part(seq: int) -> tuple[onnx.ModelProto, dict[str, Any]]:
         enc(out, 8)
     inputs.append(value("mask", [1, 1, seq, CONTEXT]))
     for h in range(HEADS):
+        key = f"key_{h}_cat"
+        if key_divisor is not None:
+            divisor = sg.const("key_divisor", np.asarray(key_divisor, dtype=np.float32))
+            sg.node("Div", [key, divisor], [f"key_{h}_scaled"])
+            key = f"key_{h}_scaled"
+            enc(key, 8)
         for g in range(GROUPS):
             p = f"h{h}g{g}"
             inputs.append(value(p + "_q", [1, 1, seq, D]))
-            qks.node("MatMul", [p + "_q", f"key_{h}_cat"], [p + "_qk"])
+            qks.node("MatMul", [p + "_q", key], [p + "_qk"])
             softmaxes.node("Add", [p + "_qk", "mask"], [p + "_masked"])
             softmaxes.node("Softmax", [p + "_masked"], [p + "_prob"], axis=-1)
             avs.node("MatMul", [p + "_prob", f"value_{h}_cat"], [p + "_out"])
@@ -205,6 +213,35 @@ def test_invalid_tile_rejected(tile: int) -> None:
     with pytest.raises(ValueError, match=r"positive tile size|does not tile"):
         tile_kv_attention(
             apply_kv_profile(model, encodings, CONFIG, 1, CONTEXT), CONFIG, tile
+        )
+
+
+@pytest.mark.parametrize("divisor", [0.0, -1.0, float("nan"), float("inf")])
+def test_invalid_attention_key_divisor_rejected(divisor: float) -> None:
+    model, encodings = attention_part(1, divisor)
+    with pytest.raises(ValueError, match="positive scalar"):
+        tile_kv_attention(
+            apply_kv_profile(model, encodings, CONFIG, 1, CONTEXT), CONFIG, 7
+        )
+
+
+@pytest.mark.parametrize("invalid", ["vector", "dynamic", "reversed"])
+def test_unsupported_attention_key_division_rejected(invalid: str) -> None:
+    model, encodings = attention_part(1, float(np.sqrt(D)))
+    if invalid == "vector":
+        tensor = next(t for t in model.graph.initializer if t.name == "key_divisor")
+        tensor.CopyFrom(
+            onnx.numpy_helper.from_array(np.ones(D, dtype=np.float32), tensor.name)
+        )
+    else:
+        node = next(n for n in model.graph.node if n.output[0] == "key_0_scaled")
+        if invalid == "dynamic":
+            node.input[1] = "new_value"
+        else:
+            node.input.reverse()
+    with pytest.raises(ValueError, match=r"positive scalar|constant|scale operands"):
+        tile_kv_attention(
+            apply_kv_profile(model, encodings, CONFIG, 1, CONTEXT), CONFIG, 7
         )
 
 
