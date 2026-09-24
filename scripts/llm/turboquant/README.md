@@ -30,8 +30,8 @@ export defaults, and need setting up separately on a different machine.
 
 ## Model selection: Qwen3-4B is opt-in
 
-`benchmark_model_once.py` supports `qwen3_1_7b` (the unchanged default) and
-`qwen3_4b` (explicit `--model-id` only). It prepares a W4A16 split checkpoint,
+`benchmark_model_once.py` supports `qwen3_1_7b` (the unchanged default),
+`qwen3_0_6b` and `qwen3_4b` (explicit `--model-id` only). It prepares a W4A16 split checkpoint,
 builds **int16 KV** and **current Dense+Native K4/V4, QJL-off, current KV
 quantized** bundles, audits them, and measures both newly. It does not reuse
 1.7B metrics for the 4B comparison. Model definitions and global defaults are
@@ -91,6 +91,63 @@ The completed Qwen3-4B device comparison (2026-09-23) is recorded in design
 and PPL **18.4237→21.7333** (int16→current TurboQuant). Both controls were
 built and measured anew, once per input condition. These results do not change
 the default model or establish a speed/quality advantage for the 4B codec.
+
+## Qwen3-0.6B: fixed C1024 comparison
+
+Use `--model-id qwen3_0_6b --cl1024-only` on **every stage** for the smaller
+model and a fixed-context comparison. This mode builds only AR1 and AR128 at
+C1024 for both int16 KV and current Dense+Native K4/V4 (QJL-off, current KV
+quantized). No C128/256/512 graphs or short-input performance sessions are run.
+The existing model and bucket-policy defaults are unchanged when omitted.
+
+```bash
+TQ_WORK=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_0_6b_cl1024_experiment
+TQ_RUNNER=$HOME/.qaihm/tmp/turboquant/qnn_runner/model_compare/qnn-llm-runner
+for stage in prepare build audit push functional performance quality summarize; do
+    PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+        scripts/llm/turboquant/benchmark_model_once.py "$stage" \
+        --model-id qwen3_0_6b --cl1024-only \
+        --work-dir "$TQ_WORK" --runner "$TQ_RUNNER" || break
+done
+```
+
+Reuse an existing compatible runner or build it using the command above.
+Formal performance is **one 897-prompt + 128-generation session per group**.
+PPL remains four 1024-token WikiText windows per group, evaluated separately.
+The functional `switches` report name is retained for compatibility, but in
+this mode checks cache growth while staying at C1024, not bucket switching.
+The summary contains only `long` performance results; changing the context
+policy between build/staging/measurement is rejected. Attempt logs are never
+silently overwritten.
+
+The published v2 checkpoint uses the model's W4A16 recipe, including its
+designated int8 weight exception; both KV configurations share exactly that
+checkpoint. Qwen3-0.6B has 28 layers, hidden size 1024, 16 query heads, 8 KV
+heads and explicit head dimension **128**, not 1024/16. Its two split parts are
+embedding and all transformer layers + LM head. Its CL1024 host KV capacity is
+the same as 1.7B: **112 MiB int16 / 28.875 MiB K4/V4**, despite fewer weights.
+The compiled boundary audit recognizes wide Concat → int8 Convert → 16×8
+attention by graph structure, including this checkpoint's ordinary ONNX tensor
+names. It still rejects narrowing before the Concat or an incorrect operand/type;
+the compatibility change does not alter the checkpoint or execution graph.
+On this machine its checkpoint cache is linked to
+`/mnt/d/ai-hub-models/checkpoints/qwen3_0_6b` so downloads remain on D.
+
+The 2026-09-24 0.6B comparison completed, but **current TurboQuant failed the
+generation-quality check**: repetitive output, no EOS within 600 generated
+tokens, and four-window PPL **25.7000 → 59.0611** (int16 → TurboQuant).
+Its decode **49.324 → 48.344 tok/s** is therefore a diagnostic comparison,
+not evidence of a quality-valid 0.6B TurboQuant baseline. See design §20.
+
+The normal workflow stops on functional failure. For an explicitly labelled
+diagnostic measurement after reviewing an **EOS-only** failure, pass
+`--allow-eos-failure` to `performance` and `summarize` only. Reset and cache
+checks must still pass, and the failed EOS result is retained. The option is
+off by default; it does not change the model or make the functional stage pass.
+`performance_policy.json` records this decision, the original check results
+and whether quality was measured before timing. EOS-failed groups receive
+`diagnostic_only: true` in the summary. The policy and existing attempt files
+prevent repeated performance runs; summary requires the same explicit policy.
 
 ## Codec defaults
 

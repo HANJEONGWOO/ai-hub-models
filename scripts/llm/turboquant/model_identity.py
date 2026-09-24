@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 QWEN_SHAPES = {
+    "qwen3_0_6b": (28, 1024, 16, 8, 128),
     "qwen3_1_7b": (28, 2048, 16, 8, 128),
     "qwen3_4b": (36, 2560, 32, 8, 128),
 }
@@ -59,7 +60,7 @@ def checkpoint_identity(checkpoint: Path, model_id: str) -> dict[str, Any]:
             "vocab_size",
         )
     }
-    # Qwen3-4B uses 128, not hidden_size / num_attention_heads (80).
+    # Qwen3-0.6B/4B use explicit 128, not hidden_size / num_attention_heads.
     architecture["head_dim"] = config.get(
         "head_dim", config["hidden_size"] // config["num_attention_heads"]
     )

@@ -4,7 +4,8 @@
 # ---------------------------------------------------------------------
 """Build and compare int16 KV and current TurboQuant for an explicitly selected model.
 
-Default model remains Qwen3-1.7B. Qwen3-4B requires --model-id qwen3_4b.
+Default model remains Qwen3-1.7B. Other sizes require explicit --model-id.
+--cl1024-only builds fixed C1024 for both groups and measures only 897+128 tokens.
 Stages are explicit; performance executes once per group/input condition and
 never overwrites attempted measurements. Builds are serial to bound host RAM.
 """
@@ -23,7 +24,7 @@ from typing import Any
 from model_identity import sha256_file, validate_model
 from summarize_native_results import performance, read
 
-MODELS = ("qwen3_1_7b", "qwen3_4b")
+MODELS = ("qwen3_0_6b", "qwen3_1_7b", "qwen3_4b")
 GROUPS = {"baseline_int16": "baseline_int16_kv", "turboquant": "k4_v4_scaled"}
 BUCKETS = {"baseline_int16": [1024], "turboquant": [128, 256, 512, 1024]}
 SCRIPTS = Path(__file__).resolve().parent
@@ -47,6 +48,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--model-id", choices=MODELS, default="qwen3_1_7b")
     result.add_argument("--work-dir", type=Path, required=True)
     result.add_argument("--checkpoint", default="DEFAULT")
+    result.add_argument(
+        "--cl1024-only",
+        action="store_true",
+        help="Use fixed C1024 for both groups; one long-input performance run each.",
+    )
+    result.add_argument(
+        "--allow-eos-failure",
+        action="store_true",
+        help="Performance/summarize only: label EOS-failed groups as diagnostic; reset/cache checks remain mandatory.",
+    )
     result.add_argument(
         "--runner",
         type=Path,
@@ -79,7 +90,18 @@ def execute(script: str, options: list[str], log: Path) -> None:
     print("DONE", log.stem, flush=True)
 
 
-def validate_bundles(work: Path, model_id: str) -> dict[str, dict[str, Any]]:
+def context_buckets(cl1024_only: bool = False) -> dict[str, list[int]]:
+    return {g: [1024] if cl1024_only else list(BUCKETS[g]) for g in GROUPS}
+
+
+def performance_conditions(cl1024_only: bool = False) -> tuple[str, ...]:
+    return ("long",) if cl1024_only else ("short", "long")
+
+
+def validate_bundles(
+    work: Path, model_id: str, cl1024_only: bool = False
+) -> dict[str, dict[str, Any]]:
+    buckets = context_buckets(cl1024_only)
     assets = read(work / "assets/assets.json")
     split_hash = sha256_file(work / "split/split_manifest.json")
     split = read(work / "split/split_manifest.json")
@@ -113,7 +135,7 @@ def validate_bundles(work: Path, model_id: str) -> dict[str, dict[str, Any]]:
             or metadata.get("num_parts") != total
             or metadata["profile"] != profile
             or metadata["context_length"] != 1024
-            or metadata["context_buckets"] != BUCKETS[group]
+            or metadata["context_buckets"] != buckets[group]
             or bool(metadata.get("quantize_current_kv")) != (group == "turboquant")
             or set(metadata["parts"]) != parts
         ):
@@ -191,7 +213,10 @@ def validate_run(
             raise ValueError("Measured Native library differs from build")
 
 
-def functional_checks(root: Path, group: str, prompt: int) -> dict[str, bool]:
+def functional_checks(
+    root: Path, group: str, prompt: int, contexts: list[int] | None = None
+) -> dict[str, bool]:
+    contexts = BUCKETS[group] if contexts is None else contexts
     reset = read(root / f"generation_{group}_reset.json")
     eos = read(root / f"generation_{group}_eos.json")
     switches = read(root / f"generation_{group}_switches.json")
@@ -208,7 +233,7 @@ def functional_checks(root: Path, group: str, prompt: int) -> dict[str, bool]:
     cached = 0
     for step in switches["steps"]:
         expected = min(
-            c for c in BUCKETS[group] if step["ar"] < c and cached <= c - step["ar"]
+            c for c in contexts if step["ar"] < c and cached <= c - step["ar"]
         )
         checks["switches"] &= (
             step["graph_context"] == expected and step["cached_before"] == cached
@@ -217,24 +242,53 @@ def functional_checks(root: Path, group: str, prompt: int) -> dict[str, bool]:
     return checks
 
 
-def summarize(work: Path, bundles: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def summarize(
+    work: Path,
+    bundles: dict[str, dict[str, Any]],
+    cl1024_only: bool = False,
+    allow_eos_failure: bool = False,
+) -> dict[str, Any]:
     root = work / "reports"
     assets = read(work / "assets/assets.json")
+    conditions = performance_conditions(cl1024_only)
+    policy_path = root / "performance_policy.json"
+    policy = read(policy_path) if policy_path.exists() else {"allow_eos_failure": False}
+    if policy["allow_eos_failure"] != allow_eos_failure:
+        raise ValueError("Performance diagnostic policy changed since measurement")
+    if policy_path.exists() and (
+        policy["cl1024_only"] != cl1024_only
+        or policy["performance_conditions"] != list(conditions)
+    ):
+        raise ValueError("Performance context policy changed since measurement")
     summary: dict[str, Any] = {
         "model": assets["model"],
         "experiment": read(root / "experiment.json"),
         "performance_sessions_per_configuration_condition": 1,
-        "measurement_notes": "W4A16 weights for both groups. Int16 uses fixed C1024; current TurboQuant uses C128/256/512/1024. Long decode is C1024 for both. Loading excluded from TTFT; profiling off; no warmup exclusion, thermal control or variance estimate. Functional and PPL runs are separate; no historical 1.7B results reused.",
-        "short": {},
-        "long": {},
+        "performance_conditions": list(conditions),
+        "performance_policy": policy,
+        "context_buckets": {g: m["context_buckets"] for g, m in bundles.items()},
+        "measurement_notes": (
+            "Published W4A16 checkpoint shared by both groups. "
+            + (
+                "Both use fixed C1024; only 897 prompt + 128 generated tokens are timed. "
+                if cl1024_only
+                else "Int16 uses fixed C1024; current TurboQuant uses C128/256/512/1024. Long decode is C1024 for both. "
+            )
+            + "Loading excluded from TTFT; profiling off; no warmup exclusion, thermal control or variance estimate. Functional and PPL runs are separate; no historical model results reused."
+            + (
+                " EOS-failed groups are diagnostic timings, not quality-valid inference results."
+                if allow_eos_failure
+                else ""
+            )
+        ),
+        **{condition: {} for condition in conditions},
         "quality": {},
         "functional": {},
     }
     device = None
     for group, metadata in bundles.items():
         paths = [
-            root / f"perf_{group}_{condition}_once.json"
-            for condition in ("short", "long")
+            root / f"perf_{group}_{condition}_once.json" for condition in conditions
         ]
         paths += [root / f"score_{group}_w{i}.json" for i in range(4)]
         paths += [
@@ -248,6 +302,8 @@ def summarize(work: Path, bundles: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 raise ValueError(f"Device mismatch: {path}")
             device = data["device"]
         for condition, prompt in (("short", assets["prompt_tokens"]), ("long", 897)):
+            if condition not in conditions:
+                continue
             summary[condition][group] = performance(
                 root / f"perf_{group}_{condition}_once.json", prompt
             )
@@ -261,14 +317,19 @@ def summarize(work: Path, bundles: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "scored_tokens": 4092,
         }
         summary["functional"][group] = functional_checks(
-            root, group, assets["prompt_tokens"]
+            root, group, assets["prompt_tokens"], metadata["context_buckets"]
         )
-        if not all(summary["functional"][group].values()):
+        checks = summary["functional"][group]
+        if not functional_acceptable(checks, allow_eos_failure):
             raise ValueError(
                 f"Functional checks failed: {summary['functional'][group]}"
             )
+        if "functional" in policy and policy["functional"][group] != checks:
+            raise ValueError("Functional results changed since performance measurement")
+        for condition in conditions:
+            summary[condition][group]["diagnostic_only"] = not all(checks.values())
     summary["device"] = device
-    for condition in ("short", "long"):
+    for condition in conditions:
         old, new = (
             summary[condition]["baseline_int16"],
             summary[condition]["turboquant"],
@@ -286,8 +347,20 @@ def summarize(work: Path, bundles: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return summary
 
 
+def functional_acceptable(checks: dict[str, bool], allow_eos_failure: bool) -> bool:
+    """EOS non-emission may be diagnosed; reset/cache failures never qualify."""
+    return {"reset", "eos", "switches"} <= checks.keys() and all(
+        passed or (name == "eos" and allow_eos_failure)
+        for name, passed in checks.items()
+    )
+
+
 def main() -> None:
     args = parser().parse_args()
+    if args.allow_eos_failure and args.stage not in ("performance", "summarize"):
+        raise ValueError("--allow-eos-failure is only for performance/summarize")
+    buckets = context_buckets(args.cl1024_only)
+    conditions = performance_conditions(args.cl1024_only)
     work = args.work_dir.expanduser().resolve()
     work.mkdir(parents=True, exist_ok=True)
     reports = work / "reports"
@@ -349,14 +422,14 @@ def main() -> None:
                         "--context-length",
                         "1024",
                         "--context-buckets",
-                        *map(str, BUCKETS[group]),
+                        *map(str, buckets[group]),
                         "--parts",
                         str(part),
                     ],
                     reports / f"build_{group}_part{part}.stdout.log",
                 )
         return
-    bundles = validate_bundles(work, args.model_id)
+    bundles = validate_bundles(work, args.model_id, args.cl1024_only)
     assets = read(work / "assets/assets.json")
     if args.stage == "audit":
         for group, script in (
@@ -385,6 +458,8 @@ def main() -> None:
         "assets_sha256": assets["sha256"],
         "performance_sessions_per_configuration_condition": 1,
     }
+    if args.cl1024_only:
+        identity["cl1024_only"] = True
     if args.stage == "push":
         for group in GROUPS:
             validate_audit(read(reports / f"boundary_{group}.json"), bundles[group])
@@ -413,7 +488,9 @@ def main() -> None:
             )
         return
     experiment = read(experiment_path)
-    if any(experiment[k] != v for k, v in identity.items()):
+    if experiment.get("cl1024_only", False) != args.cl1024_only or any(
+        experiment.get(k) != v for k, v in identity.items()
+    ):
         raise ValueError("Experiment identity changed since staging")
 
     def run(group: str, filename: str, options: list[str]) -> None:
@@ -450,19 +527,56 @@ def main() -> None:
                     f"generation_{group}_{label}.json",
                     ["--mode", "generate", *options],
                 )
-            checks = functional_checks(reports, group, assets["prompt_tokens"])
+            checks = functional_checks(
+                reports, group, assets["prompt_tokens"], buckets[group]
+            )
             if not all(checks.values()):
                 raise ValueError(f"Functional checks failed: {group}: {checks}")
     elif args.stage == "performance":
+        checks_by_group = {}
         for group in GROUPS:
-            if not all(
-                functional_checks(reports, group, assets["prompt_tokens"]).values()
-            ):
+            checks = functional_checks(
+                reports, group, assets["prompt_tokens"], buckets[group]
+            )
+            checks_by_group[group] = checks
+            if not functional_acceptable(checks, args.allow_eos_failure):
                 raise ValueError(f"Functional checks must pass first: {group}")
+            if not all(checks.values()):
+                print(f"DIAGNOSTIC ONLY: {group}: {checks}", flush=True)
+        policy_path = reports / "performance_policy.json"
+        if policy_path.exists():
+            raise FileExistsError(f"Refusing to repeat a measurement: {policy_path}")
+        for condition in conditions:
+            for group in GROUPS:
+                stem = f"perf_{group}_{condition}_once"
+                for suffix in (".json", ".log", ".stdout.log"):
+                    path = reports / (stem + suffix)
+                    if path.exists():
+                        raise FileExistsError(
+                            f"Refusing to repeat a measurement: {path}"
+                        )
+        with policy_path.open("x") as output:
+            json.dump(
+                {
+                    "allow_eos_failure": args.allow_eos_failure,
+                    "functional": checks_by_group,
+                    "cl1024_only": args.cl1024_only,
+                    "performance_conditions": list(conditions),
+                    "quality_measured_before_performance": all(
+                        (reports / f"score_{group}_w{i}.json").exists()
+                        for group in GROUPS
+                        for i in range(4)
+                    ),
+                },
+                output,
+                indent=2,
+            )
         for condition, tokens in (
             ("short", assets["prompt_ids"]),
             ("long", assets["boundary_prompt"]),
         ):
+            if condition not in conditions:
+                continue
             for group in GROUPS:
                 run(
                     group,
@@ -487,12 +601,10 @@ def main() -> None:
                     ["--mode", "score", "--tokens", assets["wikitext_windows"][window]],
                 )
     else:
-        result = summarize(work, bundles)
+        result = summarize(work, bundles, args.cl1024_only, args.allow_eos_failure)
         with (reports / "comparison.json").open("x") as output:
             json.dump(result, output, indent=2)
-        print(
-            json.dumps({k: result[k] for k in ("short", "long", "quality")}, indent=2)
-        )
+        print(json.dumps({k: result[k] for k in (*conditions, "quality")}, indent=2))
 
 
 if __name__ == "__main__":

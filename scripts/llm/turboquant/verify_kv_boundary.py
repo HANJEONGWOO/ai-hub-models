@@ -264,6 +264,34 @@ def walk_forward(
     return chain, boundary
 
 
+def is_attention_matmul_boundary(
+    info: DlcInfo, source: str, converted: set[str], op: Op
+) -> bool:
+    """Recognize wide Concat -> int8 Convert -> 16x8 attention by structure.
+
+    The 0.6B SpinQuant checkpoint uses ordinary ONNX Concat output names,
+    not the ``cat_*`` names used by older exports. Names are not evidence
+    that narrowing happens after the cache/current-token Concat.
+    """
+    concat = info.producer.get(source)
+    return (
+        concat is not None
+        and concat.op_type == "Concat"
+        and len(concat.inputs) >= 2
+        and all(t.dtype in WIDE_TYPES for t in concat.inputs)
+        and bool(concat.outputs)
+        and all(t.dtype in WIDE_TYPES for t in concat.outputs)
+        and source in {t.name for t in concat.outputs}
+        and op.op_type == "MatMul"
+        and len(op.inputs) == 2
+        and converted == {op.inputs[1].name}
+        and op.inputs[1].dtype in INT8_TYPES
+        and op.inputs[0].dtype in WIDE_TYPES
+        and len(op.outputs) == 1
+        and op.outputs[0].dtype in WIDE_TYPES
+    )
+
+
 def is_key_scale_boundary(
     info: DlcInfo, source: str, converted: set[str], op: Op
 ) -> bool:
@@ -468,18 +496,17 @@ def check_graph(
                             and bool(others)
                             and not set(others) - INT8_TYPES
                         )
-                        at_matmul = (
-                            c["op_type"] == "MatMul"
-                            and not conv_dtypes - INT8_TYPES
-                            and (
-                                b["from"].startswith("cat_")
-                                or b["from"].endswith(("_key_cat", "_value_cat"))
-                            )
-                        )
                         scale_op = (
                             info.producer.get(c["outputs"][0]["tensor"])
                             if c["outputs"]
                             else None
+                        )
+                        at_matmul = (
+                            scale_op is not None
+                            and not conv_dtypes - INT8_TYPES
+                            and is_attention_matmul_boundary(
+                                info, b["from"], converted, scale_op
+                            )
                         )
                         at_key_scale = (
                             kind == "key"
