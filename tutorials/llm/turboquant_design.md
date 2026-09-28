@@ -1586,6 +1586,240 @@ C128→256→512→1024 전환, 긴 문맥 cache 1024 경계가 모두 통과했
 `boundary_current_native.json`을 생성해야 한다. 기존 측정이나 시도 로그가
 있으면 거부하며, 과거 대조군을 다시 실행하지 않는다.
 
-## 19. 출처
+## 19. Qwen3-4B 명시적 선택 및 비교 (2026-09-23)
+
+### 19.1 변경 범위와 재현
+
+기본 모델은 **Qwen3-1.7B로 유지**한다. 새
+`scripts/llm/turboquant/benchmark_model_once.py`에서 `--model-id qwen3_4b`를
+명시할 때만 4B를 준비·빌드·측정한다. 모델 정의 자체나 Dense QR + Native LUT,
+K4/V4, QJL-off, 현재 KV 양자화 기본값은 변경하지 않았다.
+
+4B v6 W4A16 checkpoint의 구조는 36 layers, hidden size 2560, Q heads 32,
+KV heads 8, **head dimension 128**이다. head dimension을 2560/32로 추정하면
+안 된다. 다음 두 실제 그래프 차이를 지원했다.
+
+- 4B의 attention 앞 `K / sqrt(128)`를 인식한다. rotated attention에서는
+  `(Q / sqrt(128)) @ R.T`로 동일 스케일을 적용하며, 전체 과거 K를 다시
+  스케일링하지 않는다. 양의 상수 scalar divisor만 허용한다.
+- cache guard를 마지막 cache output 앞이 아니라 실제 최초 소비 노드 앞에
+  배치한다. 4B RoPE layout 경로에서 발생하던 ONNX 전방 참조를 제거한다.
+
+int16 compiled audit도 wide K Concat 뒤의 int8 Convert → static scalar Div
+→ QK 경로를 검사한다. 임의 elementwise 연산이나 이른 cache narrowing을
+허용하는 변경은 아니다. split/model/config/tokenizer/RoPE, 입력 token,
+runner/Native 및 바이너리 SHA256을 기록하고, 다른 모델의 번들·asset 혼합을
+거부한다. 기존 1.7B 경로는 회귀 테스트로 유지한다.
+
+재현 단계는 `prepare` → `build` → `audit` → `push` → `functional` →
+결과 확인 → `performance` → `quality` → `summarize`이며 명령 예시는
+[도구 README](../../scripts/llm/turboquant/README.md#model-selection-qwen3-4b-is-opt-in)에
+있다. RAM 사용을 제한하기 위해 group/part를 순차 빌드한다. 이번 빌드는
+WSL 27 GiB RAM + 24 GiB swap에서 완료했으며, 마지막 context 저장 중 **WSL 전체
+swap 사용 약 15 GiB**를 관측했다. 이는 정밀한 peak 측정이나 모델 전용
+메모리 값은 아니며, swap 8 GiB 환경에서 같은 빌드의 성공을 보장하지 않는다.
+
+### 19.2 측정 조건과 결과
+
+**두 구성 모두 이번에 새로 빌드하고 측정**했다. 과거 1.7B 수치를 대조군으로
+사용하지 않는다. Qwen3-4B W4A16 / S26 Ultra SM8850 / QAIRT 2.48 / HTP v81,
+동일 checkpoint·입력·기기·runner를 사용했다. int16은 KV 저장 형식이 int16인
+대조군이며, 모든 attention 연산이 int16이라는 뜻은 아니다.
+
+짧은 입력 35 + 생성 128, 긴 입력 897 + 생성 128에 대해 구성/조건별 성능
+세션은 **각 1회**다. profiling off, TTFT에서 모델 로딩 제외, 별도 warmup 제외
+없음, 온도 통제·분산 추정 없음 조건이다. reset/EOS/600-token 생성과 최초
+int16 8-token loading smoke는 별도 진단이며 성능 표에 섞지 않는다.
+
+CL1024 긴 문맥은 두 구성 모두 decode 127 step 전체가 C1024이고 종료 cache가
+1024 tokens이다. PPL은 별도 WikiText 4×1024 windows, AR128 청크 8개/window,
+총 4092 scored tokens의 합산 NLL로 계산했다.
+
+| 지표 | int16 KV | 현재 TurboQuant |
+|---|---:|---:|
+| TTFT | 595.385 ms | 911.087 ms |
+| prefill | 1507.63 tok/s | 984.99 tok/s |
+| decode | 20.1048 tok/s | 16.6455 tok/s |
+| decode/token | 49.7393 ms | 60.0763 ms |
+| host KV 저장소 | 144.000 MiB | 37.125 MiB |
+| resident I/O buffers | 327.557 MiB | 253.240 MiB |
+| 종료 직전 VmRSS | 489.461 MiB | 327.477 MiB |
+| 프로세스 VmHWM | 985.641 MiB | 1047.063 MiB |
+| PPL (4 windows, 낮을수록 좋음) | 18.4237 | 21.7333 |
+
+짧은 문맥에서는 int16은 고정 C1024이고 TQ는 decode C128 93 step / C256 34
+step이다. 따라서 아래 decode 차이는 동일 graph context 길이 비교가 아니다.
+
+| 지표 | int16 KV | 현재 TurboQuant |
+|---|---:|---:|
+| TTFT | 73.365 ms | 90.434 ms |
+| prefill | 478.65 tok/s | 388.44 tok/s |
+| decode | 19.9857 tok/s | 22.2143 tok/s |
+| 종료 직전 VmRSS | 489.441 MiB | 306.621 MiB |
+
+긴 문맥에서 TQ는 host KV **−74.22%**, 종료 VmRSS **−33.09%**이지만,
+decode **−17.21%**, prefill **−34.67%**, TTFT **+53.02%**로 관측됐다.
+짧은 문맥 decode는 **+11.15%**지만 버킷 정책의 이점이 포함된 단일 측정이다.
+메모리 절감만으로 4B에서도 속도 우위를 전제할 수 없다. 프로세스 VmHWM은
+오히려 높았으며, host KV/VmRSS/VmHWM은 전체 NPU·드라이버 메모리와 다르다.
+
+긴 문맥에서 token당 평균 host prepare는 6.162→2.846 ms로 감소했지만,
+QNN part 호출 wall time 합은 42.828→55.393 ms로 증가했다. 따라서 관측된
+host 복사 절약이 QNN 실행 구간 증가를 상쇄하지 못했다. Op-level profiling을
+하지 않았으므로 그 증가를 Native decoder, rotation 또는 attention 중
+하나의 연산 비용으로 단정하지 않는다.
+
+PPL은 **+17.96%**이고 네 window 모두 NLL이 증가했다. 합산 NLL은
+11922.60067→12598.62901이다. 이는 4B 적용 가능성을 검증한 결과이지 품질
+동등성을 입증한 결과는 아니다. 기존 encoder 수치 gate 미통과 제한도
+해결됐다고 주장하지 않으며, 정상 양자화 오차와 encoder 오차의 기여를
+분리하는 추가 실험은 이번 범위에 포함하지 않았다.
+
+검증: **378 tests 통과**. int16의 AR1/AR128 전체 36 layers와 TQ의 모든
+bucket/AR 전체 36 layers가 compiled 구조 검사를 통과했다. 두 구성 모두
+reset 2×8의 생성 ID 일치, EOS 종료(int16 12번째/TQ 8번째 토큰), 600-token
+생성 및 cache 위치 검사를 통과했다. TQ는 C128→256→512→1024를 전환했다.
+
+### 19.3 산출물
+
+실험 경로: `/mnt/d/ai-hub-models/binaries/turboquant/qwen3_4b_20260922/`.
+디렉터리 날짜는 준비 시작일이고 기기 측정은 2026-09-23에 완료했다.
+
+- `split/`, `assets/`, `baseline_int16/`, `turboquant/`: 입력과 빌드 산출물.
+- `reports/comparison.json`: 검증된 전체 비교 요약.
+- `reports/experiment.json`: 실험 설정과 해시.
+- `reports/perf_{baseline_int16,turboquant}_{short,long}_once.json`: 성능 원본.
+- `reports/score_{baseline_int16,turboquant}_w{0,1,2,3}.json`: 품질 원본.
+- `reports/boundary_{baseline_int16,turboquant}.json`: 최종 전체 구조 검사.
+- `reports/generation_{baseline_int16,turboquant}_{reset,eos,switches}.json`: 기능 검사.
+
+초기 진단 로그도 보존했다. `early_baseline_part2_ar128.json`의 실패는 앞서
+설명한 4B scalar-Div 경로를 구 verifier가 인식하지 못한 결과이며, 최종
+판정은 전체 레이어를 검사한 `boundary_baseline_int16.json`이다.
+
+## 20. Qwen3-0.6B 고정 C1024 지원 및 비교 (2026-09-24)
+
+### 20.1 변경 범위와 측정 조건
+
+기존 SDK의 Qwen3-0.6B 모델 정의를 로컬 TurboQuant 빌드·측정 경로에 연결했다.
+`benchmark_model_once.py`의 모든 단계에 `--model-id qwen3_0_6b --cl1024-only`를
+명시한다. **기본 모델은 1.7B로 유지**하며, 옵션을 생략했을 때의 기존 버킷
+정책도 바꾸지 않는다. 재현 명령은 [도구 README](../../scripts/llm/turboquant/README.md)에 있다.
+
+이번 조건은 int16 KV와 현재 TurboQuant 모두 **고정 C1024**다. 각 구성에
+AR128 prefill·AR1 decode를 위한 두 파트, 총 4개 그래프만 생성한다.
+C128/256/512 그래프나 짧은 입력 성능 세션은 생성·실행하지 않는다.
+정식 성능은 **897 입력 + 128 생성, 구성당 1회**이며 과거 모델의 결과를
+대조군으로 재사용하지 않는다. reset/EOS/600-token cache 증가 진단과
+WikiText 4×1024 windows PPL은 별도다. `switches`라는 진단 파일명은
+호환성을 위해 유지하지만 이번에는 모든 step이 C1024에 머무는지 검사한다.
+
+0.6B v2 공개 W4A16 checkpoint를 두 구성에 동일하게 사용한다. 이 checkpoint는
+SpinQuant R2/R3·AdaScale recipe와 지정된 int8 weight 예외
+(`model.model.layers.2.mlp.down_proj.weight`)를 포함한다. 모델 구조는
+28 layers, hidden size 1024, Q heads 16, KV heads 8, **head dimension 128**이며
+1024/16으로 head dimension을 추정하면 안 된다. 파트는 embedding과
+전체 28 layers + LM head의 2개다. CL1024 host KV 용량은 가중치 크기와 달리
+1.7B와 동일한 **112 MiB / 28.875 MiB**다.
+
+현재 TurboQuant의 Dense QR K/V, Native LUT, K4/V4, QJL-off, tile 256,
+현재 토큰 KV 양자화 설정과 커널은 변경하지 않았다. 모델 식별·shape 검증,
+고정 C1024 빌드/진단/측정/요약 경로와 관련 테스트를 추가했다. 설정을
+staging 이후 변경하거나 이미 시도한 성능 측정을 덮어쓰는 실행은 거부한다.
+
+0.6B의 일반 ONNX Concat 이름도 인식하도록 int16 boundary audit를 보완했다.
+기존 `cat_*` 이름 조건을 실제 **wide Concat → int8 Convert → wide×int8
+attention MatMul** 연결 검사로 교체했다. Concat 입출력의 wide 타입,
+MatMul의 K/V 우측 피연산자와 query/probability·출력 타입을 확인하며,
+이른 narrowing이나 잘못된 연산·피연산자는 거부한다. 모델 그래프나
+양자화 정책을 완화한 변경은 아니다.
+
+### 20.2 실기기 결과와 품질 실패
+
+S26 Ultra SM8850 / QAIRT 2.48 / HTP v81에서 두 구성 모두 새로 빌드·실행했다.
+int16 KV는 모델 가중치 precision이 아니라 cache 저장 형식이다. 두 구성
+모두 127개 decode step이 C1024이고 종료 cache는 1024 tokens이다.
+모델 로딩은 TTFT에서 제외하고 profiling은 끈다. 별도 warmup 제외,
+온도 통제·분산 추정은 없다. 이번에는 기능 검사에서 TQ의 EOS 실패가
+발견되어 **PPL을 먼저 확인한 뒤 속도를 측정**했으며, 이 순서도 기록했다.
+
+**현재 0.6B TurboQuant는 품질 검사 미통과 상태다.** int16은 중력 설명
+질문에 정상 답변 후 12번째 토큰에서 EOS를 출력했지만, TQ는 질문과
+무관한 반복 출력을 보이고 64-token EOS 검사뿐 아니라 별도 600-token
+생성에도 EOS가 없었다. 이는 EOS를 강제로 무시한 실행 결과가 아니라,
+해당 구간에 EOS 토큰 자체가 생성되지 않은 결과다. 네 PPL window 모두
+TQ의 NLL이 증가했다. 구조 검사 통과를 수치적 정확성의 증명으로 보지 않는다.
+
+| 지표 | int16 KV | 현재 TurboQuant (품질 미통과·진단용) |
+|---|---:|---:|
+| TTFT | 243.720 ms | 470.128 ms |
+| prefill | 3685.65 tok/s | 1911.94 tok/s |
+| decode | 49.3243 tok/s | 48.3444 tok/s |
+| decode/token | 20.2740 ms | 20.6849 ms |
+| host KV 저장소 | 112.000 MiB | 28.875 MiB |
+| resident I/O buffers | 261.919 MiB | 95.669 MiB |
+| 종료 직전 VmRSS | 392.961 MiB | 153.418 MiB |
+| 프로세스 VmHWM | 409.395 MiB | 433.652 MiB |
+| PPL (4 windows, 낮을수록 좋음) | 25.7000 | 59.0611 |
+
+단회 관측에서 TQ는 host KV **−74.22%**, 종료 VmRSS **−60.96%**이나,
+TTFT **+92.90%**, prefill **−48.12%**, decode **−1.99%**다. VmHWM은
+오히려 **+5.93%**이며 이 메모리 값들은 전체 NPU·드라이버 메모리가 아니다.
+host prepare 평균은 5.101→1.706 ms/token, QNN 호출 wall time 합은
+14.342→17.632 ms/token으로, host 쪽 절약과 QNN 구간 증가가 비슷한 크기다.
+Op-level profiling 없이 특정 커널을 원인으로 단정하지 않는다.
+
+PPL은 합산 NLL 13284.64792→16689.52095, 구성당 4092 scored tokens에서
+계산했으며 **2.298배(+129.81%)**다. 속도가 가깝다는 이유로 정상 품질의
+baseline으로 채택할 수 없다. 0.6B의 압축 민감도, encoder 수치 오차,
+checkpoint별 그래프/양자화 상호작용의 기여는 아직 분리하지 않았다.
+기존 encoder 수치 gate 미통과 제한 역시 해결한 것이 아니다.
+이번 결과는 빌드·실행 경로 지원과 실패를 포함한 측정 결과이지, 0.6B의
+품질 적합성을 검증한 결과는 아니다.
+
+### 20.3 검증과 진단 측정 정책
+
+**440 tests 통과**. 두 구성의 AR1/AR128 전체 28 layers 구조 검사를 통과했고,
+TQ는 각 그래프에 Native decoder 280개(현재 KV용 56개 포함), Dense QR와
+현재 KV 양자화가 유지된다. 회전된 복원 중간 텐서 최대 크기는 512 KiB다.
+새 boundary 검사로 기존 1.7B·4B의 prefill/decode 파트 표본도 통과했다.
+두 구성 모두 reset 2×8 생성 ID 일치, 600-token cache 위치 및 고정 C1024
+검사는 통과했다. **TQ의 EOS 실패는 그대로 보존하며 통과로 처리하지 않는다.**
+
+기본 `functional`/`performance`/`summarize`는 계속 모든 기능 검사를 요구한다.
+EOS 실패만 있는 구성을 연구용으로 측정하려면 `performance`와 `summarize`에
+명시적으로 `--allow-eos-failure`를 사용한다. reset/cache 실패나 모델·입력·
+그래프 identity 불일치는 이 옵션으로도 허용하지 않는다. 이때 성능 policy에
+원래 판정과 실행 순서를 기록하고, 해당 구성에 `diagnostic_only: true`를
+표시한다. **이번 성능 세션은 int16 1회, TQ 진단 1회이며 재측정하지 않았다.**
+policy/시도 파일이 있으면 재실행을 거부하며 요약에서도 policy 변경을 거부한다.
+
+### 20.4 산출물과 빌드 기록
+
+실험 경로: `/mnt/d/ai-hub-models/binaries/turboquant/qwen3_0_6b_20260924_cl1024/`.
+checkpoint는 `/mnt/d/ai-hub-models/checkpoints/qwen3_0_6b/v2/qwen3_0_6b_w4a16`에 있다.
+
+- `split/`, `assets/`, `baseline_int16/`, `turboquant/`: 입력과 바이너리.
+- `reports/comparison.json`: 실패 표시를 포함한 전체 비교 요약.
+- `reports/experiment.json`, `reports/performance_policy.json`: identity·해시·진단 정책.
+- `reports/perf_{baseline_int16,turboquant}_long_once.json`: 구성당 1회 성능 원본.
+- `reports/score_{baseline_int16,turboquant}_w{0,1,2,3}.json`: 구성당 4개 품질 원본.
+- `reports/generation_*_{reset,eos,switches}.json`: EOS 실패를 포함한 기능 검사.
+- `reports/boundary_{baseline_int16,turboquant}.json`: 최종 전체 구조 검사.
+
+초기 `early_baseline_part2_ar128.json`의 실패는 Concat 이름에 의존하던
+검증기의 호환성 문제이며, 구조 기반 검사로 수정한 뒤 동일 int16 바이너리가
+통과했다. 이 초기 로그와 기존 1.7B·4B 정적 회귀 검사 로그도 보존한다.
+이 검증기 문제와 실제 TQ 생성 품질 실패는 별개다.
+
+구성당 4개 그래프를 순차 빌드했다. 기록된 변환 시간 합은 int16 15.48분 /
+TQ 41.60분, 양자화 1.94분 / 2.17분, context 생성 4.64분 / 5.83분이다.
+메타데이터 추출·분할·다운로드 시간 등은 이 합에 포함하지 않는다.
+WSL 27 GiB RAM + 24 GiB swap에서 완료했으며, TQ converter의 관측된
+VmHWM은 약 21.9 GiB였다. WSL 전체 swap 관측값은 시작 약 4.2 GiB에서
+약 4.9 GiB까지 증가했지만 이는 전체 빌드 peak를 정밀 측정한 값은 아니다.
+0.6B라도 전체 28 layers가 한 파트인 변환 단계에는 상당한 메모리가 필요하다.
+
+## 21. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

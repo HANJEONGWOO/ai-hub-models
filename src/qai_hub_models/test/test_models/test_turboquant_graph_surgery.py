@@ -155,6 +155,26 @@ def node_map(model: onnx.ModelProto) -> dict[str, onnx.NodeProto]:
     return {n.output[0]: n for n in model.graph.node}
 
 
+@pytest.mark.parametrize("profile", ["baseline_int16_kv", "k4_v4", "k4_v4_scaled"])
+def test_cache_guard_precedes_intermediate_unshared_layout(profile: str) -> None:
+    """A layout chain before a shared transpose must not read a later guard."""
+    model, encodings = synthetic_part()
+    model.graph.node.insert(
+        1, helper.make_node("Identity", ["k_tap"], ["k_unshared_layout"])
+    )
+    node_map(model)["k_hub"].input[0] = "k_unshared_layout"
+    encodings["activation_encodings"].append(
+        _enc("k_unshared_layout", TAP_SCALE["key"])
+    )
+    result = apply_kv_profile(model, encodings, get_profile(profile), SEQ, CTX)
+    onnx.checker.check_model(result.model, full_check=True)
+    if profile != "baseline_int16_kv":
+        positions = {
+            o: i for i, n in enumerate(result.model.graph.node) for o in n.output
+        }
+        assert positions["k_tap_tq_cache"] < positions["k_unshared_layout"]
+
+
 # Value-only codec (exported affine int8 K); not a shipped profile.
 V_ONLY = TurboQuantConfig("v_only", BASELINE, get_profile("k4_v4").value)
 

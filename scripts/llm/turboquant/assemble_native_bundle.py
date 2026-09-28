@@ -30,6 +30,9 @@ def main() -> None:
     replaced = set()
     for source in sources[1:]:
         report = json.loads((source / "convert_report.json").read_text())
+        for key in ("model", "split_manifest_sha256", "num_parts"):
+            if report.get(key) != base.get(key):
+                raise ValueError(f"Incompatible {key}: {source}")
         if report.get("quantize_current_kv", False) != base.get(
             "quantize_current_kv", False
         ):

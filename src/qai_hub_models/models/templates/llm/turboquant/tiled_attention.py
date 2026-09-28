@@ -42,6 +42,7 @@ class _Head:
     key: onnx.NodeProto
     value: onnx.NodeProto
     products: list[tuple[onnx.NodeProto, onnx.NodeProto]]
+    key_scale: onnx.NodeProto | None = None
 
 
 def _attribute(node: onnx.NodeProto, name: str) -> Any:
@@ -60,7 +61,7 @@ def _constant(model: onnx.ModelProto, index: _GraphIndex, name: str) -> np.ndarr
             if isinstance(value, onnx.TensorProto)
             else np.asarray(value)
         )
-    raise ValueError(f"Expected a constant slice parameter: {name}.")
+    raise ValueError(f"Expected a constant graph parameter: {name}.")
 
 
 def _head_concat(
@@ -115,8 +116,23 @@ def _heads(
     for head in range(count):
         key, value = concats["key"][head], concats["value"][head]
         products = []
-        for qk in index.consumers[key.output[0]]:
-            if qk.op_type != "MatMul" or qk.input[1] != key.output[0]:
+        key_input = key.output[0]
+        consumers = index.consumers[key_input]
+        key_scale = None
+        # Qwen3-4B exports K / sqrt(head_dim) before the shared GQA products.
+        # Recognize only a positive constant scalar divisor, never arbitrary
+        # elementwise preprocessing that would not commute with rotation.
+        if len(consumers) == 1 and consumers[0].op_type == "Div":
+            key_scale = consumers[0]
+            if len(key_scale.input) != 2 or key_scale.input[0] != key_input:
+                raise ValueError("Unsupported attention key scale operands.")
+            divisor = _constant(result.model, index, key_scale.input[1])
+            if divisor.size != 1 or not np.all(np.isfinite(divisor) & (divisor > 0)):
+                raise ValueError("Attention key divisor must be a positive scalar.")
+            key_input = key_scale.output[0]
+            consumers = index.consumers.get(key_input, [])
+        for qk in consumers:
+            if qk.op_type != "MatMul" or qk.input[1] != key_input:
                 raise ValueError(f"Unsupported QK consumer: {qk.name}.")
             add = _only_consumer(index, qk.output[0], "Add")
             softmax = _only_consumer(index, add.output[0], "Softmax")
@@ -128,7 +144,7 @@ def _heads(
             products.append((qk, av))
         if not products or len(index.consumers[value.output[0]]) != len(products):
             raise ValueError(f"Unsupported V consumers in layer {layer}.")
-        heads.append(_Head(head, key, value, products))
+        heads.append(_Head(head, key, value, products, key_scale))
     return heads
 
 
@@ -275,9 +291,17 @@ def tile_kv_attention(
                     current[head.head, kind] = dest
                 for group, (qk, _) in enumerate(head.products):
                     dest = prefix + f"q{group}_rotated"
+                    query = qk.input[0]
+                    if head.key_scale is not None:
+                        # q @ (K / c).T == (q / c) @ K.T. Scale only the
+                        # current query, not every restored historical K tile.
+                        query = prefix + f"q{group}_scaled"
+                        keys.node(
+                            "Div", [qk.input[0], head.key_scale.input[1]], [query]
+                        )
                     keys.node(
                         "MatMul",
-                        [qk.input[0], _rotation_name(keys, config, config.key, True)],
+                        [query, _rotation_name(keys, config, config.key, True)],
                         [dest],
                     )
                     queries[qk.output[0]] = dest
@@ -313,6 +337,11 @@ def tile_kv_attention(
                         encoding(original.output[0], cat)
                     cats[kind] = cat
                     tile_cats[kind].append(cat)
+                if head.key_scale is not None and not rotated:
+                    scaled = prefix + "key_scaled"
+                    keys.node("Div", [cats["key"], head.key_scale.input[1]], [scaled])
+                    encoding(head.key_scale.output[0], scaled)
+                    cats["key"] = scaled
                 for group, (qk, av) in enumerate(head.products):
                     stem = prefix + f"q{group}_"
                     score = stem + "score"
@@ -393,6 +422,7 @@ def tile_kv_attention(
                 "new_tokens": seq,
                 "kv_heads": key_io.num_kv_heads,
                 "query_heads": len(pairs),
+                "key_divisor_heads": [h.head for h in heads if h.key_scale is not None],
                 "strategy": "rotated_precomputed_scale"
                 if rotated
                 else "two_pass_tiled_global_softmax",

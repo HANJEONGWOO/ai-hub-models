@@ -37,6 +37,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 from huggingface_hub import hf_hub_download
+from model_identity import checkpoint_identity
 from transformers import AutoConfig, AutoTokenizer
 
 from qai_hub_models.models.templates.lm_driver.utils.rope_embedding import (
@@ -60,7 +61,10 @@ PROMPT = "What is gravity? Keep the answer under ten words."
 
 def windows_path(path: Path) -> str:
     return subprocess.run(
-        ["wslpath", "-w", str(path)], check=True, capture_output=True, text=True
+        ["wslpath", "-w", str(path.expanduser().resolve())],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
@@ -153,6 +157,8 @@ def cmd_assets(args: argparse.Namespace) -> None:
             p.name: sha256_file(p) for p in sorted(out.iterdir()) if p.suffix == ".bin"
         },
     }
+    if getattr(args, "model_id", None):
+        manifest["model"] = checkpoint_identity(ckpt, args.model_id)
     (out / "assets.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({k: v for k, v in manifest.items() if k != "sha256"}, indent=2))
 
@@ -188,6 +194,9 @@ def cmd_push(args: argparse.Namespace) -> None:
             "config_hash",
             "config",
             "quantize_current_kv",
+            "model",
+            "split_manifest_sha256",
+            "num_parts",
         )
         if k in metadata
     }
@@ -222,11 +231,12 @@ def cmd_push(args: argparse.Namespace) -> None:
 def cmd_run(args: argparse.Namespace) -> None:
     assets_dir = args.assets.expanduser()
     assets = json.loads((assets_dir / "assets.json").read_text())
-    remote_assets = f"{DEVICE_ROOT}/assets/cl{assets['context_length']}"
-    adb(args, "shell", "mkdir", "-p", remote_assets, f"{DEVICE_ROOT}/reports")
-    for name in assets["sha256"]:
-        push_if_changed(args, assets_dir / name, f"{remote_assets}/{name}")
-
+    asset_identity = hashlib.sha256(
+        json.dumps(assets["sha256"], sort_keys=True).encode()
+    ).hexdigest()[:16]
+    remote_assets = (
+        f"{DEVICE_ROOT}/assets/cl{assets['context_length']}_{asset_identity}"
+    )
     remote_bundle = f"{DEVICE_ROOT}/bundles/{args.name}"
     listing = adb(args, "shell", f"ls {remote_bundle}").split()
     runtime = (
@@ -239,6 +249,18 @@ def cmd_run(args: argparse.Namespace) -> None:
         != assets["context_length"]
     ):
         raise ValueError("Bundle and assets context lengths differ.")
+    asset_model = assets.get("model")
+    if runtime.get("model") and asset_model is None:
+        # Keep legacy asset commands usable with newly tagged bundles. Validate
+        # their actual local checkpoint instead of trusting a directory name.
+        asset_model = checkpoint_identity(
+            Path(assets["checkpoint_dir"]), runtime["model"]["model_id"]
+        )
+    if runtime.get("model") != asset_model:
+        raise ValueError("Bundle and assets belong to different models/checkpoints.")
+    adb(args, "shell", "mkdir", "-p", remote_assets, f"{DEVICE_ROOT}/reports")
+    for name in assets["sha256"]:
+        push_if_changed(args, assets_dir / name, f"{remote_assets}/{name}")
     bins = sorted((b for b in listing if re.fullmatch(r"part\d+_of_\d+\.bin", b)),
                   key=lambda b: int(re.search(r"part(\d+)", b).group(1)))  # fmt: skip
     tokens = args.tokens or (
@@ -322,9 +344,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     if runtime.get("config_hash"):
         report["config_hash"] = runtime["config_hash"]
     report["quantize_current_kv"] = runtime.get("quantize_current_kv", False)
+    for key in ("model", "split_manifest_sha256", "num_parts"):
+        if key in runtime:
+            report[key] = runtime[key]
     report["assets"] = {
         "tokens_file": tokens,
         "tokens_sha256": sha256_file(assets_dir / tokens),
+        "rope_sha256": sha256_file(assets_dir / assets["rope"]),
         **{k: assets[k] for k in ("context_length", "prompt", "prompt_tokens")},
     }
     if args.mode == "generate":
@@ -344,6 +370,11 @@ def main() -> None:
         p.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     assets = sub.add_parser("assets")
     assets.add_argument("--checkpoint-dir", type=Path, required=True)
+    assets.add_argument(
+        "--model-id",
+        default=None,
+        help="Record model identity and reject mismatched bundles.",
+    )
     assets.add_argument("--context-length", type=int, default=1024)
     assets.add_argument("--num-windows", type=int, default=4)
     assets.add_argument("--out", type=Path, required=True)

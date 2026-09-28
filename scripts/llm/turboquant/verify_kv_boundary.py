@@ -16,7 +16,9 @@ For every KV tensor a profile changes, this walks the final QNN op table
   16-bit -> float16 Convert, and that packed / norm I/O carry no encodings;
 - the read path from the cache input (or the codec's restored tensor) to the
   first int8 conversion, which is expected at the attention-side Concat, whose
-  other (new-token) input must still be the exported int8 tensor.
+  other (new-token) input must still be the exported int8 tensor, or after a
+  wide Concat immediately before QK/AV. Qwen3-4B's K/scalar Div is accepted
+  between that conversion and QK only with a static scalar and int8 K output.
 
 Usage:
 
@@ -262,6 +264,70 @@ def walk_forward(
     return chain, boundary
 
 
+def is_attention_matmul_boundary(
+    info: DlcInfo, source: str, converted: set[str], op: Op
+) -> bool:
+    """Recognize wide Concat -> int8 Convert -> 16x8 attention by structure.
+
+    The 0.6B SpinQuant checkpoint uses ordinary ONNX Concat output names,
+    not the ``cat_*`` names used by older exports. Names are not evidence
+    that narrowing happens after the cache/current-token Concat.
+    """
+    concat = info.producer.get(source)
+    return (
+        concat is not None
+        and concat.op_type == "Concat"
+        and len(concat.inputs) >= 2
+        and all(t.dtype in WIDE_TYPES for t in concat.inputs)
+        and bool(concat.outputs)
+        and all(t.dtype in WIDE_TYPES for t in concat.outputs)
+        and source in {t.name for t in concat.outputs}
+        and op.op_type == "MatMul"
+        and len(op.inputs) == 2
+        and converted == {op.inputs[1].name}
+        and op.inputs[1].dtype in INT8_TYPES
+        and op.inputs[0].dtype in WIDE_TYPES
+        and len(op.outputs) == 1
+        and op.outputs[0].dtype in WIDE_TYPES
+    )
+
+
+def is_key_scale_boundary(
+    info: DlcInfo, source: str, converted: set[str], op: Op
+) -> bool:
+    """Recognize the 4B int8 K/scalar -> QK path, after a wide cache Concat.
+
+    QAIRT represents Div as Eltwise_Binary operation 2 (QnnOpDef.h).
+    Do not whitelist arbitrary elementwise operations or early cache narrowing.
+    """
+    concat = info.producer.get(source)
+    if (
+        concat is None
+        or concat.op_type != "Concat"
+        or any(t.dtype not in WIDE_TYPES for t in concat.outputs)
+        or op.op_type != "Eltwise_Binary"
+        or "operation: 2" not in op.params
+        or len(op.inputs) != 2
+        or len(op.outputs) != 1
+        or op.inputs[0].name not in converted
+        or op.inputs[0].dtype not in INT8_TYPES
+        or op.inputs[1].ttype != "STATIC"
+        or op.inputs[1].dims.replace(" ", "") != "1"
+        or op.inputs[1].dtype not in INT8_TYPES
+        or op.outputs[0].dtype not in INT8_TYPES
+    ):
+        return False
+    consumers = info.consumers.get(op.outputs[0].name, [])
+    return bool(consumers) and all(
+        c.op_type == "MatMul"
+        and len(c.inputs) == 2
+        and c.inputs[1].name == op.outputs[0].name
+        and c.inputs[1].dtype in INT8_TYPES
+        and c.inputs[0].dtype in WIDE_TYPES
+        for c in consumers
+    )
+
+
 def check_graph(
     info: DlcInfo,
     config: TurboQuantConfig,
@@ -430,22 +496,37 @@ def check_graph(
                             and bool(others)
                             and not set(others) - INT8_TYPES
                         )
+                        scale_op = (
+                            info.producer.get(c["outputs"][0]["tensor"])
+                            if c["outputs"]
+                            else None
+                        )
                         at_matmul = (
-                            c["op_type"] == "MatMul"
+                            scale_op is not None
                             and not conv_dtypes - INT8_TYPES
-                            and (
-                                b["from"].startswith("cat_")
-                                or b["from"].endswith(("_key_cat", "_value_cat"))
+                            and is_attention_matmul_boundary(
+                                info, b["from"], converted, scale_op
+                            )
+                        )
+                        at_key_scale = (
+                            kind == "key"
+                            and scale_op is not None
+                            and is_key_scale_boundary(
+                                info, b["from"], converted, scale_op
                             )
                         )
                         entry["attention_int8_at"] = (
-                            "concat_inputs" if at_concat else "concat_output"
+                            "concat_inputs"
+                            if at_concat
+                            else "key_scale_input"
+                            if at_key_scale
+                            else "concat_output"
                         )
-                        if not (at_concat or at_matmul):
+                        if not (at_concat or at_matmul or at_key_scale):
                             violations.append(
                                 f"{read_start}: int8 conversion feeds {c['op']} "
                                 f"({c['op_type']}, out {sorted(out_dtypes)}, other "
-                                f"inputs {others}), not the attention Concat/MatMul"
+                                f"inputs {others}), not the attention Concat/MatMul/scalar-K-Div"
                             )
             report["kv"].append(entry)
     return report

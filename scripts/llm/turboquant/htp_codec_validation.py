@@ -398,7 +398,10 @@ def _find_keys(obj: Any, keys: tuple[str, ...]) -> dict[str, Any]:
 
 def windows_path(path: Path) -> str:
     return subprocess.run(
-        ["wslpath", "-w", str(path)], check=True, capture_output=True, text=True
+        ["wslpath", "-w", str(path.expanduser().resolve())],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 

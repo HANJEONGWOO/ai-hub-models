@@ -635,13 +635,24 @@ def apply_kv_profile(
     graph.output.extend(kept_outputs + new_outputs)
     original_nodes = list(graph.node)
     del graph.node[:]
-    # Cache copies read only taps, so placing them just before the present's
-    # producer (which follows every tap) keeps the graph topologically sorted.
+    # An unshared layout node can be rewired in place far before past_*_out
+    # (e.g. the RoPE half concatenations in Qwen3-4B). Insert its cache guards
+    # before that first use, not only before the final cache output producer.
     rebuilt: list[onnx.NodeProto] = []
+    pending = {n.output[0]: n for nodes in cache_nodes.values() for n in nodes}
+
+    def append_cache_dependencies(node: onnx.NodeProto) -> None:
+        for name in node.input:
+            dependency = pending.pop(name, None)
+            if dependency is not None:
+                append_cache_dependencies(dependency)
+                rebuilt.append(dependency)
+
     for node in original_nodes:
-        for out in node.output:
-            rebuilt.extend(cache_nodes.pop(out, []))
+        append_cache_dependencies(node)
         rebuilt.append(node)
+    if pending:
+        raise ValueError(f"Unused cache path nodes: {sorted(pending)}.")
     graph.node.extend(decode.nodes + rebuilt + encode.nodes)
     existing = {init.name for init in graph.initializer}
     for sg in (decode, encode):
