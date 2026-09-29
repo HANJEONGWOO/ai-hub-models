@@ -18,12 +18,22 @@ def main() -> None:
     parser.add_argument("--base", type=Path, required=True)
     parser.add_argument("--parts", type=Path, nargs="+", required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--fp16-attention",
+        action="store_true",
+        help="Assemble uncompressed FP16 attention parts instead of Native codec parts.",
+    )
     args = parser.parse_args()
     sources = [p.expanduser().resolve() for p in [args.base, *args.parts]]
     output = args.out.expanduser().resolve()
     if output in sources or (output / "convert_report.json").exists():
         raise ValueError("Use a new output directory; source bundles are immutable")
     base = json.loads((sources[0] / "convert_report.json").read_text())
+    if args.fp16_attention and (
+        base.get("profile") != "baseline_fp16_kv_fp16_attn"
+        or base.get("native_decoder")
+    ):
+        raise ValueError("Expected a non-Native FP16 attention base")
     combined = copy.deepcopy(base)
     locations = dict.fromkeys(base["parts"], sources[0])
     native = base.get("native_decoder")
@@ -46,7 +56,12 @@ def main() -> None:
         ):
             if report[key] != base[key]:
                 raise ValueError(f"Incompatible {key}: {source}")
-        if not report.get("native_decoder"):
+        if args.fp16_attention and (
+            report.get("profile") != "baseline_fp16_kv_fp16_attn"
+            or report.get("native_decoder")
+        ):
+            raise ValueError("Expected matching non-Native FP16 attention parts")
+        if not args.fp16_attention and not report.get("native_decoder"):
             raise ValueError(f"Missing native package: {source}")
         if native is not None and native != report["native_decoder"]:
             raise ValueError("Native parts were compiled against different packages")

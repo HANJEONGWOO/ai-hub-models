@@ -14,10 +14,13 @@ Storage (``kind``)
       ``past_{kind}_{L}_out`` becomes internal and an encode subgraph produces
       ``tq_{kind}_{L}_{packed,norm}_out`` (token axis -2).
     - ``INT16``: names and shapes stay; the cache I/O, the taps and the whole
-      write path carry one explicit 16-bit grid, so the stored value is the
-      producer's 16-bit activation with no conversion.
+      write path request one shared 16-bit affine grid. This is uncompressed,
+      not necessarily lossless: narrower producer grids can be requantized.
+    - ``FP16``: prepare the same floating cache-write branch as POLAR, without
+      inserting a codec. Follow with ``fp16_attention.use_fp16_kv_attention``
+      to set FP16 I/O and replace the legacy attention-side KV path.
 
-Codec input (both kinds)
+Codec/cache input
     The value before the KV-specific int8 encodings. The first computing op
     behind ``past_*_out`` (the tap: the R3 MatMul for K, v_proj for V in Qwen3)
     is re-gridded from 8 to 16 bits over its calibrated range, so weights and
@@ -132,6 +135,7 @@ class SurgeryResult:
     paths: list[KVPath] = field(default_factory=list)
     attention_tiles: list[dict[str, Any]] = field(default_factory=list)
     current_kv_attention: list[dict[str, Any]] = field(default_factory=list)
+    fp16_attention: list[dict[str, Any]] = field(default_factory=list)
 
     def report(self) -> dict[str, Any]:
         return {
@@ -140,6 +144,7 @@ class SurgeryResult:
             "kv_paths": [p.to_dict() for p in self.paths],
             "attention_tiles": self.attention_tiles,
             "current_kv_attention": self.current_kv_attention,
+            "fp16_attention": self.fp16_attention,
         }
 
 
@@ -193,12 +198,12 @@ def union_grid(
     """One ``bits``-bit affine grid that covers every input encoding's range.
 
     Symmetric per-head grids of one cache tensor share the offset, so the union
-    is the widest head's grid and the other heads are stored on it exactly.
+    is the widest head's grid. Narrower grids can require rounding on conversion.
     """
     grids = [regrid_encoding(e, bits) for e in encodings]
     new = copy.deepcopy(grids[0])
     if len({g["offset"][0] for g in grids}) == 1:
-        # Same zero point (symmetric grids): the widest scale covers every range exactly.
+        # Same zero point: the widest scale covers every head's range.
         new["scale"] = [max(g["scale"][0] for g in grids)]
         return new
     lo = min(_grid_bounds(e)[0] for e in encodings)
@@ -593,7 +598,7 @@ def apply_kv_profile(
         result.paths.append(
             KVPath(kind, layer, tuple(chain.taps), tuple(chain.tap_ops), tuple(kept))
         )
-        if spec.is_int16:
+        if spec.is_int16 or spec.is_fp16:
             continue
 
         scalar = "scale" if config.precomputed_norm else "norm"

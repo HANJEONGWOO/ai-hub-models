@@ -97,12 +97,18 @@ def _only_consumer(index: _GraphIndex, name: str, op: str) -> onnx.NodeProto:
 
 
 def _heads(
-    result: SurgeryResult, index: _GraphIndex, layer: int, count: int
+    result: SurgeryResult,
+    index: _GraphIndex,
+    layer: int,
+    count: int,
+    cache_sources: dict[str, str] | None = None,
 ) -> list[_Head]:
     paths = {p.kind: p for p in result.paths if p.layer == layer}
     concats: dict[str, dict[int, onnx.NodeProto]] = {}
     for kind, axis in (("key", 3), ("value", 2)):
         restored = f"tq_{kind}_{layer}_restored" + ("_hub" if kind == "key" else "")
+        if cache_sources is not None:
+            restored = cache_sources[kind]
         entries = [
             _head_concat(result.model, index, n, restored, axis)
             for n in paths[kind].kept_consumers

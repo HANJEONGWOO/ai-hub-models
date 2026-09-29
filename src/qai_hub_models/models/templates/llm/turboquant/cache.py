@@ -101,7 +101,9 @@ class PackedKVStore:
             )
             self.norms = np.zeros((*lead, 1), config.norm_dtype)
         else:
-            self.raw = np.zeros((*lead, head_dim), np.float32)
+            self.raw = np.zeros(
+                (*lead, head_dim), np.float16 if spec.is_fp16 else np.float32
+            )
         self.norm_dtype = config.norm_dtype
 
     def write(self, start: int, tokens: np.ndarray) -> None:
@@ -120,7 +122,7 @@ class PackedKVStore:
         """Decode the first ``length`` tokens as float32 ``(kv_heads, batch, length, head_dim)``."""
         if self.codec is None:
             assert self.raw is not None
-            return self.raw[:, :, :length].copy()
+            return self.raw[:, :, :length].astype(np.float32, copy=True)
         assert self.packed is not None and self.norms is not None
         indices = unpack_indices(
             self.packed[:, :, :length], self.spec.bits, self.head_dim

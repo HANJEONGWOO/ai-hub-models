@@ -37,6 +37,9 @@ from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_
 from qai_hub_models.models.templates.llm.turboquant.current_attention import (
     quantize_current_attention,
 )
+from qai_hub_models.models.templates.llm.turboquant.fp16_attention import (
+    use_fp16_kv_attention,
+)
 from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
     apply_kv_profile,
 )
@@ -130,6 +133,8 @@ def apply_profile(
     result = apply_kv_profile(
         model, json.loads(encodings.read_text()), config, seq_len, args.context_length
     )
+    if config.fp16_attention:
+        result = use_fp16_kv_attention(result, config)
     if args.attention_tile:
         result = tile_kv_attention(
             result, config, args.attention_tile, rotated=args.rotated_attention
@@ -162,6 +167,7 @@ def apply_profile(
         "rotated_attention": args.rotated_attention,
         "native_decoder": bool(args.native_decoder_package),
         "quantize_current_kv": bool(result.current_kv_attention),
+        "fp16_attention_heads": len(result.fp16_attention),
     }
     return new_onnx, new_encodings, summary
 

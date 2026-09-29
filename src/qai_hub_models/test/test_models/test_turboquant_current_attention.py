@@ -225,7 +225,13 @@ def test_conversion_current_kv_default(
 
 
 @pytest.mark.parametrize(
-    "profile", ["baseline_int16_kv", "k4_v4_scaled", "k3qjl_v4_scaled"]
+    "profile",
+    [
+        "baseline_int16_kv",
+        "baseline_fp16_kv_fp16_attn",
+        "k4_v4_scaled",
+        "k3qjl_v4_scaled",
+    ],
 )
 def test_export_pipeline_current_kv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
@@ -238,7 +244,7 @@ def test_export_pipeline_current_kv(
     encodings = tmp_path / "input.encodings"
     onnx.save(model, source)
     encodings.write_text(json.dumps(enc))
-    enabled = profile != "baseline_int16_kv"
+    enabled = profile in ("k4_v4_scaled", "k3qjl_v4_scaled")
     args = Namespace(
         profile=profile,
         rotation=None,
@@ -252,6 +258,9 @@ def test_export_pipeline_current_kv(
         args, source, encodings, "output", 1, tmp_path
     )
     assert summary["quantize_current_kv"] == enabled
+    assert bool(summary["fp16_attention_heads"]) == (
+        profile == "baseline_fp16_kv_fp16_attn"
+    )
     exported = onnx.load(path)
     if enabled:
         exported = with_reference_decoder(exported)
