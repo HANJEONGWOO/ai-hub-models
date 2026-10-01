@@ -28,6 +28,70 @@ The D drive must be mounted; explicitly choosing another output directory still
 uses that directory. These directory links are machine-local, not Git-tracked
 export defaults, and need setting up separately on a different machine.
 
+## FP16 KV + FP16-input attention control (opt-in)
+
+`baseline_fp16_kv_fp16_attn` is a separate, uncompressed control. It does **not**
+replace `baseline_int16_kv`, change the default model, or change TurboQuant.
+Unlike the old int16-cache baseline's quantized attention-side KV boundary:
+
+- Past KV graph I/O and host storage are FP16, without affine cache encodings.
+- Current KV is rounded to the same FP16 cache output **before** attention,
+  in both AR128 prefill and AR1 decode. There is no raw-current bypass.
+- Both operands of QK and AV are FP16; no int8 conversion is allowed on the
+  cache read path. The HTP accumulation dtype is not claimed to be FP16.
+- W4A16 weights, parameter encodings and non-KV producer encodings are kept.
+  KV-specific 8-bit taps are regridded to 16-bit using the same calibrated range
+  as TurboQuant, then converted to FP16. Query, score, mask, softmax and final
+  attention-output calibrated boundaries are retained. This is **not** an
+  all-FP16 model or a recalibrated/retrained checkpoint.
+- No extra TurboQuant rotation, codec or QJL is added; original checkpoint
+  operations (including SpinQuant) remain. This control uses untiled attention;
+  TurboQuant still uses rotated tiled attention, so throughput/PPL differences
+  are not attributable solely to compression.
+
+Build explicitly from the existing 1.7B split, into a **new** directory:
+
+```bash
+TQ_FP16=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_fp16_attention_new
+TQ_SPLIT=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_w4a16_split
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src venv/bin/python \
+    scripts/llm/turboquant/convert_parts.py --split-dir "$TQ_SPLIT" \
+    --out "$TQ_FP16/bundle" --profile baseline_fp16_kv_fp16_attn \
+    --context-length 1024 --sequence-lengths 128 1
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src venv/bin/python \
+    scripts/llm/turboquant/verify_fp16_attention.py --bundle "$TQ_FP16/bundle" \
+    --split-dir "$TQ_SPLIT" --report "$TQ_FP16/reports/fp16_graph_audit.json"
+```
+
+The audit checks compiled DLC types and cache dependencies, not just ONNX
+`Cast` nodes. `--split-dir` additionally checks unchanged original weights and
+parameter encodings, and restricts activation edits to recorded KV taps.
+Separate part builds can be assembled using `assemble_native_bundle.py
+--fp16-attention`; its usual Native-package validation remains the default.
+
+`benchmark_fp16_attention_once.py` stages immutable historical int16/TurboQuant
+bundles through new symlink directories, plus the newly built FP16 control.
+All groups use **fixed C1024**, the same runner/tokenizer/RoPE/input assets,
+35+128 and 897+128 generation conditions (one session each), and four separate
+1024-token PPL windows (4092 scored tokens). No repeated timing attempts are
+overwritten; reset/EOS diagnostics are separate and EOS failures are labelled.
+This fixed-context experiment must not be mixed with historical bucketed
+short-prompt or PPL runs. Single-run timings have no variance estimate.
+
+```bash
+bash scripts/llm/turboquant/qnn_runner/build_android.sh "$TQ_FP16/runner"
+for stage in push functional performance quality summarize; do
+    OPENBLAS_NUM_THREADS=1 PYTHONPATH=src venv/bin/python \
+        scripts/llm/turboquant/benchmark_fp16_attention_once.py "$stage" \
+        --int16-bundle /mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_baseline_int16_kv_cl1024 \
+        --fp16-bundle "$TQ_FP16/bundle" \
+        --turboquant-bundle /mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_current_kv_native_20260922_final \
+        --assets /mnt/d/ai-hub-models/binaries/turboquant/device_assets_cl1024 \
+        --runner "$TQ_FP16/runner/qnn-llm-runner" \
+        --reports "$TQ_FP16/reports" --name qwen3_1_7b_fp16_attention_new || break
+done
+```
+
 ## Model selection: Qwen3-4B is opt-in
 
 `benchmark_model_once.py` supports `qwen3_1_7b` (the unchanged default),

@@ -1820,6 +1820,109 @@ VmHWM은 약 21.9 GiB였다. WSL 전체 swap 관측값은 시작 약 4.2 GiB에�
 약 4.9 GiB까지 증가했지만 이는 전체 빌드 peak를 정밀 측정한 값은 아니다.
 0.6B라도 전체 28 layers가 한 파트인 변환 단계에는 상당한 메모리가 필요하다.
 
-## 21. 출처
+## 21. FP16 KV + FP16 입력 QK·AV baseline (2026-09-29)
+
+새 opt-in 프로파일은 `baseline_fp16_kv_fp16_attn`이다. 기존 int16 baseline,
+Dense+Native K4/V4 기본값, QJL-off 정책과 과거 바이너리·측정 파일은 보존했다.
+이번에 새로 빌드한 모델은 **Qwen3-1.7B, CL1024, AR128/AR1**뿐이다.
+
+### 21.1 변경 범위와 정밀도
+
+- 과거 KV 입출력과 host cache를 **FP16**으로 저장한다. 현재 토큰/현재 prefill
+  chunk도 같은 FP16 cache output으로 반올림한 뒤 attention에서 읽는다.
+  원래 current KV를 우회해서 사용하는 경로는 없다.
+- QK와 AV의 **양쪽 입력을 FP16**으로 만든다. KV 읽기 경로의 int8 변환을
+  제거한다. 이는 하드웨어의 누산 정밀도까지 FP16이라고 주장하는 것은 아니다.
+- W4A16 checkpoint, 가중치, parameter encodings, 비-KV activation encodings는
+  그대로다. KV-specific 8-bit tap은 기존 TQ와 같은 16-bit regrid 정책을 쓰고
+  FP16으로 변환한다. query/score/mask/softmax/attention 최종 출력의 기존
+  calibrated boundary는 유지한다. **전체 FP16 모델이나 재보정/재학습한 모델이 아니다.**
+- 별도의 TQ rotation/codec/QJL 없이 untiled attention을 쓴다. 원본 checkpoint의
+  SpinQuant 연산은 유지한다. TQ는 기존 rotated tiled attention과 Native decoder를
+  그대로 쓰므로 두 구성의 차이를 압축 오차/비용 하나로만 설명할 수는 없다.
+
+구현은 `fp16_attention.py`, 변환 진입점은 `convert_parts.py --profile
+baseline_fp16_kv_fp16_attn`이다. `PackedKVStore`의 새 FP16 저장소도 2-byte raw
+array로 저장하며, 디버깅용 float 읽기는 저장된 FP16 값을 FP32로 확장한다.
+QNN runner는 이미 FP16 stream을 바이트 단위로 보존하므로 연산 코드를 바꾸지 않았다.
+
+### 21.2 검증과 측정 조건
+
+- 관련 테스트 **461개 통과** 및 수정 파일 정적 검사 통과.
+- 최종 DLC에서 28개 layer의 AR128/AR1 **QK·AV 1,792개** 입력이 모두 FP16임을
+  검사했다. FP16 KV I/O, 숨은 int8 읽기/쓰기 변환 부재, 저장한 current KV가
+  실제 QK/AV로 연결되는 것도 검사했다. 변환 전 ONNX Cast만 검사한 결과가 아니다.
+- 가중치 initializer/external-data 연결과 parameter encodings 보존, 허용된
+  KV tap 이외의 남아 있는 activation encodings 보존을 검사했다.
+- 세 구성 모두 동일 기기(S26 Ultra / SM8850), SDK 2.48.0.260626, 새로 빌드한
+  동일 runner, 동일 tokenizer/RoPE/입력 파일을 사용했다. 기존 int16/TQ는
+  바이너리를 재사용하되 **측정은 모두 새로** 했다. 입력·바이너리·runner·audit
+  해시는 `experiment.json`에 고정했다.
+- 실행 graph context는 **세 구성의 prefill/decode 모두 C1024 고정**이다.
+  TQ 바이너리 자체에는 과거 C128/256/512 그래프가 남아 있지만 선택하지 않는다.
+  따라서 과거 bucketed short/prefill 결과와 섞지 않으며, 남아 있는 그래프의
+  로딩/메모리 비용도 cache 자체의 비용과 구분해야 한다.
+- 성능은 구성별/입력 조건별 **각 1회**, 생성 128개 중 decode 127 step을 집계했다.
+  모델 로딩은 TTFT에서 제외했다. 별도의 반복 측정/분산 추정/온도 통제는 없다.
+  reset(독립 세션 2개)·EOS 검사는 별도이며 세 구성 모두 통과했다.
+- 실기기 FP16 cache는 K/V 56개 stream 모두 `float16`, **112 MiB**였다.
+  긴 입력 종료 시 세 구성 모두 cache가 1024 tokens에 도달했다.
+- PPL은 같은 WikiText 1024-token window 4개, 총 **4092 scored tokens**의
+  NLL 합으로 계산했다. window마다 1회 평가이며 생성 성능 세션과 별개다.
+
+### 21.3 결과
+
+긴 입력: **897 prompt + 128 generated tokens**, 고정 C1024.
+
+| 지표 | 기존 int16 KV | 새 FP16 KV + FP16 QK·AV | 기존 Dense+Native K4/V4 |
+|---|---:|---:|---:|
+| TTFT (ms) | 317.324 | 343.323 | 597.614 |
+| prefill (tok/s) | 2829.085 | 2614.118 | 1503.445 |
+| decode (tok/s) | 34.840 | 37.033 | 37.928 |
+| host KV (MiB) | 112.000 | 112.000 | 28.875 |
+| 종료 VmRSS (MiB) | 391.277 | 392.148 | 164.359 |
+| process VmHWM (MiB) | 604.746 | 604.914 | 604.875 |
+| PPL (별도 4 window) | 20.108306 | 20.123237 | 25.660831 |
+
+짧은 입력도 **35 prompt + 128 generated tokens**, 고정 C1024로 각 1회 측정했다.
+
+| 지표 | 기존 int16 KV | 새 FP16 KV + FP16 QK·AV | 기존 Dense+Native K4/V4 |
+|---|---:|---:|---:|
+| TTFT (ms) | 40.049 | 48.875 | 70.548 |
+| prefill (tok/s) | 877.948 | 719.454 | 499.012 |
+| decode (tok/s) | 35.012 | 37.726 | 38.870 |
+
+FP16 baseline의 긴 입력 decode는 이번 단회에서 기존 int16 대비 **+6.30%**,
+PPL은 **+0.0743%**였다. FP16 경로를 만드는 작업이지 PPL 개선을 보장하는
+작업은 아니다. 특히 W4A16과 기존 calibrated 비-KV boundary는 그대로다.
+
+현재 TQ는 새 FP16 baseline보다 host KV **74.22% 절감**, decode **+2.42%**,
+PPL **+27.52%**였다. 작은 decode 차이를 통계적 성능 우세로 단정할 수 없으며,
+prefill 지연과 품질 손실은 여전히 남는다. VmRSS는 runner 프로세스의 resident
+memory이고 NPU 전체 메모리는 아니다. 종료 RSS 절감과 로딩을 포함한 peak
+VmHWM도 구분해야 한다. 기존 TQ encoder의 0.2% 수치 gate 미통과 제한은
+이번 FP16 baseline 작업으로 해결한 것이 아니다.
+
+### 21.4 재현 및 산출물
+
+실험 루트:
+`/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_fp16_attention_20260929/`.
+
+- `bundle/`: 새 FP16 baseline의 4개 context binary와 변환 산출물 링크.
+- `part12/`, `part34/`: 분리 빌드 원본. 충분한 현재 RAM에서 두 빌드만 병행했다.
+- `probe/`: 처음 정밀도를 확인한 part 2 / AR1 변환; 성능 측정에는 사용하지 않았다.
+- `runner/`: 세 구성에서 공통 사용한 runner binary.
+- `reports/summary.json`: short/long/PPL 통합 비교.
+- `reports/fp16_graph_audit.json`: 최종 전체 layer/precision/source 보존 검사.
+- `reports/experiment.json`: 고정 입력/바이너리/runner/audit 해시.
+- `reports/functional.json`, `*_reset.json`, `*_eos.json`: 기능 검사 원본.
+- `reports/{int16,fp16,turboquant}_{short,long}_once.json`: 성능 원본.
+- `reports/{int16,fp16,turboquant}_score_w{0,1,2,3}.json`: 품질 원본.
+- `reports/staging/`: 과거 bundle에 쓰기를 하지 않기 위한 별도 staging 링크.
+
+재현 명령은 `scripts/llm/turboquant/README.md`의 FP16 control 절에 있다.
+새 측정은 새 실험 디렉터리와 기기 bundle 이름을 사용한다.
+
+## 22. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

@@ -36,9 +36,11 @@ VALUE_SEED = 542
 class CodecKind(Enum):
     # The repo's existing KV path (int8 affine on device). The codec leaves it untouched.
     BASELINE = "baseline"
-    # Cache and graph I/O keep the 16-bit integer grid of the K/V producers
-    # (no conversion, no codec). Uncompressed comparison group.
+    # Uncompressed cache with a shared 16-bit affine grid per layer/KV kind.
+    # Head-grid conversion and the legacy int8 attention boundary can remain.
     INT16 = "int16"
+    # Uncompressed FP16 cache, including current KV, and FP16 QK/AV inputs.
+    FP16 = "fp16"
     POLAR = "polar"
 
 
@@ -52,7 +54,7 @@ class Rotation(Enum):
 class KVCodecSpec:
     """How one of K or V is stored.
 
-    INT16 and POLAR read the value before the KV-specific int8 encodings of
+    INT16, FP16 and POLAR read before the KV-specific int8 encodings of
     an exported w4a16 part (see ``graph_surgery``); BASELINE keeps that path.
     """
 
@@ -78,6 +80,10 @@ class KVCodecSpec:
         return self.kind == CodecKind.INT16
 
     @property
+    def is_fp16(self) -> bool:
+        return self.kind == CodecKind.FP16
+
+    @property
     def modifies_graph(self) -> bool:
         return self.kind != CodecKind.BASELINE
 
@@ -87,6 +93,7 @@ class KVCodecSpec:
 
 BASELINE = KVCodecSpec(CodecKind.BASELINE)
 INT16 = KVCodecSpec(CodecKind.INT16)
+FP16 = KVCodecSpec(CodecKind.FP16)
 
 
 @dataclass(frozen=True)
@@ -107,6 +114,12 @@ class TurboQuantConfig:
     reference_commit: str = field(default=REFERENCE_COMMIT)
 
     def __post_init__(self) -> None:
+        if any(s.is_fp16 for s in self.codecs) and not all(
+            s.is_fp16 for s in self.codecs
+        ):
+            raise ValueError(
+                "FP16 attention requires both K and V to use FP16 storage."
+            )
         if self.norm_dtype not in ("float16", "float32"):
             raise ValueError(f"Unsupported norm dtype {self.norm_dtype}.")
         if self.bit_order != "msb_first":
@@ -155,6 +168,10 @@ class TurboQuantConfig:
         return self.key.is_polar or self.value.is_polar
 
     @property
+    def fp16_attention(self) -> bool:
+        return self.key.is_fp16 and self.value.is_fp16
+
+    @property
     def modifies_graph(self) -> bool:
         """True when the exported part needs surgery (codec or float16 KV)."""
         return self.key.modifies_graph or self.value.modifies_graph
@@ -195,6 +212,14 @@ class TurboQuantConfig:
         }
         if self.precomputed_norm:
             data["norm_representation"] = "effective_scale"
+        if self.fp16_attention:
+            data["attention"] = {
+                "kv_storage": "float16",
+                "qk_av_inputs": "float16",
+                "current_kv": "read_stored_fp16",
+                "rotation": "none",
+                "recalibrated": False,
+            }
         if self.qjl:
             from qai_hub_models.models.templates.llm.turboquant.qjl import projection
 
@@ -257,6 +282,9 @@ PROFILES: dict[str, TurboQuantConfig] = {
     ),
     "baseline_int16_kv": TurboQuantConfig(
         "baseline_int16_kv", INT16, INT16, rotation=Rotation.FWHT
+    ),
+    "baseline_fp16_kv_fp16_attn": TurboQuantConfig(
+        "baseline_fp16_kv_fp16_attn", FP16, FP16
     ),
     "k4_v4": TurboQuantConfig("k4_v4", _polar(4, KEY_SEED), _polar(4, VALUE_SEED)),
     "k4_v4_scaled": TurboQuantConfig(
