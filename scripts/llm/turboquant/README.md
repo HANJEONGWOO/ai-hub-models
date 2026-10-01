@@ -92,6 +92,141 @@ for stage in push functional performance quality summarize; do
 done
 ```
 
+## FP16 activation recalibration (separate opt-in experiment)
+
+`baseline_fp16_kv_fp16_attn_calibrated` has the same FP16 cache/current-KV and
+FP16-input QK/AV graph as the original FP16 control. Only the ranges of its
+existing integer activation boundaries are recalibrated. Original ONNX/external
+weights, parameter encodings, SpinQuant, activation bitwidth/symmetry policies,
+and all existing defaults remain unchanged. This is not weight training/QAT or
+an all-FP16 model. No TurboQuant or larger-model build is part of this workflow.
+
+Parameter-derived split interfaces are constrained: a Gather output uses its
+frozen embedding-table grid, so the consuming `embedding` activation retains
+that same grid. Independently recalibrating it would break raw-buffer sharing
+between parts. Other observed activation grids remain eligible for calibration.
+The final audit checks matching shared I/O shapes, dtypes and grids as well as
+the FP16 attention path. The runner is not changed to hide interface mismatches.
+
+Calibration uses **WikiText-2 raw train**, seed 42, 128 non-overlapping sampled
+1024-token windows, and the existing training-data separator/tokenizer policy.
+Each window has eight AR128 prefill calls (the last has 127 valid tokens) and
+eight AR1 calls with valid cache lengths 128, 256, ..., 896, 1023. Intermediate
+AR1 probes do not commit KV; the next prefill includes that same next token.
+The last AR1 call commits token 1023. No test tokens or PPL labels are used.
+
+Parts are processed sequentially, with disk-backed boundary hidden states, to
+reproduce conventional **global pass-through activation min/max calibration**:
+weight QDQ and explicit FP16 rounding remain active while integer activation
+observers pass values through. Statistics cover the complete dataset in every
+part; internal activations are not accumulated across steps. This avoids a
+second full-dataset quantized replay. Final encodings are evaluated end-to-end
+on the device. This is not represented as bit-exact HTP simulation. CUDA TF32
+is disabled; hardware accumulation precision and bit-exact agreement with HTP
+are not claimed.
+
+`--native-observers` collects the same min/max statistic using ONNX GPU
+reductions and computes the integer grids with AIMET. Only simulation copies of
+frozen weight QDQ are folded to reduce runtime overhead; exported/source weights
+are not changed. Opaque disabled FP16 barriers preserve intermediate half
+rounding, including ONNX Runtime's CPU FP16 promotion behavior.
+
+The calibration path is validated with AIMET ONNX 2.34.0, ONNX 1.18.0 and
+ONNX Runtime GPU 1.23.2. It uses AIMET's internal constraint/fusion controls to
+preserve the checkpoint's boundaries; rerun the calibration tests when changing
+these dependencies. Each part records tool versions and implementation hashes.
+
+```bash
+TQ_CAL=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_fp16_calibration_new
+TQ_SPLIT=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_w4a16_split
+TQ_CHECKPOINT=/home/hjw/.qaihm/qai-hub-models/models/qwen3_1_7b/v2/qwen3_1_7b_w4a16
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src venv/bin/python \
+    scripts/llm/turboquant/calibrate_fp16_attention.py prepare \
+    --out "$TQ_CAL/calibration" --split-dir "$TQ_SPLIT" \
+    --checkpoint "$TQ_CHECKPOINT" --samples 128 --seed 42
+for part in 1 2 3 4; do
+    OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4 PYTHONPATH=src venv/bin/python \
+        scripts/llm/turboquant/calibrate_fp16_attention.py calibrate \
+        --out "$TQ_CAL/calibration" --part "$part" --native-observers || break
+done
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src venv/bin/python \
+    scripts/llm/turboquant/calibrate_fp16_attention.py finalize \
+    --out "$TQ_CAL/calibration"
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src venv/bin/python \
+    scripts/llm/turboquant/convert_parts.py --split-dir "$TQ_SPLIT" \
+    --out "$TQ_CAL/bundle" --profile baseline_fp16_kv_fp16_attn_calibrated \
+    --activation-calibration-dir "$TQ_CAL/calibration" \
+    --context-length 1024 --sequence-lengths 128 1
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src venv/bin/python \
+    scripts/llm/turboquant/verify_fp16_attention.py --bundle "$TQ_CAL/bundle" \
+    --split-dir "$TQ_SPLIT" --report "$TQ_CAL/reports/fp16_graph_audit.json"
+```
+
+Stop if any stage fails. The converter rejects missing/incomplete calibration,
+source weight/encoding hash changes, changed integer policies, and mixed bundle
+metadata. `--probe` is a tool-compatibility check, not a completed calibration.
+Existing attempt directories are never silently overwritten.
+
+On hosts with sufficient RAM, `convert_parts.py --parts 1 2` and `--parts 3 4`
+can build into separate directories. Combine the finalized results with
+`assemble_native_bundle.py --fp16-attention --base PART12 --parts PART34 --out BUNDLE`.
+Both builds must use the same calibrated profile and calibration manifest hash;
+the assembler rejects missing or mixed calibration identities. Audit the combined
+bundle before deployment. Sequential conversion above remains the lower-memory
+option.
+
+For a train-only range-change report after finalization (without tuning on PPL):
+
+```bash
+OPENBLAS_NUM_THREADS=1 PYTHONPATH=src venv/bin/python \
+    scripts/llm/turboquant/analyze_fp16_calibration.py \
+    --calibration "$TQ_CAL/calibration" \
+    --report "$TQ_CAL/reports/calibration_analysis.json"
+```
+
+The report compares observed extrema and old/new integer grid ranges, including
+QK-score and AV-output boundaries. Its coverage counts are **boundary counts**,
+not the fraction of activation values clipped.
+
+`constrain-interfaces --from-calibration OLD --out NEW` on
+`calibrate_fp16_attention.py` can derive a separate deployment artifact from
+already completed observations made before this interface constraint was added.
+It retains the parent manifest identity and links the same observed ranges and
+train inputs; it does not rerun calibration or tune on test PPL. Rebuild against
+the new manifest and use a new bundle/report directory.
+
+`benchmark_fp16_calibration_once.py` supports `push`, `functional`,
+`performance`, `quality`, and `summarize`. Provide `--bundle`, `--reports`,
+`--assets`, `--runner`, and `--baseline-reports`. The historical FP16 report
+directory must contain the prior experiment and summary; runner, input assets,
+fixed C1024 policy, device and historical binary identities are checked before
+reuse. The new model is measured once for 35+128 and 897+128 generation, plus
+the same four held-out WikiText test windows. Reset/EOS runs are separate, and
+EOS-failed results are labelled diagnostic. Times from different dates are not
+paired trials or statistical evidence of a speedup.
+
+```bash
+TQ_PREVIOUS=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_fp16_attention_20260929
+for stage in push functional performance quality summarize; do
+    OPENBLAS_NUM_THREADS=1 PYTHONPATH=src venv/bin/python \
+        scripts/llm/turboquant/benchmark_fp16_calibration_once.py "$stage" \
+        --bundle "$TQ_CAL/bundle" --reports "$TQ_CAL/reports" \
+        --baseline-reports "$TQ_PREVIOUS/reports" \
+        --runner "$TQ_PREVIOUS/runner/qnn-llm-runner" \
+        --assets /mnt/d/ai-hub-models/binaries/turboquant/device_assets_cl1024 \
+        --name qwen3_1_7b_fp16_calibration_new || break
+done
+```
+
+The completed 2026-09-29 FP16 recalibration experiment is documented in
+`tutorials/llm/turboquant_design.md` §22. Final artifacts are under
+`/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_fp16_calibration_20260929/fixed_interfaces/`.
+The earlier sibling bundle was rejected before inference for an embedding-grid
+mismatch and is not a benchmark result. Final four-window PPL was 20.104589
+versus the reused FP16 control's 20.123237; long decode was 36.084 versus
+37.033 tok/s. The small quality change and single-run timings do not establish
+a clear advantage. Existing defaults remain unchanged.
+
 ## Model selection: Qwen3-4B is opt-in
 
 `benchmark_model_once.py` supports `qwen3_1_7b` (the unchanged default),

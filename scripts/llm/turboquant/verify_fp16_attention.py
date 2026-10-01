@@ -15,6 +15,18 @@ from typing import Any
 import onnx
 from verify_kv_boundary import INT8_TYPES, PASS_THROUGH, parse_dlcinfo
 
+from qai_hub_models.models.templates.llm.turboquant.calibration import (
+    digest,
+    load_calibrated,
+)
+from qai_hub_models.models.templates.llm.turboquant.config import get_profile
+from qai_hub_models.models.templates.llm.turboquant.fp16_attention import (
+    use_fp16_kv_attention,
+)
+from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
+    apply_kv_profile,
+)
+
 
 def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
     manifest = json.loads((bundle / f"{name}.kv_edits.json").read_text())
@@ -164,7 +176,9 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
     }
 
 
-def verify_source(bundle: Path, name: str, original: Path) -> dict[str, Any]:
+def verify_source(
+    bundle: Path, name: str, original: Path, calibration: Path | None = None
+) -> dict[str, Any]:
     """Ensure graph surgery did not change weights or unrelated live encodings."""
     before = onnx.load(original, load_external_data=False)
     after = onnx.load(bundle / f"{name}.onnx", load_external_data=False)
@@ -198,6 +212,16 @@ def verify_source(bundle: Path, name: str, original: Path) -> dict[str, Any]:
         if e["action"] == "regrid"
     }
     acts = {e["name"]: e for e in enc_before["activation_encodings"]}
+    if calibration is not None:
+        config = get_profile("baseline_fp16_kv_fp16_attn_calibrated")
+        result = use_fp16_kv_attention(
+            apply_kv_profile(before, enc_before, config, 1, 1024), config
+        )
+        calibrated, _ = load_calibrated(calibration, original, result.encodings)
+        acts = {e["name"]: e for e in calibrated["activation_encodings"]}
+        allowed = {}
+        if enc_after != calibrated:
+            changed.append("Bundle encodings differ from verified calibration artifact")
     for enc in enc_after["activation_encodings"]:
         if enc != allowed.get(enc["name"], acts.get(enc["name"])):
             changed.append(f"Changed unrelated activation encoding: {enc['name']}")
@@ -210,6 +234,37 @@ def verify_source(bundle: Path, name: str, original: Path) -> dict[str, Any]:
     }
 
 
+def verify_shared_interfaces(bundle: Path, conversion: dict) -> dict:
+    """Check raw-buffer compatibility across split graph inputs and outputs."""
+    seen: dict[str, dict] = {}
+    repeated = set()
+    errors = []
+    for part in conversion["parts"].values():
+        for name in part["graphs"]:
+            match = re.fullmatch(r"(.+)_\d+_of_\d+", name)
+            if match is None:
+                raise ValueError(f"Unrecognized split graph name: {name}")
+            group = match.group(1)
+            tensors = seen.setdefault(group, {})
+            info = parse_dlcinfo(bundle / f"{name}.dlcinfo.txt")
+            for side in ("input", "output"):
+                for tensor, row in info.io_tables[side].items():
+                    signature = {k: row[k] for k in ("dims", "dtype", "encoding")}
+                    if tensor in tensors:
+                        repeated.add((group, tensor))
+                        if tensors[tensor] != signature:
+                            errors.append(
+                                f"Shared interface mismatch: {group}/{tensor}"
+                            )
+                    else:
+                        tensors[tensor] = signature
+    return {
+        "graph_sets": len(seen),
+        "shared_tensors_checked": len(repeated),
+        "violations": sorted(set(errors)),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, required=True)
@@ -219,9 +274,28 @@ def main() -> None:
     )
     args = parser.parse_args()
     conversion = json.loads((args.bundle / "convert_report.json").read_text())
-    if conversion["profile"] != "baseline_fp16_kv_fp16_attn":
+    if conversion["profile"] not in (
+        "baseline_fp16_kv_fp16_attn",
+        "baseline_fp16_kv_fp16_attn_calibrated",
+    ):
         raise ValueError("Not an FP16 attention baseline bundle")
+    calibration = (
+        Path(conversion["activation_calibration_dir"])
+        if conversion.get("activation_calibration_dir")
+        else None
+    )
+    if get_profile(conversion["profile"]).activation_calibrated != bool(calibration):
+        raise ValueError("Calibration metadata/profile mismatch")
+    if calibration and not args.split_dir:
+        raise ValueError(
+            "Calibrated audit requires --split-dir to verify fixed weights"
+        )
     graphs = {}
+    if calibration and digest(
+        calibration / "calibration_manifest.json"
+    ) != conversion.get("activation_calibration_sha256"):
+        raise ValueError("Conversion/calibration artifact identity mismatch")
+    passthrough = {}
     split = (
         json.loads((args.split_dir / "split_manifest.json").read_text())
         if args.split_dir
@@ -237,14 +311,31 @@ def main() -> None:
                         args.bundle,
                         name,
                         Path(original["bundle_dir"]) / (original["class"] + ".onnx"),
+                        calibration,
                     )
                     graphs[name]["source_preservation"] = check
                     graphs[name]["violations"].extend(check["violations"])
+            elif calibration and split:
+                original = split["parts"][part_name]
+                source = Path(original["bundle_dir"]) / (original["class"] + ".onnx")
+                before = json.loads(source.with_suffix(".encodings").read_text())
+                calibrated, check = load_calibrated(calibration, source, before)
+                actual = json.loads((args.bundle / f"{name}.encodings").read_text())
+                if actual != calibrated:
+                    raise ValueError(
+                        "Non-attention part differs from calibration artifact"
+                    )
+                passthrough[name] = check
+    shared = verify_shared_interfaces(args.bundle, conversion)
     report = {
         "bundle": str(args.bundle.resolve()),
         "config_hash": conversion["config_hash"],
         "graphs": graphs,
-        "passed": bool(graphs) and not any(g["violations"] for g in graphs.values()),
+        "calibration_passthrough": passthrough,
+        "shared_interfaces": shared,
+        "passed": bool(graphs)
+        and not shared["violations"]
+        and not any(g["violations"] for g in graphs.values()),
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n")

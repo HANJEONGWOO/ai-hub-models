@@ -33,6 +33,10 @@ from typing import Any
 import onnx
 from model_identity import sha256_file
 
+from qai_hub_models.models.templates.llm.turboquant.calibration import (
+    digest,
+    load_calibrated,
+)
 from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_profile
 from qai_hub_models.models.templates.llm.turboquant.current_attention import (
     quantize_current_attention,
@@ -126,15 +130,32 @@ def apply_profile(
         args.profile, Rotation(args.rotation) if args.rotation else None
     )
     model = onnx.load(str(onnx_path), load_external_data=False)
+    calibration = getattr(args, "activation_calibration_dir", None)
+    if config.activation_calibrated != bool(calibration):
+        raise ValueError(
+            "Calibrated profile requires --activation-calibration-dir; other profiles reject it"
+        )
     if not config.modifies_graph or not any(
         i.name.startswith("past_") for i in model.graph.input
     ):
+        if calibration:
+            calibrated, change = load_calibrated(
+                calibration, onnx_path, json.loads(encodings.read_text())
+            )
+            new_encodings = out / f"{name}.encodings"
+            new_encodings.write_text(json.dumps(calibrated))
+            return onnx_path, new_encodings, {"activation_calibration": change}
         return onnx_path, encodings, {}
     result = apply_kv_profile(
         model, json.loads(encodings.read_text()), config, seq_len, args.context_length
     )
     if config.fp16_attention:
         result = use_fp16_kv_attention(result, config)
+    calibration_report = None
+    if calibration:
+        result.encodings, calibration_report = load_calibrated(
+            calibration, onnx_path, result.encodings
+        )
     if args.attention_tile:
         result = tile_kv_attention(
             result, config, args.attention_tile, rotated=args.rotated_attention
@@ -169,6 +190,8 @@ def apply_profile(
         "quantize_current_kv": bool(result.current_kv_attention),
         "fp16_attention_heads": len(result.fp16_attention),
     }
+    if calibration_report is not None:
+        summary["activation_calibration"] = calibration_report
     return new_onnx, new_encodings, summary
 
 
@@ -187,10 +210,7 @@ def convert_graph(
     graph = onnx.load(str(onnx_path), load_external_data=False).graph
     shape_args: list[str] = []
     for value in graph.input:
-        dims = [
-            d.dim_param if d.dim_param else d.dim_value
-            for d in value.type.tensor_type.shape.dim
-        ]
+        dims = [d.dim_param or d.dim_value for d in value.type.tensor_type.shape.dim]
         shape = input_shape(value.name, dims, seq_len, args.context_length)
         shape_args += [
             "--source_model_input_shape",
@@ -342,6 +362,11 @@ def main() -> None:
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--profile", default="baseline_int8")
     parser.add_argument(
+        "--activation-calibration-dir",
+        type=Path,
+        help="Complete FP16 activation calibration artifact; calibrated profile only",
+    )
+    parser.add_argument(
         "--rotation",
         choices=[r.value for r in Rotation],
         help="PolarQuant rotation (default: dense_qr); fwht reproduces old bundles.",
@@ -395,6 +420,16 @@ def main() -> None:
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     args = parser.parse_args()
+    if get_profile(args.profile).activation_calibrated != bool(
+        args.activation_calibration_dir
+    ):
+        parser.error(
+            "Use calibrated FP16 profile and --activation-calibration-dir together"
+        )
+    if args.activation_calibration_dir:
+        args.activation_calibration_dir = (
+            args.activation_calibration_dir.expanduser().resolve()
+        )
     scaled = args.profile in ("k4_v4_scaled", "k3qjl_v4_scaled")
     if args.native_decoder is None:
         args.native_decoder = scaled
@@ -478,6 +513,10 @@ def main() -> None:
             "native_decoder": native_manifest,
             "quantize_current_kv": current_kv,
         }
+        if args.activation_calibration_dir:
+            expected["activation_calibration_sha256"] = digest(
+                args.activation_calibration_dir / "calibration_manifest.json"
+            )
         if "model" in manifest:
             expected["model"] = manifest["model"]
             expected["split_manifest_sha256"] = sha256_file(
@@ -511,6 +550,19 @@ def main() -> None:
         }
     )
     report.setdefault("parts", {})
+    if args.activation_calibration_dir:
+        calibration_manifest = (
+            args.activation_calibration_dir / "calibration_manifest.json"
+        )
+        calibration_metadata = json.loads(calibration_manifest.read_text())
+        if (
+            calibration_metadata.get("status") != "complete"
+            or calibration_metadata.get("context_length") != args.context_length
+            or buckets != [args.context_length]
+        ):
+            raise ValueError("Incomplete calibration or context mismatch")
+        report["activation_calibration_sha256"] = digest(calibration_manifest)
+        report["activation_calibration_dir"] = str(args.activation_calibration_dir)
     if "model" in manifest:
         report["model"] = manifest["model"]
         report["split_manifest_sha256"] = sha256_file(split_dir / "split_manifest.json")

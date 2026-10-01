@@ -1923,6 +1923,184 @@ VmHWM도 구분해야 한다. 기존 TQ encoder의 0.2% 수치 gate 미통과 �
 재현 명령은 `scripts/llm/turboquant/README.md`의 FP16 control 절에 있다.
 새 측정은 새 실험 디렉터리와 기기 bundle 이름을 사용한다.
 
-## 22. 출처
+## 22. FP16 attention 경로의 activation 재보정 (2026-09-29)
+
+### 22.1 변경 범위
+
+별도 opt-in 프로파일 `baseline_fp16_kv_fp16_attn_calibrated`를 추가했다.
+§21의 FP16 KV 저장/current-KV 재사용/FP16 입력 QK·AV 그래프에 대해,
+**기존 정수 activation 경계의 scale·offset만 재보정**한다. 가중치 값,
+parameter encodings, SpinQuant, activation bitwidth·대칭성·경계 위치는
+바꾸지 않는다. FP16 tensor에 정수 quantizer를 다시 붙이지 않는다.
+재학습/QAT/AdaScale가 아니며 전체 모델을 FP16으로 만드는 작업도 아니다.
+기존 프로파일 hash와 기본값, 원본 checkpoint 및 과거 산출물은 보존한다.
+
+보정은 FP16 그래프를 만든 **이후** 실행한다. 원래 INT8 KV 그래프를 보정한 뒤
+attention만 FP16으로 바꾸는 순서가 아니다. 빌드 시에는 보정 완료 manifest,
+원본 ONNX·external weights·encodings hash, 보정 파일 hash 및 정수 정책을
+검사한다. 보정 manifest hash를 변환 메타데이터와 실기기 보고서에도 전달한다.
+같은 프로파일 이름이어도 다른 보정 산출물과 측정 결과를 혼용하지 않도록 한다.
+
+### 22.2 데이터와 관측 방법
+
+- Qwen3-1.7B, CL1024만 대상으로 한다. TurboQuant 및 0.6B/4B 모델은
+  이번 작업에서 다시 빌드하거나 측정하지 않는다.
+- WikiText-2 raw **train**을 기존 tokenizer/학습 데이터 연결 정책으로
+  토큰화한다. Seed 42로 겹치지 않는 1024-token window 128개를 고정하고
+  선택 인덱스·원본 데이터·입력 토큰·tokenizer hash를 남긴다.
+  PPL test window는 보정 및 범위 선택에 사용하지 않는다.
+- Window마다 AR128 prefill 8회(마지막은 유효 127개)와 AR1 decode probe
+  8회를 사용한다. Decode의 유효 과거 길이는 128, 256, …, 896, 1023이다.
+  중간 decode probe는 cache에 commit하지 않아 다음 prefill과 같은 prefix를
+  유지한다. 마지막 decode가 1024번째 토큰을 commit한다.
+- **Global pass-through min/max calibration**을 수행한다. 정수 activation
+  observer는 값을 그대로 통과시키고, 고정된 가중치 QDQ와 명시적 FP16
+  cache/attention 반올림은 유지한다. 분할 경계의 hidden state만 디스크에
+  저장해 다음 분할로 전달한다. 모든 내부 activation을 쌓아 두지는 않는다.
+- `--native-observers`는 GPU ReduceMin/ReduceMax로 각 정수 경계의 극값을
+  모으고, AIMET으로 scale·offset을 계산한다. 수천 개 observer마다 host와
+  동기화하는 비용을 줄인다. 이는 **보정용 최적화**로, 기기 측 TQ Native
+  LUT decoder와는 별개다.
+- 관측 그래프에서 가중치 QDQ folding은 simulation copy에만 적용한다.
+  folding되지 않는 RMSNorm/Mul 가중치의 고정 QDQ는 그대로 유지한다.
+  FP16 입출력의 비활성 opaque barrier도 남겨 ORT의 CPU FP16 승격 과정에서
+  중간 half 반올림이 사라지지 않도록 한다. 원본/export 가중치는 바꾸지 않는다.
+- CUDA TF32를 끈다. 이 host simulation이 HTP와 bit-exact하거나, 하드웨어
+  누산 정밀도까지 FP16이라는 주장은 하지 않는다. 최종 품질은 compiled
+  graph 검사와 실기기 평가로 확인한다.
+
+`analyze_fp16_calibration.py`는 train 관측 범위와 이전/새 quantization grid를
+비교한다. 범위를 벗어나는 값이 관측된 **경계 개수**를 보고하며, 전체
+activation 중 실제 clipping된 값의 비율을 측정한 것으로 해석하면 안 된다.
+
+정식 관측은 모든 분할에서 128 windows × 16 calls를 완료했고 NaN·Inf가
+없었다. 정수 경계 11,802개 중 최종 배포 산출물에서는 11,316개의
+scale·offset이 갱신됐다(아래 embedding 경계 제약 적용).
+가중치와 parameter encodings는 전부 보존됐다. 관측 실행 시간은 embedding
+14.1초, 첫 10 layers 1,121.8초, 다음 10 layers 1,145.9초, 마지막 8 layers와
+출력 head 954.4초였다. 이 합은 그래프 준비·hash 검증·빌드 시간을 제외한다.
+
+| 범위 분석 대상 | 경계 수 | 기존 범위 밖 관측 경계 | 새 범위 밖 관측 경계 | 새/기존 scale 중앙값 |
+|---|---:|---:|---:|---:|
+| 전체 정수 activation | 11,802 | 3,572 | 0 | 0.9463 |
+| QK score 출력(전체의 부분집합) | 448 | 41 | 0 | 0.8689 |
+| AV 출력(전체의 부분집합) | 448 | 23 | 0 | 0.6086 |
+
+새 범위가 train 관측 극값을 포함하는 것은 min/max 보정의 결과이며, 실제
+양자화 실행의 clipping 비율이나 held-out 품질 개선을 입증하지 않는다.
+동일 bitwidth에서 scale은 quantization step 크기다. 범위 폭·중심 변화와
+PPL 변화는 구분해서 해석한다.
+
+초기 실기기 reset 검사는 추론 시작 전 `tensor embedding differs between
+parts`로 차단됐다. Embedding 분할은 Gather 하나이며 출력 grid를 고정된
+embedding weight의 parameter encoding에서 상속한다. 입력 쪽 `embedding`
+activation만 train 부분집합으로 독립 재보정하면 이 grid와 달라진다.
+나머지 분할 간 hidden-state 및 mask/RoPE grid는 일치했다.
+
+따라서 parameter-derived Gather 인터페이스를 찾아 소비자 activation도
+원래 grid를 유지하도록 제약했다. Runner에 재양자화를 추가하거나 가중치
+encoding을 변경하지 않았다. 기존 128개 train 관측/통계에서 새 manifest를
+파생하고 별도 경로에서 재빌드했다. 변경 대상은 embedding 입력 경계 하나이며,
+보정 데이터 재관측·test PPL 튜닝은 없다. 이 제약은 새 `prepare`/`calibrate`
+워크플로에도 기본 적용된다. 최종 정적 검사에는 분할 간 동일 이름 I/O의
+shape·dtype·grid 일치 검사도 추가했다. 최초 실패 시 성능/PPL 측정은
+실행되지 않았고, 실패 로그와 최초 바이너리는 보존했다.
+
+### 22.3 비교 조건과 재현
+
+관련 회귀 테스트 484개와 수정 Python 파일의 정적 검사를 통과했다. 최종 DLC의
+28 layers × AR128/AR1에 있는 QK·AV 1,792개에서 FP16 입력, FP16 cache I/O,
+stored current-KV 재사용과 숨은 int8 cache 변환 부재를 검사했다. 원본
+initializer/parameter encodings 보존 및 실제 변환 encodings와 보정 산출물의
+일치도 통과했다. Activation 보정 대상이 없는 embedding 분할의 context
+binary는 이전 FP16 결과와 SHA-256까지 같았다.
+
+이전 §21 FP16 결과를 재사용하고 새 보정 모델만 측정한다. 이전 runner,
+입력 파일, 기기, C1024 고정 정책과 바이너리 identity를 검사한다.
+짧은 입력 35+128 및 긴 입력 897+128은 각각 1회, 품질 평가는 동일한
+WikiText test 4 windows/4092 scored tokens다. Reset/EOS 검사는 별도다.
+서로 다른 시점의 단회 측정이므로 작은 속도 차이는 통계적 우세가 아니다.
+보정 후 PPL이 나빠져도 test 결과에 맞춰 범위를 다시 조정하지 않는다.
+
+실험 루트는 다음과 같다.
+`/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_fp16_calibration_20260929/`.
+
+- `calibration_global/`: 정식 train 입력과 원 관측 통계, 제약 적용 전
+  encodings, hidden-state 중간 파일 및 완료 manifest.
+- `calibration/`: 초기 도구 호환성/성능 확인 산출물. 중단된 관측 및 실패한
+  probe는 `attempt_status.json`으로 구분하며 정식 보정으로 사용하지 않는다.
+- `bundle/`, `part12/`, `part34/`, `reports/`: embedding 인터페이스 불일치로
+  추론 전 차단된 최초 빌드와 기록. `reports/failure_notes.json`으로 구분한다.
+- `fixed_interfaces/calibration/`: 동일 관측에서 파생한 최종 제약 적용
+  encodings와 manifest. 원 관측의 hash/provenance를 기록한다.
+- `fixed_interfaces/{part12,part34,bundle}/`: 최종 제약 적용 바이너리.
+  두 묶음의 빌드를 조립할 때 같은 보정 manifest hash인지 검사한다.
+- `fixed_interfaces/reports/`: 최종 compiled graph/shared-interface audit,
+  범위 분석, 기능 검사, 단회 성능/PPL 원본 및 통합 비교.
+
+실행 명령과 각 단계의 전제 조건은 `scripts/llm/turboquant/README.md`의
+FP16 activation recalibration 절에 있다.
+
+### 22.4 실기기 단회 결과와 해석
+
+S26 Ultra / SM8850, QAIRT 2.48.0.260626, 동일 runner·tokenizer·입력 파일을
+사용했다. 기존 FP16 결과는 §21 원본을 재사용했다. 새 모델의 reset(2개 독립
+세션)과 EOS 검사를 통과했고, 분할 공유 I/O 12개 항목도 prefill/decode 모두
+정상이다. 최종 성능 조건별 실행은 각 1회이며, 최초 로딩 실패는 추론 전
+오류였으므로 성능·PPL 결과에 포함하지 않는다.
+
+긴 입력: **897 prompt + 128 generated tokens, 고정 C1024**.
+
+| 지표 | 기존 FP16 | FP16 경로 activation 재보정 |
+|---|---:|---:|
+| TTFT (ms) | 343.323 | 364.308 |
+| prefill (tok/s) | 2614.118 | 2464.487 |
+| decode (tok/s) | 37.033 | 36.084 |
+| host KV (MiB) | 112.000 | 112.000 |
+| 종료 VmRSS (MiB) | 392.148 | 392.328 |
+| process VmHWM (MiB) | 604.914 | 604.730 |
+| PPL (별도 4 windows) | 20.123237 | 20.104589 |
+
+짧은 입력: **35 prompt + 128 generated tokens, 고정 C1024**.
+
+| 지표 | 기존 FP16 | FP16 경로 activation 재보정 |
+|---|---:|---:|
+| TTFT (ms) | 48.875 | 48.095 |
+| prefill (tok/s) | 719.454 | 732.309 |
+| decode (tok/s) | 37.726 | 35.181 |
+
+품질은 같은 WikiText test 4 windows, 총 4092 scored tokens다.
+
+| Window | 기존 FP16 PPL | 재보정 PPL |
+|---|---:|---:|
+| 0 | 11.629360 | 11.557040 |
+| 1 | 23.570998 | 23.573653 |
+| 2 | 22.215514 | 22.472205 |
+| 3 | 26.927819 | 26.684658 |
+
+총 NLL은 12283.67329 → 12279.87964, 통합 PPL은 **−0.0927%**로 아주 조금
+낮아졌다. 두 window는 개선, 두 window는 악화했다. 이 정도 결과만으로
+재보정의 뚜렷한 품질 우세나 기존 FP16 PPL 차이의 원인을 입증했다고
+해석하지 않는다. Train 극값의 범위 포함 여부와 held-out 품질은 다른 지표다.
+
+긴 입력은 TTFT +6.11%, prefill −5.72%, decode −2.56%였고, 짧은 입력
+decode는 −6.75%였다. 다만 단회·시점이 다른 비교이므로 이를 보정이 유발한
+고유한 속도 저하라고 단정하지 않는다. 기록된 긴 입력 decode의 평균 QNN
+실행 시간은 21.824 → 22.052 ms(+1.04%), host 준비 시간은
+4.543 → 4.830 ms였다. 짧은 입력은 QNN 21.912 → 22.130 ms인 반면
+host 준비 시간이 3.993 → 5.435 ms로 늘었다. 별도 반복·온도 통제나 새
+profiling 실행은 하지 않았으며, 이 분해는 기존 단회 보고서의 타이밍이다.
+
+결론적으로 **재보정 경로 구현과 검증은 완료했지만 이번 조건에서 개선 효과는
+제한적이며 성능 우세는 없다.** 기존 FP16 baseline과 TurboQuant 기본값은
+그대로 두고, 재보정 구성을 별도 실험 옵션으로 보존한다. 가중치 재학습이나
+더 넓은 held-out 평가의 효과는 이번 실험으로 확인한 것이 아니다.
+
+최종 통합 원본은 `fixed_interfaces/reports/summary.json`, 단회 원본은
+`calibrated_{short,long}_once.json` 및 `calibrated_score_w{0,1,2,3}.json`이다.
+`fp16_graph_audit.json`, `functional.json`, `experiment.json`에는 최종 검증,
+기능 검사와 고정된 실험 identity를 남겼다.
+
+## 23. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

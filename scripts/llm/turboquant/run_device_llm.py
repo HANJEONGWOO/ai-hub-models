@@ -194,6 +194,7 @@ def cmd_push(args: argparse.Namespace) -> None:
             "config_hash",
             "config",
             "quantize_current_kv",
+            "activation_calibration_sha256",
             "model",
             "split_manifest_sha256",
             "num_parts",
@@ -344,6 +345,10 @@ def cmd_run(args: argparse.Namespace) -> None:
     if runtime.get("config_hash"):
         report["config_hash"] = runtime["config_hash"]
     report["quantize_current_kv"] = runtime.get("quantize_current_kv", False)
+    if runtime.get("activation_calibration_sha256"):
+        report["activation_calibration_sha256"] = runtime[
+            "activation_calibration_sha256"
+        ]
     for key in ("model", "split_manifest_sha256", "num_parts"):
         if key in runtime:
             report[key] = runtime[key]

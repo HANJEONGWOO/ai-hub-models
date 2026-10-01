@@ -172,6 +172,10 @@ class TurboQuantConfig:
         return self.key.is_fp16 and self.value.is_fp16
 
     @property
+    def activation_calibrated(self) -> bool:
+        return self.profile == "baseline_fp16_kv_fp16_attn_calibrated"
+
+    @property
     def modifies_graph(self) -> bool:
         """True when the exported part needs surgery (codec or float16 KV)."""
         return self.key.modifies_graph or self.value.modifies_graph
@@ -218,7 +222,7 @@ class TurboQuantConfig:
                 "qk_av_inputs": "float16",
                 "current_kv": "read_stored_fp16",
                 "rotation": "none",
-                "recalibrated": False,
+                "recalibrated": self.activation_calibrated,
             }
         if self.qjl:
             from qai_hub_models.models.templates.llm.turboquant.qjl import projection
@@ -285,6 +289,9 @@ PROFILES: dict[str, TurboQuantConfig] = {
     ),
     "baseline_fp16_kv_fp16_attn": TurboQuantConfig(
         "baseline_fp16_kv_fp16_attn", FP16, FP16
+    ),
+    "baseline_fp16_kv_fp16_attn_calibrated": TurboQuantConfig(
+        "baseline_fp16_kv_fp16_attn_calibrated", FP16, FP16
     ),
     "k4_v4": TurboQuantConfig("k4_v4", _polar(4, KEY_SEED), _polar(4, VALUE_SEED)),
     "k4_v4_scaled": TurboQuantConfig(

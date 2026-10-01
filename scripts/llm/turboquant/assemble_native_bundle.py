@@ -12,6 +12,19 @@ import json
 import re
 from pathlib import Path
 
+FP16_PROFILES = {
+    "baseline_fp16_kv_fp16_attn",
+    "baseline_fp16_kv_fp16_attn_calibrated",
+}
+
+
+def check_fp16(report: dict) -> None:
+    if report.get("profile") not in FP16_PROFILES or report.get("native_decoder"):
+        raise ValueError("Expected non-Native FP16 attention parts")
+    calibrated = report["profile"] == "baseline_fp16_kv_fp16_attn_calibrated"
+    if calibrated != bool(report.get("activation_calibration_sha256")):
+        raise ValueError("FP16 calibration identity is missing or inconsistent")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -29,18 +42,20 @@ def main() -> None:
     if output in sources or (output / "convert_report.json").exists():
         raise ValueError("Use a new output directory; source bundles are immutable")
     base = json.loads((sources[0] / "convert_report.json").read_text())
-    if args.fp16_attention and (
-        base.get("profile") != "baseline_fp16_kv_fp16_attn"
-        or base.get("native_decoder")
-    ):
-        raise ValueError("Expected a non-Native FP16 attention base")
+    if args.fp16_attention:
+        check_fp16(base)
     combined = copy.deepcopy(base)
     locations = dict.fromkeys(base["parts"], sources[0])
     native = base.get("native_decoder")
     replaced = set()
     for source in sources[1:]:
         report = json.loads((source / "convert_report.json").read_text())
-        for key in ("model", "split_manifest_sha256", "num_parts"):
+        for key in (
+            "model",
+            "split_manifest_sha256",
+            "num_parts",
+            "activation_calibration_sha256",
+        ):
             if report.get(key) != base.get(key):
                 raise ValueError(f"Incompatible {key}: {source}")
         if report.get("quantize_current_kv", False) != base.get(
@@ -56,11 +71,10 @@ def main() -> None:
         ):
             if report[key] != base[key]:
                 raise ValueError(f"Incompatible {key}: {source}")
-        if args.fp16_attention and (
-            report.get("profile") != "baseline_fp16_kv_fp16_attn"
-            or report.get("native_decoder")
-        ):
-            raise ValueError("Expected matching non-Native FP16 attention parts")
+        if args.fp16_attention:
+            check_fp16(report)
+            if report["profile"] != base["profile"]:
+                raise ValueError("Incompatible FP16 profile")
         if not args.fp16_attention and not report.get("native_decoder"):
             raise ValueError(f"Missing native package: {source}")
         if native is not None and native != report["native_decoder"]:
