@@ -38,6 +38,8 @@ struct ProfileEvent {
   uint32_t unit = 0;
   uint64_t value = 0;
   std::string identifier;
+  int parent = -1;  // index in the flattened event vector; -1 denotes a root
+  uint32_t children = 0;
 };
 
 struct GraphInfo {
@@ -83,11 +85,14 @@ class QnnRuntime {
   void registerOpPackage(const std::string& path, const std::string& provider);
   // Must be called before any context is created: HTP binds detailed profiling at load time.
   void enableDetailedProfiling();
+  // Optrace requires separately instrumented contexts and an existing output directory.
+  void enableOptrace(const std::string& directory);
   Qnn_ProfileHandle_t profile() const { return profile_; }
   void execute(GraphInfo& graph, std::vector<Qnn_Tensor_t>& inputs, std::vector<Qnn_Tensor_t>& outputs);
   // Executes with QNN detailed profiling and returns the flattened event tree.
   std::vector<ProfileEvent> executeProfiled(GraphInfo& graph, std::vector<Qnn_Tensor_t>& inputs,
-                                            std::vector<Qnn_Tensor_t>& outputs);
+                                            std::vector<Qnn_Tensor_t>& outputs,
+                                            double* executeSeconds = nullptr);
   std::string backendVersion() const;
 
   const QNN_INTERFACE_VER_TYPE& api() const { return *api_; }
@@ -107,6 +112,9 @@ class QnnRuntime {
   uint32_t powerConfigId_ = 0;
   bool hasPowerConfig_ = false;
   std::string backendVersion_;
+  std::string optraceDirectory_;
+  uint64_t optraceSequence_ = 0;
+  void serializeOptrace(GraphInfo& graph, uint64_t startUs, uint64_t stopUs);
 };
 
 }  // namespace tqrun

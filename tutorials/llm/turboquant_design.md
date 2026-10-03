@@ -1923,6 +1923,293 @@ VmHWM도 구분해야 한다. 기존 TQ encoder의 0.2% 수치 gate 미통과 �
 재현 명령은 `scripts/llm/turboquant/README.md`의 FP16 control 절에 있다.
 새 측정은 새 실험 디렉터리와 기기 bundle 이름을 사용한다.
 
-## 22. 출처
+## 22. TurboQuant 단계별 실기기 profiling (2026-10-01)
+
+### 22.1 조건과 관측 단위
+
+§21의 **재보정 전 FP16 attention / Dense+Native K4/V4, QJL-off** 바이너리를
+그대로 사용했다. 로컬·기기 context SHA-256과 기존 입력 해시를 확인했고,
+모델·weights·KV 알고리즘·기본 설정은 바꾸지 않았다. S26 Ultra / SM8850,
+QAIRT 2.48에서 고정 C1024, 입력 897 + 생성 128, **구성당 생성 세션 1회**다.
+별도 이름의 profiling runner만 업로드해 기존 benchmark runner도 보존했다.
+
+- prefill: AR128 8개 chunk 전체. 첫 chunk의 실제 입력은 1개지만 graph는
+  AR128이며 나머지 127개 slot은 padding이다. 이후 7개 chunk는 각각 128개다.
+- decode: 같은 세션의 step 0/63/126을 선택했다. 유효 past KV는 각각
+  897/960/1023개이나 실제 선택 graph의 past slot은 모두 **1023개**다.
+- 두 구성 모두 생성 ID 128개가 §21의 unprofiled 결과와 정확히 일치했다.
+- MSE/PPL을 다시 평가하거나 calibration을 적용하지 않았다. 본 절은 시간
+  attribution 진단이며 품질 개선/encoder 수치 gate 통과를 주장하지 않는다.
+- 배터리 온도는 FP16 26.9→27.6℃, TQ 27.6→28.3℃다. 이는 칩 온도가 아니며
+  온도·주파수 통제나 반복 측정에 의한 분산 추정은 하지 않았다.
+
+원본은 모든 event의 type/unit/parent/children을 보존한다. 집계는
+**type=NODE(404), unit=cycles(3), children=0**인 event만 사용하며 inclusive
+graph counter를 중복 합산하지 않는다. 이번 모든 graph에서 이 합은 SDK의
+graph cycle counter와 일치했다. 수치는 HTP가 각 named node에 귀속한 counter이고,
+CPU wall time·독립 stage latency·개선 가능한 시간 비율과 동일하지 않다.
+원본 graph wall time에는 상세 profiling overhead가 크므로 기존 tok/s 표는
+교체하지 않는다. event 읽기 시간도 graphExecute 호출 시간과 별도로 저장했다.
+
+### 22.2 TurboQuant 단계별 cycle 비중
+
+prefill은 8개 chunk 합계, decode는 past 1023개인 마지막 단일 step이다.
+각 열의 분모는 **그 조건의 전체 모델 leaf-node cycles 합계**다.
+
+| 단계 | prefill 비중 | decode 비중 |
+|---|---:|---:|
+| Scalar 양자화 인덱스 결정 | 20.21% | 2.75% |
+| effective scale / norm 보정 계산 | 10.31% | 1.39% |
+| 정규화·overflow 방지 | 4.43% | 0.72% |
+| 인덱스 packing | 3.09% | 0.93% |
+| 새 KV Dense 회전 GEMM | 분리 관측 불가¹ | 분리 관측 불가¹ |
+| 과거 KV Native unpack + LUT + scale | 7.37% | 26.53% |
+| 현재 KV Native 복원 | 1.14% | 1.21% |
+| Query 회전 | 0.04% | 0.09% |
+| QK | 1.99% | 3.43% |
+| score 결합·mask·softmax | 7.65% | 2.02% |
+| AV 및 tile 결과 합산 | 1.36% | 4.29% |
+| attention 출력 역회전 | 0.37% | 0.08% |
+| Layout·정밀도 변환 | 18.12% | 30.99% |
+| 공통 linear·기타 모델 연산 | 21.83% | 25.23% |
+| backend I/O·미귀속 compiler event | 2.08% | 0.33% |
+
+¹ 회전 행렬곱은 compiled DLC에서 FullyConnected로 존재하지만 해당 named event는
+prefill 448/448개, 마지막 decode 56/56개가 **0 cycles**다. 이것은 비용 0이나
+Dense 회전이 무료라는 증명이 아니다. fusion/스케줄링에 따른 다른 event 귀속
+또는 profiling 지원 범위의 영향을 분리하지 못했다. 회전 뒤의
+`rotated_ht1d` Transpose를 회전 GEMM 비용으로 오인하지 않도록 layout에 넣었다.
+decode AV MatMul도 1792/1792개가 0 cycles이며, 표의 AV 비용은 해당 계산 경로의
+합산 연산 등에 귀속된 counter다. 따라서 순수 AV GEMM 비용으로 해석하지 않는다.
+
+### 22.3 FP16과의 비교 및 다음 최적화 후보
+
+마지막 decode의 counter 비교 (단위 **Mcycles**, milliseconds 아님):
+
+| 분류 | FP16 attention | TurboQuant |
+|---|---:|---:|
+| 전체 named leaf-node 합계 | 91.386 | 192.666 |
+| Layout·정밀도 변환 | 20.016 | 59.700 |
+| 과거 KV Native 복원 | 해당 없음 | 51.119 |
+| 현재 KV Native 복원 | 해당 없음 | 2.336 |
+| QK | 7.717 | 6.610 |
+| AV·합산 경로 | 5.751 | 8.273 |
+
+counter 비율을 그대로 end-to-end 속도비로 해석하지 않는다. SDK가 별도로
+보고한 accelerator excluding-wait 시간(type 3012)은 FP16/TQ가 prefill
+합계 **264.011 / 479.242 ms**, 마지막 decode **21.369 / 24.221 ms**다.
+이들 역시 상세 profiling 세션의 진단값이며 §21의 단회 벤치마크와 구분한다.
+
+TQ decode layout 59.700 Mcycles의 compiled op별 분해는 다음과 같다.
+
+- StridedSlice: **25.043 Mcycles**
+- Transpose: **17.405 Mcycles**
+- Convert: **12.480 Mcycles**
+- Concat: **4.754 Mcycles**
+- Reshape: **0.018 Mcycles**
+
+이 중 과거 K 복원 결과를 attention layout으로 바꾸는
+`tq_key_*_tile*_restored_hub` Transpose만 **17.241 Mcycles**다. 과거 Native 복원은
+K **25.336**, V **25.783 Mcycles**로 양쪽 비용이 비슷하다. decode 한 step마다
+28 layers × K/V × 4 tiles = **224개** 과거 Native event가 발생했다.
+Native 출력 shape 합계는 111.891 MiB의 FP16 원소량이며, 이는 tile별 논리적
+출력량이지 동시 peak 메모리나 실제 DDR traffic 측정값은 아니다.
+
+관측에 따른 다음 후보는 다음과 같다. 아직 최적화나 효과 검증을 수행한 것은 아니다.
+
+1. **decode:** Native 복원과 layout 변환/attention 소비를 결합하는 경로.
+   Native가 attention에 필요한 K layout을 직접 출력할 수 있는지, head별
+   Slice·Concat·중간 FP16 tile 전달을 줄일 수 있는지 먼저 검토한다.
+   현재 Decode4는 복원만 결합한 op이며 packed attention fused kernel이 아니다.
+2. **prefill:** Scalar 인덱스 결정과 scale 보정이 합쳐서 **30.52%**를 차지한다.
+   threshold 비교·ReduceSum·centroid 선택·norm 보정·packing의 Native encoder
+   결합이 우선 후보다. norm 보정은 이미 저장 시 1회 계산하는 구조다.
+3. **회전:** 이번 graph-level profiling은 Dense GEMM 독립 비용을 해결하지
+   못했으므로, 회전 삭제/교체의 우선순위를 이 0 counter만으로 정하지 않는다.
+   필요하면 별도 rotation microbenchmark/optrace로 보완한다.
+
+### 22.4 산출물과 검증
+
+실험 루트:
+`/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_stage_profile_20261001/`.
+
+- `runner/qnn-llm-runner`: 별도로 빌드한 진단 실행 파일.
+- `reports/experiment.json`: baseline 바이너리·입력·runner 해시, 선택 step, 기기 identity.
+- `reports/{fp16,turboquant}_profile_once.json`: 전체 raw event tree와 host 시간.
+- `reports/{fp16,turboquant}_node_stages.csv`: 각 node의 stage/K·V/layer/shape/cycles.
+- `reports/stage_summary.json`: 조건별·단계별 집계, 0-cycle 관측 한계,
+  layout 세부 분해 및 기존 생성 ID와의 일치 여부.
+- `*.attempt.json`, `*.complete.json`, `*.log`: 재실행 방지 및 실행 기록.
+
+전용 sysfs 온도 파일은 shell 권한으로 읽을 수 없어 첫 준비 단계에서 중단됐다.
+그 시점에는 모델 추론이 시작되지 않았다. 공개 `dumpsys battery` 값으로
+대체한 후 위 두 생성 세션만 실행했으며 성능 세션을 반복한 것이 아니다.
+재현과 분석 명령은 `scripts/llm/turboquant/README.md`의 Stage profiling 절에 있다.
+Android runner 빌드, Python 정적 검사 및 TurboQuant 관련 **477 tests**를 통과했다.
+새 tests는 stage 분류, graph parent 중복 제외, 0-cycle 처리 및 회전/layout
+분리를 검사한다.
+
+## 23. HTP optrace로 단계별 비용 재관측 (2026-10-01)
+
+### 23.1 계측 조건과 해석
+
+§22와 같은 Qwen3-1.7B / S26 Ultra / QAIRT 2.48, 고정 C1024,
+897 prompt + 128 generation, FP16 attention / Dense+Native K4/V4 QJL-off를
+사용했다. 기존 quantized DLC를 그대로 읽어 **optrace 계측용 context만**
+별도 생성했다. 기존 context, weights, encodings, calibration, 기본 설정은
+바꾸지 않았다. 원본 graph 집합과 weight sharing, O3/v81 설정을 유지했다.
+
+각 구성은 생성 세션 **1회**, AR128 prefill 8 chunk 전체와 AR1 decode
+0/63/126을 수집했다. 따라서 구성당 44개의 graph execute trace다.
+이전처럼 prefill 첫 chunk는 실제 1 token, 나머지 7 chunk는 각각 128 token이며,
+decode의 실제 선택 graph는 세 step 모두 past slot 1023개를 가진다.
+
+두 구성 모두 생성 ID 128개가 기존 비계측 결과와 정확히 일치했다. PPL/MSE는
+재측정하지 않았다. 배터리 온도는 FP16 27.1→27.6℃, TurboQuant 27.4→28.5℃다.
+칩 온도·주파수 통제나 반복에 의한 분산 추정은 하지 않았다. 원본 context
+바이너리의 SHA-256도 §21의 실험 기록과 모두 일치함을 재확인했다.
+
+runner가 QNN extended event의 opaque trace object까지 SystemProfile API로
+직렬화하고, 같은 context 빌드에서 생성한 schematic으로 SDK viewer를 실행한다.
+본 측정 이전의 synthetic zero-input part-2 점검은 trace 저장 경로만 확인한
+것이며 성능·품질 집계에서 제외한다. 최초 점검은 DSP library를 찾지 못해
+추론 이전에 종료됐고, 기존 runner와 동일한 working directory로 고친 뒤
+단일 그래프 점검이 성공했다. 불필요한 Netron topology/중복 보기 export는
+중단하고 gzip physical trace와 QHAS HTML을 사용했다. 원본 trace는 보존한다.
+
+**단위와 분모가 §22의 named NODE counter와 다르다.**
+
+- optrace의 `ts`, `dur`는 이 SDK에서 **cycles**다. Chrome trace의 통상적인
+  microseconds로 읽거나 고정 주파수를 가정해 ms로 환산하지 않는다.
+- `Core N Overview`의 실제 HVX/HMX 실행만 연산 집계에 사용한다. QNN별 중복
+  보기와 `Non Executed Tensors`는 제외한다. 후자의 양수 duration도 실측 실행
+  비용으로 취급하지 않는다.
+- 표의 비중은 **전체 모델의 HVX/HMX busy-cycle 합계** 대비 비중이다.
+  여러 HVX worker의 겹치는 실행 시간을 합산하므로 latency 비중이 아니다.
+  병목을 없애면 그 비중만큼 빨라진다는 의미도 아니다.
+- DMA transfer, wait, synchronization/control은 별도로 집계한다. stage별
+  interval union과 전체 graph cycle span도 별도로 저장하며 중복 합산하지 않는다.
+- `args["Duration (cycles)"]`는 worker 간 공유되는 op 통계일 수 있다.
+  각 worker의 실제 `dur`를 사용하며 여러 worker에 같은 통계를 반복 적용하지 않는다.
+- SDK의 accelerator excluding-wait(type 3012, us)는 별도 진단 지표다.
+  이번 instrumented session의 tok/s·TTFT는 기존 비계측 benchmark를 대체하지 않는다.
+
+### 23.2 회전의 0-counter 원인
+
+HTP trace에서 encoder Dense 회전은 실제 **`q::ConvLayer.fp16.s1.tcm` HMX**
+커널로 관측된다. 그러나 QNN owner가 원래 `tq_{key,value}_L_enc_rotated`
+FullyConnected가 아니라 그 뒤의 `*_post_reshape`다. 즉, 회전이 사라진 것이
+아니라 **행렬곱과 출력 reshape가 합쳐진 뒤의 이름으로 비용이 귀속**돼,
+§22의 원래 FullyConnected named counter는 0으로 보였다.
+
+분석기는 실제 `uses_hmx` Conv/MatMul 커널이고, suffix를 제거한 원본 op가
+compiled DLC의 FullyConnected/MatMul임이 확인될 때만 arithmetic stage로
+귀속한다. 같은 이름에 붙은 ForceFormat/Reshape/Transpose, DMA는 회전 GEMM으로
+세지 않는다. 이는 shape-only 출력 reshape와 결합된 HMX kernel의 실행 비용이며,
+회전을 넣거나 뺀 end-to-end 차이와는 다르다. 기존의 모든 0-counter를 이
+한 가지 원인으로 일반화하지 않는다.
+
+### 23.3 단계별 결과와 이전 관측의 대조
+
+같은 단계 분류로 얻은 TurboQuant 결과다. prefill은 8 chunk 합계,
+decode는 past 1023개인 마지막 단일 step이다. **Mcycles는 백만 cycle**이며
+비중의 분모는 각 조건의 전체 HVX/HMX kernel busy-cycle 합계다.
+
+| 단계 | prefill Mcycles | prefill 비중 | decode Mcycles | decode 비중 |
+|---|---:|---:|---:|---:|
+| 정규화·overflow 방지 | 236.318 | 4.74% | 1.377 | 0.85% |
+| 새 KV Dense 회전 GEMM | 1.456 | 0.029% | 0.014747 | 0.009% |
+| Scalar 양자화 인덱스 결정 | 1058.658 | 21.23% | 5.316 | 3.29% |
+| effective scale / norm 보정 | 538.125 | 10.79% | 2.644 | 1.63% |
+| 인덱스 packing | 162.282 | 3.25% | 1.741 | 1.08% |
+| 과거 KV Native unpack + LUT + scale | 386.203 | 7.75% | 51.094 | 31.59% |
+| 현재 KV Native 복원 | 59.651 | 1.20% | 2.327 | 1.44% |
+| Query 회전 | 2.149 | 0.04% | 0.178 | 0.11% |
+| QK | 103.433 | 2.07% | 6.504 | 4.02% |
+| score 결합·mask·softmax | 402.603 | 8.07% | 3.835 | 2.37% |
+| AV 및 tile 결과 합산 | 69.973 | 1.40% | 8.137 | 5.03% |
+| attention 출력 역회전 | 19.188 | 0.38% | 0.141 | 0.09% |
+| Layout·정밀도 변환 | 952.904 | 19.11% | 60.395 | 37.34% |
+| 공통 linear·기타 모델 연산 | 888.614 | 17.82% | 17.951 | 11.10% |
+| 미귀속 named kernel | 104.653 | 2.10% | 0.076 | 0.05% |
+| 전체 compute busy cycles | 4986.210 | 100% | 161.731 | 100% |
+
+회전 HMX kernel은 prefill **448개**, 마지막 decode **56개**로 모두 관측됐다.
+같은 optrace 세션의 종전 detailed counter는 여전히 rotation FullyConnected
+56/56개, AV MatMul 1792/1792개가 0이다. 반면 physical trace에서 AV 경로의
+HMX kernel은 마지막 decode **0.720 Mcycles**, HVX 합산 등은 **7.417 Mcycles**로
+관측된다. named counter의 0을 실제 미실행으로 읽으면 안 된다는 근거다.
+
+직접 비교 가능한 같은 optrace 방식의 마지막 decode 분해:
+
+| 분류 | FP16 attention Mcycles | TurboQuant Mcycles |
+|---|---:|---:|
+| 전체 HVX/HMX busy-cycle 합계 | 50.367 | 161.731 |
+| Layout·정밀도 변환 | 15.998 | 60.395 |
+| 과거 KV Native 복원 | 해당 없음 | 51.094 |
+| 현재 KV Native 복원 | 해당 없음 | 2.327 |
+| QK 경로 | 7.689 | 6.504 |
+| AV·합산 경로 | 5.696 | 8.137 |
+| DMA wait, 위 합계에서 제외 | 32.988 | 27.007 |
+| physical graph span, 병렬 lane 합계 아님 | 45.229 | 54.040 |
+
+TurboQuant의 busy-cycle 합은 약 3.21배지만 graph span은 약 1.19배다.
+이는 여러 HVX lane·HMX·DMA가 겹쳐 동작하고 waiting time도 별도이기 때문이다.
+3.21배를 실제 decode 지연비로 해석하지 않는다. DMA wait는 실제 전송 byte나
+메모리 대역폭 수치도 아니다.
+
+TurboQuant decode layout의 세부 값은 StridedSlice **25.836**, Transpose
+**17.307**, Convert **12.436**, Concat **4.816 Mcycles**다. 과거 Native 복원은
+K **25.289**, V **25.805 Mcycles**이고 실제 kernel은 모두 HVX의
+`TurboQuantNative::Decode4`다. 224개 논리 Native op가 여러 worker에서 실행되어
+1344개 physical event로 집계된다. 이를 1344번의 별도 KV 복원으로 해석하지 않는다.
+
+관측에 따른 우선순위는 §22의 결론과 일치한다.
+
+1. **decode:** 과거 Native 복원 + layout이 compute busy cycles의 **68.93%**다.
+   Native 출력 layout 개선 및 attention 소비와의 결합이 우선 후보다.
+2. **prefill:** scalar 인덱스 + scale 보정이 **32.02%**, 정규화·packing·회전까지
+   포함한 encoder 전체가 **40.05%**다. encoder의 여러 HVX 단계 결합을 검토할 근거다.
+3. **회전:** 관측된 Dense GEMM 자체는 HMX에서 작게 나타난다. 이 모델·shape에서
+   회전 GEMM 삭제를 최우선으로 삼을 근거는 약하다. 다만 회전 주변 format/transpose는
+   layout에 남아 있으므로 “회전 경로 전체가 무료”라는 뜻은 아니다.
+
+이는 최적화 후보의 근거이지 예상 속도 향상률이 아니다. 모델/알고리즘을 바꾸지
+않았으며 §22와의 비중 차이도 개선/악화가 아니라 집계 범위·분모 차이를 포함한다.
+
+### 23.4 SDK graph-time 대조
+
+별도 accelerator excluding-wait counter(type 3012), 단위 **ms**:
+
+| 조건 | FP16 §22 detailed | FP16 optrace | TurboQuant §22 detailed | TurboQuant optrace |
+|---|---:|---:|---:|---:|
+| prefill 8 chunk 합계 | 264.011 | 264.869 | 479.242 | 488.274 |
+| 마지막 decode, past 1023 | 21.369 | 21.436 | 24.221 | 25.605 |
+
+optrace 세션의 decode 0/63/126은 FP16 **21.403/21.430/21.436 ms**,
+TurboQuant **22.941/25.408/25.605 ms**다. 그래프의 past slot은 동일하게 1023개다.
+단회·온도 차이·계측 방식 차이가 있으므로 이 변화를 유효 KV 길이에 따른
+연산량 변화나 알고리즘 성능 회귀로 단정하지 않는다. 두 표의 시점 간 차이를
+최적화 성과로 주장하지 않으며 §21의 비계측 성능표는 그대로 유지한다.
+
+### 23.5 산출물과 재현
+
+루트: `/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_optrace_20261001/`.
+
+- `{fp16,turboquant}/partN_of_4/`: 계측용 context, graph별 schematic,
+  command/build log, 원본 DLC와 신규 context·schematic SHA-256.
+- `reports/*_profile_once.{attempt,complete}.json`: 세션 1회 보호, provenance,
+  입력·runner 해시, 배터리 온도, 기존 생성 ID 일치 여부, 원본 trace 해시.
+- `reports/*_profile_once.json`: §22와 호환되는 detailed counter와 host 시간.
+- `traces/{fp16,turboquant}/`: 각각 44개 QNN 직렬화 원본 `.log`.
+- `rendered/{fp16,turboquant}/execute_*/`: gzip physical trace, runtrace,
+  QHAS HTML, viewer command/log. Perfetto/Chrome trace에서 열 수 있다.
+- `reports/*_optrace_summary.json` / `.csv`: 같은 단계 분류의 cycle 집계,
+  자원별·K/V별 분해, kernel attribution, 원래 detailed counter와의 대조.
+
+재현 명령은 README의 HTP optrace 절에 있다. Android main/smoke runner 빌드,
+Python 정적 검사와 TurboQuant 관련 **482 tests**를 통과했다.
+
+## 24. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.
