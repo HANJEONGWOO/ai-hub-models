@@ -273,8 +273,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     if remote_tag and re.fullmatch(r"[A-Za-z0-9_.-]+", remote_tag) is None:
         raise ValueError("Report tag must contain only letters, digits, _, . or -.")
     remote_report = f"{DEVICE_ROOT}/reports/{tag}.json"
+    runner_name = getattr(args, "runner_name", "qnn-llm-runner")
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", runner_name) is None:
+        raise ValueError("Runner name must be a filename, not a path")
     runner_args = [
-        f"{DEVICE_ROOT}/bin/qnn-llm-runner",
+        f"{DEVICE_ROOT}/bin/{runner_name}",
         "--backend libQnnHtp.so --system libQnnSystem.so",
         "--bins " + ",".join(f"{remote_bundle}/{b}" for b in bins),
         f"--context-length {assets['context_length']}",
@@ -311,6 +314,20 @@ def cmd_run(args: argparse.Namespace) -> None:
         runner_args.append(f"--profile-decode-step {args.profile_decode_step}")
     if args.profile_prefill:
         runner_args.append("--profile-prefill")
+    if trace_out := getattr(args, "optrace_out", None):
+        if trace_out.exists():
+            raise FileExistsError(f"Refusing to reuse trace output: {trace_out}")
+        remote_trace = f"{DEVICE_ROOT}/reports/{tag}_optrace"
+        if adb(args, "shell", f"test -e {remote_trace} && echo exists", check=False).strip():
+            raise FileExistsError(f"Refusing to reuse remote trace output: {remote_trace}")
+        adb(args, "shell", "mkdir", "-p", remote_trace)
+        runner_args.append(f"--optrace-dir {remote_trace}")
+    if getattr(args, "profile_prefill_all", False):
+        runner_args.append("--profile-prefill-all")
+    if steps := getattr(args, "profile_decode_steps", []):
+        if any(step < 0 or step >= args.n_gen - 1 for step in steps):
+            raise ValueError("Profile decode steps must be within [0, n_gen - 2]")
+        runner_args.append("--profile-decode-steps " + ",".join(map(str, steps)))
     if args.sessions > 1:
         runner_args.append(f"--sessions {args.sessions}")
     script = (
@@ -325,6 +342,9 @@ def cmd_run(args: argparse.Namespace) -> None:
     if not rc or rc.group(1) != "0":
         raise RuntimeError(f"runner failed; log in {args.report.with_suffix('.log')}")
     adb(args, "pull", remote_report, windows_path(args.report))
+    if trace_out:
+        trace_out.parent.mkdir(parents=True, exist_ok=True)
+        adb(args, "pull", remote_trace, windows_path(trace_out))
     if args.dump_logits:
         adb(
             args,
@@ -333,11 +353,26 @@ def cmd_run(args: argparse.Namespace) -> None:
             windows_path(args.report.with_suffix(".logits.bin")),
         )
     report = json.loads(args.report.read_text())
+    if (
+        args.profile_prefill
+        or args.profile_decode_step >= 0
+        or getattr(args, "profile_prefill_all", False)
+        or getattr(args, "profile_decode_steps", [])
+        or trace_out
+    ):
+        report["diagnostic_only"] = True
+        report["profiling_protocol"] = (
+            "Detailed profiling is enabled for the runtime lifetime; "
+            "throughput is not an unprofiled benchmark result."
+        )
     report["device"] = {
         "soc_model": adb(args, "shell", "getprop", "ro.soc.model").strip(),
         "fingerprint": adb(args, "shell", "getprop", "ro.build.fingerprint").strip(),
     }
     report["bundle_name"] = args.name
+    report["runner_name"] = runner_name
+    if trace_out:
+        report["optrace_directory"] = str(trace_out)
     report["context_buckets"] = buckets or [assets["context_length"]]
     if native:
         report["native_decoder"] = native
@@ -394,6 +429,10 @@ def main() -> None:
     run.add_argument("--dump-logits", action="store_true")
     run.add_argument("--profile-decode-step", type=int, default=-1)
     run.add_argument("--profile-prefill", action="store_true")
+    run.add_argument("--profile-prefill-all", action="store_true")
+    run.add_argument("--profile-decode-steps", type=int, nargs="+", default=[])
+    run.add_argument("--runner-name", default="qnn-llm-runner")
+    run.add_argument("--optrace-out", type=Path, default=None)
     run.add_argument("--sessions", type=int, default=1)
     run.add_argument("--report", type=Path, required=True)
     run.add_argument(

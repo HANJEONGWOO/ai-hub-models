@@ -92,6 +92,93 @@ for stage in push functional performance quality summarize; do
 done
 ```
 
+## Stage profiling (diagnostic only)
+
+`profile_stages_once.py` reuses the frozen FP16/TurboQuant binaries from an
+existing FP16 comparison. It verifies local/device context hashes and uploads
+only a separately named runner, leaving the benchmark runner untouched. Each
+group runs **one** 897-prompt + 128-generation session at fixed C1024. All eight
+AR128 prefill chunks and AR1 decode steps 0/63/126 are captured in that session.
+These are diagnostic profiles, **not** new throughput/PPL benchmark results.
+
+```bash
+TQ_PROFILE=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_stage_profile_new
+bash scripts/llm/turboquant/qnn_runner/build_android.sh "$TQ_PROFILE/runner"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/profile_stages_once.py \
+    --reference-reports /mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_fp16_attention_20260929/reports \
+    --assets /mnt/d/ai-hub-models/binaries/turboquant/device_assets_cl1024 \
+    --runner "$TQ_PROFILE/runner/qnn-llm-runner" --out "$TQ_PROFILE/reports"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/summarize_stage_profiles.py \
+    --reports "$TQ_PROFILE/reports"
+```
+
+The reference device bundles must already exist and match the historical hashes.
+Use a new output directory; an attempted inference cannot be silently retried.
+Raw events retain type/unit/parent/children, and host graph-execution wall time
+is separated from profile-event retrieval. The analyzer attributes **leaf NODE
+cycle events** using the frozen ONNX/DLC, excludes inclusive parent counters,
+and exports per-node CSV plus `stage_summary.json`. Percentages are counter
+shares, not wall-time fractions or predicted speedups. Zero-cycle nodes may be
+fused/eliminated/uninstrumented; encoder rotation GEMMs and many AV products
+are zero in this SDK's detailed report, so their standalone cost is unresolved.
+
+Direct runner options are `--profile-prefill-all`, `--profile-decode-steps 0 63
+126` and `--runner-name <uploaded-filename>`. Existing single-step flags and
+unprofiled defaults are unchanged. `run_device_llm.py` marks profiled reports
+`diagnostic_only` because the profile handle is active for the whole runtime,
+even on steps whose events are not exported. See design §22 for the measured
+stage split and limitations; no model, weights or calibration are modified.
+
+### HTP optrace (same stage taxonomy)
+
+`build_optrace_contexts.py` adds `--profiling_level detailed --profiling_option
+optrace` when rebuilding **contexts only** from frozen quantized DLCs. It keeps
+the original graph set/weight sharing, native package and O3/v81 settings. All
+source DLCs are hash-checked before/after; source contexts are never overwritten.
+The SDK emits a schematic per graph in the build working directory.
+
+```bash
+TQ_TRACE=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_optrace_new
+BUILD_OPTRACE_SMOKE=1 bash scripts/llm/turboquant/qnn_runner/build_android.sh "$TQ_TRACE/runner"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/build_optrace_contexts.py \
+    --source /mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_fp16_attention_20260929/bundle \
+    --out "$TQ_TRACE/fp16" --parts 1 2 3 4
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/build_optrace_contexts.py \
+    --source /mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_current_kv_native_20260922_final \
+    --out "$TQ_TRACE/turboquant" --parts 1 2 3 4
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/profile_optrace_once.py measure \
+    --root "$TQ_TRACE" \
+    --reference-reports /mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_fp16_attention_20260929/reports \
+    --assets /mnt/d/ai-hub-models/binaries/turboquant/device_assets_cl1024
+for group in fp16 turboquant; do
+    venv/bin/python scripts/llm/turboquant/render_optrace.py \
+        --logs "$TQ_TRACE/traces/$group" --contexts "$TQ_TRACE/$group" \
+        --out "$TQ_TRACE/rendered/$group" --jobs 4 || break
+done
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/summarize_optrace.py --root "$TQ_TRACE"
+```
+
+Run commands only after the preceding stage succeeds. The optional `pilot`
+action of `profile_optrace_once.py` uses the same arguments but executes only
+TurboQuant part 2 with synthetic zero inputs. It checks trace serialization,
+**not performance or quality**; part 2 must already have been built. A failed
+pilot may be preserved under a separate `--pilot-label`. Real `measure` sessions
+are attempt-guarded and run once per group, using 8 prefill chunks and decode
+0/63/126 (44 graph trace logs each). A separately named runner and device bundle
+preserve the original benchmark artifacts. Direct runner support is exposed via
+`run_device_llm.py run --optrace-out <new-local-directory>` with profiling step
+selection; extended QNN events, including opaque trace objects, are serialized.
+
+The analyzer selects physical Core Overview HVX/HMX lanes and excludes duplicate
+views and Non Executed Tensors. **Trace durations are cycles, not microseconds.**
+It reports summed busy cycles, interval unions, DMA transfer/wait/control, and
+SDK graph-time counters separately. Summing parallel HVX workers is work, not
+wall latency. HMX arithmetic attributed to `*_post_reshape` is associated with
+its verified source FullyConnected/MatMul; real reshape/transpose/format kernels
+remain layout. Gzip traces retain per-kernel QNN names and hardware resource.
+Optional topology/duplicated-view rendering is disabled to limit host export
+cost, without changing the captured device data. See design §23 for results.
+
 ## Model selection: Qwen3-4B is opt-in
 
 `benchmark_model_once.py` supports `qwen3_1_7b` (the unchanged default),

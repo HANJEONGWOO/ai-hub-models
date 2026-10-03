@@ -19,3 +19,15 @@ mkdir -p "$OUT"
   "$HERE/src/main.cpp" "$HERE/src/session.cpp" "$HERE/src/qnn_api.cpp" \
   -ldl -llog -o "$OUT/qnn-llm-runner"
 echo "$OUT/qnn-llm-runner"
+
+# Optional synthetic single-graph optrace serialization check. Never benchmark
+# these zero inputs or replace the normal runner with this diagnostic utility.
+if [[ "${BUILD_OPTRACE_SMOKE:-0}" == "1" ]]; then
+  "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" \
+    --target=aarch64-linux-android31 -std=c++17 -O2 -Wall -Wextra -fPIE -pie \
+    -static-libstdc++ -Wl,-z,max-page-size=16384 \
+    -I"$QNN_SDK_ROOT/include/QNN" \
+    "$HERE/src/optrace_smoke.cpp" "$HERE/src/qnn_api.cpp" \
+    -ldl -llog -o "$OUT/qnn-optrace-smoke"
+  echo "$OUT/qnn-optrace-smoke"
+fi

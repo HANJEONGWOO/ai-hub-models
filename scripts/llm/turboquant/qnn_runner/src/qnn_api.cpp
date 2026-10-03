@@ -15,10 +15,12 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <list>
 #include <stdexcept>
 
 #include "HTP/QnnHtpDevice.h"
 #include "HTP/QnnHtpPerfInfrastructure.h"
+#include "System/QnnSystemProfile.h"
 
 namespace tqrun {
 namespace {
@@ -229,28 +231,118 @@ void QnnRuntime::enableDetailedProfiling() {
   if (err != QNN_SUCCESS) fail("profileCreate", err);
 }
 
+void QnnRuntime::enableOptrace(const std::string& directory) {
+  if (access(directory.c_str(), W_OK) != 0) fail("Optrace directory must already exist and be writable");
+  if (!api_->profileSetConfig || !api_->profileGetExtendedEventData ||
+      !sysApi_->systemProfileCreateSerializationTarget ||
+      !sysApi_->systemProfileSerializeEventData || !sysApi_->systemProfileFreeSerializationTarget)
+    fail("SDK lacks required optrace/serialization APIs");
+  enableDetailedProfiling();
+  QnnProfile_Config_t config = QNN_PROFILE_CONFIG_INIT;
+  config.option = QNN_PROFILE_CONFIG_OPTION_ENABLE_OPTRACE;
+  config.enableOptrace = 1;
+  const QnnProfile_Config_t* configs[] = {&config, nullptr};
+  const auto err = api_->profileSetConfig(profile_, configs);
+  if (err != QNN_SUCCESS) fail("profileSetConfig optrace", err);
+  optraceDirectory_ = directory;
+}
+
+void QnnRuntime::serializeOptrace(GraphInfo& graph, uint64_t startUs, uint64_t stopUs) {
+  using Event = QnnSystemProfile_ProfileEventV1_t;
+  // List storage keeps recursively allocated child arrays valid through serialization.
+  std::list<std::vector<Event>> storage;
+  std::function<std::vector<Event>&(const QnnProfile_EventId_t*, uint32_t)> collect =
+      [&](const QnnProfile_EventId_t* ids, uint32_t count) -> std::vector<Event>& {
+        storage.emplace_back();
+        auto& result = storage.back();
+        result.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+          Event event = QNN_SYSTEM_PROFILE_EVENT_V1_INIT;
+          event.type = QNN_SYSTEM_PROFILE_EXTENDED_EVENT_DATA;
+          event.extendedEventData = QNN_PROFILE_EXTENDED_EVENT_DATA_INIT;
+          auto err = api_->profileGetExtendedEventData(ids[i], &event.extendedEventData);
+          if (err != QNN_SUCCESS) fail("profileGetExtendedEventData", err);
+          const QnnProfile_EventId_t* children = nullptr;
+          uint32_t childCount = 0;
+          err = api_->profileGetSubEvents(ids[i], &children, &childCount);
+          if (err != QNN_SUCCESS) fail("profileGetSubEvents for trace", err);
+          if (childCount) {
+            auto& childEvents = collect(children, childCount);
+            event.profileSubEventData = childEvents.data();
+            event.numSubEvents = static_cast<uint32_t>(childEvents.size());
+          }
+          result.push_back(event);
+        }
+        return result;
+      };
+  const QnnProfile_EventId_t* ids = nullptr;
+  uint32_t count = 0;
+  auto err = api_->profileGetEvents(profile_, &ids, &count);
+  if (err != QNN_SUCCESS) fail("profileGetEvents for trace", err);
+  auto& events = collect(ids, count);
+  char sequence[32];
+  std::snprintf(sequence, sizeof(sequence), "%05llu", static_cast<unsigned long long>(optraceSequence_++));
+  const std::string filename = std::string("execute_") + sequence + "_" + graph.name + ".log";
+  const std::string path = optraceDirectory_ + "/" + filename;
+  if (access(path.c_str(), F_OK) == 0) fail("Refusing to overwrite optrace log " + path);
+  QnnSystemProfile_SerializationTarget_t target{};
+  target.type = QNN_SYSTEM_PROFILE_SERIALIZATION_TARGET_FILE;
+  target.file = {filename.c_str(), optraceDirectory_.c_str()};
+  const std::string version = backendVersion();
+  QnnSystemProfile_SerializationTargetConfig_t config{};
+  config.type = QNN_SYSTEM_PROFILE_SERIALIZATION_TARGET_CONFIG_SERIALIZATION_HEADER;
+  config.serializationHeader = {"qnn-llm-runner-optrace", "1", version.c_str()};
+  QnnSystemProfile_SerializationTargetHandle_t handle = nullptr;
+  err = sysApi_->systemProfileCreateSerializationTarget(target, &config, 1, &handle);
+  if (err != QNN_SUCCESS) fail("systemProfileCreateSerializationTarget", err);
+  QnnSystemProfile_ProfileData_t data = QNN_SYSTEM_PROFILE_DATA_INIT;
+  data.version = QNN_SYSTEM_PROFILE_DATA_VERSION_1;
+  data.v1.header.startTime = startUs;
+  data.v1.header.stopTime = stopUs;
+  data.v1.header.methodType = QNN_SYSTEM_PROFILE_METHOD_TYPE_BACKEND_EXECUTE;
+  data.v1.header.graphName = graph.name.c_str();
+  data.v1.profilingEvents = events.data();
+  data.v1.numProfilingEvents = static_cast<uint32_t>(events.size());
+  const QnnSystemProfile_ProfileData_t* payload[] = {&data};
+  err = sysApi_->systemProfileSerializeEventData(handle, payload, 1);
+  const auto freeError = sysApi_->systemProfileFreeSerializationTarget(handle);
+  if (err != QNN_SUCCESS) fail("systemProfileSerializeEventData", err);
+  if (freeError != QNN_SUCCESS) fail("systemProfileFreeSerializationTarget", freeError);
+}
+
 std::vector<ProfileEvent> QnnRuntime::executeProfiled(GraphInfo& graph, std::vector<Qnn_Tensor_t>& inputs,
-                                                      std::vector<Qnn_Tensor_t>& outputs) {
+                                                      std::vector<Qnn_Tensor_t>& outputs,
+                                                      double* executeSeconds) {
   if (!profile_) fail("executeProfiled requires enableDetailedProfiling before loading contexts");
+  const auto executeStart = std::chrono::steady_clock::now();
   Qnn_ErrorHandle_t err = api_->graphExecute(graph.handle, inputs.data(), static_cast<uint32_t>(inputs.size()),
                                              outputs.data(), static_cast<uint32_t>(outputs.size()), profile_, nullptr);
+  const auto executeStop = std::chrono::steady_clock::now();
+  if (executeSeconds) *executeSeconds = std::chrono::duration<double>(executeStop - executeStart).count();
   if (err != QNN_SUCCESS) fail("graphExecute (profiled) " + graph.name, err);
+  if (!optraceDirectory_.empty()) {
+    serializeOptrace(graph,
+        std::chrono::duration_cast<std::chrono::microseconds>(executeStart.time_since_epoch()).count(),
+        std::chrono::duration_cast<std::chrono::microseconds>(executeStop.time_since_epoch()).count());
+  }
   std::vector<ProfileEvent> events;
-  std::function<void(const QnnProfile_EventId_t*, uint32_t, int)> walk =
-      [&](const QnnProfile_EventId_t* ids, uint32_t count, int depth) {
+  std::function<void(const QnnProfile_EventId_t*, uint32_t, int, int)> walk =
+      [&](const QnnProfile_EventId_t* ids, uint32_t count, int depth, int parent) {
         for (uint32_t i = 0; i < count; ++i) {
           QnnProfile_EventData_t data{};
           if (api_->profileGetEventData(ids[i], &data) != QNN_SUCCESS) continue;
-          events.push_back({depth, data.type, data.unit, data.value, data.identifier ? data.identifier : ""});
           const QnnProfile_EventId_t* sub = nullptr;
           uint32_t numSub = 0;
-          if (api_->profileGetSubEvents(ids[i], &sub, &numSub) == QNN_SUCCESS && numSub) walk(sub, numSub, depth + 1);
+          if (api_->profileGetSubEvents(ids[i], &sub, &numSub) != QNN_SUCCESS) numSub = 0;
+          const int eventIndex = static_cast<int>(events.size());
+          events.push_back({depth, data.type, data.unit, data.value, data.identifier ? data.identifier : "", parent, numSub});
+          if (numSub) walk(sub, numSub, depth + 1, eventIndex);
         }
       };
   const QnnProfile_EventId_t* ids = nullptr;
   uint32_t count = 0;
   // The handle holds only the most recent execute's events.
-  if (api_->profileGetEvents(profile_, &ids, &count) == QNN_SUCCESS) walk(ids, count, 0);
+  if (api_->profileGetEvents(profile_, &ids, &count) == QNN_SUCCESS) walk(ids, count, 0, -1);
   return events;
 }
 

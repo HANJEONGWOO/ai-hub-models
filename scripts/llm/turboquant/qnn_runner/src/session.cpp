@@ -331,11 +331,14 @@ StepRecord LlmSession::step(const std::vector<int32_t>& tokens, int ar, bool pro
   for (size_t p = 0; p < set.parts.size(); ++p) {
     auto partStart = Clock::now();
     if (profile) {
-      record.partProfiles.push_back(rt_.executeProfiled(*set.parts[p], set.inputs[p], set.outputs[p]));
+      double executeSeconds = 0.0;
+      record.partProfiles.push_back(rt_.executeProfiled(*set.parts[p], set.inputs[p], set.outputs[p], &executeSeconds));
+      record.partSeconds.push_back(executeSeconds);
+      record.profileReadSeconds.push_back(std::max(0.0, since(partStart) - executeSeconds));
     } else {
       rt_.execute(*set.parts[p], set.inputs[p], set.outputs[p]);
+      record.partSeconds.push_back(since(partStart));
     }
-    record.partSeconds.push_back(since(partStart));
   }
 
   auto commitStart = Clock::now();

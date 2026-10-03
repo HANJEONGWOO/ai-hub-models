@@ -45,7 +45,10 @@ struct Args {
   std::string dumpLogits;
   std::string graphSuffix;
   int profileDecodeStep = -1;
+  std::vector<int> profileDecodeSteps;
   bool profilePrefill = false;
+  bool profilePrefillAll = false;
+  std::string optraceDirectory;
   int sessions = 1;
   bool burst = true;
 };
@@ -71,6 +74,8 @@ Args parseArgs(int argc, char** argv) {
       a.burst = false;
     } else if (key == "--profile-prefill") {
       a.profilePrefill = true;
+    } else if (key == "--profile-prefill-all") {
+      a.profilePrefillAll = true;
     } else if (key.rfind("--", 0) == 0 && i + 1 < argc) {
       kv[key] = argv[++i];
     } else {
@@ -94,6 +99,13 @@ Args parseArgs(int argc, char** argv) {
   a.dumpLogits = get("--dump-logits", "");
   a.graphSuffix = get("--graph-suffix", "");
   a.profileDecodeStep = std::stoi(get("--profile-decode-step", "-1"));
+  a.optraceDirectory = get("--optrace-dir", "");
+  if (a.profileDecodeStep >= 0) a.profileDecodeSteps.push_back(a.profileDecodeStep);
+  for (const auto& step : split(get("--profile-decode-steps", ""), ',')) {
+    const int index = std::stoi(step);
+    if (index < 0 || index >= a.nGen - 1) throw std::runtime_error("profile decode step is outside generated decode range");
+    a.profileDecodeSteps.push_back(index);
+  }
   a.sessions = std::max(1, std::stoi(get("--sessions", "1")));
   if (kv.count("--eos")) {
     a.eos.clear();
@@ -212,6 +224,7 @@ std::string stepJson(const StepRecord& r, const char* kind) {
   j.num("prepare_s", r.prepareSeconds);
   j.num("commit_s", r.commitSeconds);
   j.raw("part_s", numberList(r.partSeconds));
+  j.raw("profile_read_s", numberList(r.profileReadSeconds));
   j.num("total_s", r.totalSeconds);
   return j.dump();
 }
@@ -222,8 +235,19 @@ std::string profileJson(const StepRecord& r, const std::string& label) {
   for (size_t p = 0; p < r.partProfiles.size(); ++p) {
     size_t cycleEvents = 0, codecEvents = 0, codecZero = 0;
     double cycles = 0.0, codecCycles = 0.0;
-    std::string timings = "[", codecList = "[";
+    std::string timings = "[", codecList = "[", raw = "[";
+    size_t eventIndex = 0;
     for (const auto& e : r.partProfiles[p]) {
+      Json entry;
+      entry.num("index", static_cast<double>(eventIndex));
+      entry.num("parent", e.parent);
+      entry.num("children", e.children);
+      entry.num("depth", e.depth);
+      entry.num("type", e.type);
+      entry.num("unit", e.unit);
+      entry.num("value", static_cast<double>(e.value));
+      entry.str("identifier", e.identifier);
+      raw += (eventIndex++ ? ", " : "") + entry.dump();
       if (e.unit == QNN_PROFILE_EVENTUNIT_CYCLES && e.depth > 0) {
         ++cycleEvents;
         cycles += static_cast<double>(e.value);
@@ -253,10 +277,21 @@ std::string profileJson(const StepRecord& r, const std::string& label) {
     part.num("codec_op_cycles_sum", codecCycles);
     part.raw("timings", timings + "]");
     part.raw("codec_ops", codecList + "]");
+    part.raw("raw_events", raw + "]");
     parts += (p ? ", " : "") + part.dump();
   }
   Json j;
   j.str("step", label);
+  j.num("schema_version", 2);
+  j.num("ar", r.ar);
+  j.num("graph_context", r.graphContext);
+  j.num("cached_before", static_cast<double>(r.cachedBefore));
+  j.num("new_tokens", r.newTokens);
+  j.num("past_slots", r.graphContext - r.ar);
+  j.num("prepare_s", r.prepareSeconds);
+  j.num("commit_s", r.commitSeconds);
+  j.raw("part_s", numberList(r.partSeconds));
+  j.raw("profile_read_s", numberList(r.profileReadSeconds));
   j.raw("parts", parts + "]");
   return j.dump();
 }
@@ -282,7 +317,8 @@ int main(int argc, char** argv) {
     if (!args.opPackage.empty()) rt.registerOpPackage(args.opPackage, args.opPackageProvider);
     memSamples.push_back("{\"at\": \"runtime\", \"mem\": " + memJson(readProcStatus()) + "}");
     const bool burst = args.burst && rt.setBurstPower();
-    if (args.profilePrefill || args.profileDecodeStep >= 0) rt.enableDetailedProfiling();
+    if (!args.optraceDirectory.empty()) rt.enableOptrace(args.optraceDirectory);
+    else if (args.profilePrefill || args.profilePrefillAll || !args.profileDecodeSteps.empty()) rt.enableDetailedProfiling();
 
     tqrun::SessionOptions options;
     options.bins = args.bins;
@@ -327,10 +363,10 @@ int main(int argc, char** argv) {
       prefillStart = Clock::now();
       for (const auto& [start, count] : chunks) {
         std::vector<int32_t> chunk(tokens.begin() + start, tokens.begin() + start + count);
-        const bool profiled = first && args.profilePrefill && start == chunks.back().first;
+        const bool profiled = first && (args.profilePrefillAll || (args.profilePrefill && start == chunks.back().first));
         StepRecord rec = session.step(chunk, prefillAr, profiled);
         steps.push_back(stepJson(rec, profiled ? "prefill_profiled" : "prefill"));
-        if (profiled) profiles.push_back(profileJson(rec, "prefill_last_chunk"));
+        if (profiled) profiles.push_back(profileJson(rec, args.profilePrefillAll ? "prefill_offset_" + std::to_string(start) : "prefill_last_chunk"));
         if (args.mode == "score") {
           for (size_t i = 0; i < count; ++i) {
             const size_t target = start + i + 1;
@@ -357,12 +393,13 @@ int main(int argc, char** argv) {
             break;
           }
           auto t0 = Clock::now();
-          const bool profiled = first && static_cast<int>(generated.size()) - 1 == args.profileDecodeStep;
+          const int decodeIndex = static_cast<int>(generated.size()) - 1;
+          const bool profiled = first && std::find(args.profileDecodeSteps.begin(), args.profileDecodeSteps.end(), decodeIndex) != args.profileDecodeSteps.end();
           StepRecord rec = session.step({next}, 1, profiled);
           session.logitsRow(0, row);
           next = argmax(row);
           if (profiled) {
-            profiles.push_back(profileJson(rec, "decode_" + std::to_string(args.profileDecodeStep)));
+            profiles.push_back(profileJson(rec, "decode_" + std::to_string(decodeIndex)));
           } else {
             decodeTimes.push_back(std::chrono::duration<double>(Clock::now() - t0).count());
           }

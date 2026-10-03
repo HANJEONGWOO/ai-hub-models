@@ -45,6 +45,7 @@ struct StepRecord {
   double prepareSeconds = 0.0;
   double commitSeconds = 0.0;
   std::vector<double> partSeconds;
+  std::vector<double> profileReadSeconds;
   std::vector<std::vector<ProfileEvent>> partProfiles;  // filled only for profiled steps
   double totalSeconds = 0.0;
 };
