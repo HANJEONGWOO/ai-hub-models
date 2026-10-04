@@ -24,7 +24,7 @@ from typing import Any
 from model_identity import sha256_file, validate_model
 from summarize_native_results import performance, read
 
-MODELS = ("qwen3_0_6b", "qwen3_1_7b", "qwen3_4b")
+MODELS = ("qwen3_0_6b", "qwen3_1_7b", "qwen3_4b", "qwen3_8b")
 GROUPS = {"baseline_int16": "baseline_int16_kv", "turboquant": "k4_v4_scaled"}
 BUCKETS = {"baseline_int16": [1024], "turboquant": [128, 256, 512, 1024]}
 SCRIPTS = Path(__file__).resolve().parent

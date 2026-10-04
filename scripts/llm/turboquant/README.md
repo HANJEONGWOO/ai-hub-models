@@ -182,7 +182,7 @@ cost, without changing the captured device data. See design §23 for results.
 ## Model selection: Qwen3-4B is opt-in
 
 `benchmark_model_once.py` supports `qwen3_1_7b` (the unchanged default),
-`qwen3_0_6b` and `qwen3_4b` (explicit `--model-id` only). It prepares a W4A16 split checkpoint,
+`qwen3_0_6b`, `qwen3_4b` and `qwen3_8b` (explicit `--model-id` only). It prepares a W4A16 split checkpoint,
 builds **int16 KV** and **current Dense+Native K4/V4, QJL-off, current KV
 quantized** bundles, audits them, and measures both newly. It does not reuse
 1.7B metrics for the 4B comparison. Model definitions and global defaults are
@@ -242,6 +242,85 @@ The completed Qwen3-4B device comparison (2026-09-23) is recorded in design
 and PPL **18.4237→21.7333** (int16→current TurboQuant). Both controls were
 built and measured anew, once per input condition. These results do not change
 the default model or establish a speed/quality advantage for the 4B codec.
+
+## Qwen3-8B: FP16 attention versus current TurboQuant
+
+The 8B model is opt-in and uses its published v5 W4A16 checkpoint, five split
+parts and 36 transformer layers (32 query heads, 8 KV heads, head dimension 128).
+It does not change the default model or recalibrate/retrain the checkpoint.
+The FP16 control retains W4A16 outside the audited FP16 KV/attention path.
+The compiled FP16 audit recognizes the checkpoint's K/scalar division as
+QAIRT `Eltwise_Binary` operation 2 only when it matches the source `Div`, has
+a static scalar divisor and preserves FP16 throughout; other elementwise
+operations and hidden int8 conversions remain rejected.
+
+Use a fresh work directory on D. Prepare the model-specific split and input
+assets, then build one part per process, serially:
+
+```bash
+TQ_WORK=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_8b_fp16_turboquant_new
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/benchmark_model_once.py prepare \
+    --model-id qwen3_8b --cl1024-only --work-dir "$TQ_WORK"
+for tq_part in 1 2 3 4 5; do
+    PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+        scripts/llm/turboquant/convert_parts.py --split-dir "$TQ_WORK/split" \
+        --out "$TQ_WORK/fp16" --profile baseline_fp16_kv_fp16_attn \
+        --context-length 1024 --sequence-lengths 128 1 --parts "$tq_part" || break
+done
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/benchmark_model_once.py build --groups turboquant \
+    --model-id qwen3_8b --cl1024-only --work-dir "$TQ_WORK"
+```
+
+Only continue after all five parts of each group have completed. Audit the
+compiled attention boundaries and unchanged FP16 source weights/encodings:
+
+```bash
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/verify_fp16_attention.py --bundle "$TQ_WORK/fp16" \
+    --split-dir "$TQ_WORK/split" --report "$TQ_WORK/reports/fp16_graph_audit.json"
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/verify_rotated_attention.py --bundle "$TQ_WORK/turboquant" \
+    --report "$TQ_WORK/reports/turboquant_graph_audit.json"
+bash scripts/llm/turboquant/qnn_runner/build_android.sh "$TQ_WORK/runner"
+for stage in push functional performance quality summarize; do
+    PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+        scripts/llm/turboquant/benchmark_fp16_attention_once.py "$stage" \
+        --model-id qwen3_8b --groups fp16 turboquant \
+        --fp16-bundle "$TQ_WORK/fp16" --turboquant-bundle "$TQ_WORK/turboquant" \
+        --assets "$TQ_WORK/assets" --runner "$TQ_WORK/runner/qnn-llm-runner" \
+        --reports "$TQ_WORK/reports" --name "$(basename "$TQ_WORK")" || break
+done
+```
+
+Both groups use fixed C1024 for short and 897-token prompts, with 128 generated
+tokens and **one session per group/input condition**. Four separate 1024-token
+WikiText windows supply token-weighted PPL (4092 scored tokens). TTFT,
+prefill/decode throughput, host KV, end VmRSS and peak VmHWM follow the existing
+FP16 comparison. Expected cache capacity is **144 MiB FP16 / 37.125 MiB TQ**;
+these are layout checks, not estimates of total process/device memory. Reset
+and EOS diagnostics are separate; EOS-failed groups remain explicitly labelled.
+Hashes freeze both groups' binaries, runner, assets and compiled graph audits.
+The historical three-group 1.7B CLI remains the default.
+
+The completed 8B comparison (2026-10-04) is recorded in design section 24 of
+[`turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
+For the long prompt, FP16 versus TQ measured **9.136 / 10.431 tok/s decode**,
+**144.000 / 37.125 MiB host KV**, and **12.086954 / 12.658172 PPL**.
+TQ's observed decode gain was 14.18%, with 74.22% less cache and 4.73% higher
+PPL; prefill fell from 824.437 to 692.561 tok/s. These are single runs, not a
+variance-controlled performance claim. Both reset/EOS checks and both compiled
+graph audits passed. Peak process VmHWM did not decrease (1463.125 / 1480.098
+MiB), despite lower end VmRSS; neither metric represents total NPU memory.
+
+Artifacts are under
+`/mnt/d/ai-hub-models/binaries/turboquant/qwen3_8b_fp16_turboquant_20261003/`
+(the directory uses the build start date). `reports/summary.json` contains all
+metrics, `reports/experiment.json` freezes the inputs, and raw generation/PPL
+reports, audit reports and build logs are retained beside them. The two groups'
+serial builds took 4:31:27, excluding split/assets preparation and evaluation;
+`reports/build_resource_usage.json` records the build process resource usage.
 
 ## Qwen3-0.6B: fixed C1024 comparison
 

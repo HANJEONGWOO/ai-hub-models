@@ -29,6 +29,7 @@ def model_info(model_id: str = "qwen3_4b") -> dict[str, Any]:
         "qwen3_0_6b": (28, 1024, 16),
         "qwen3_1_7b": (28, 2048, 16),
         "qwen3_4b": (36, 2560, 32),
+        "qwen3_8b": (36, 4096, 32),
     }[model_id]
     return {
         "model_id": model_id,
@@ -117,6 +118,12 @@ def test_default_remains_1_7b(benchmark: ModuleType) -> None:
         ["build", "--work-dir", "unused", "--model-id", "qwen3_0_6b", "--cl1024-only"]
     )
     assert small.model_id == "qwen3_0_6b" and small.cl1024_only
+    assert (
+        benchmark.parser()
+        .parse_args(["prepare", "--work-dir", "unused", "--model-id", "qwen3_8b"])
+        .model_id
+        == "qwen3_8b"
+    )
     assert benchmark.context_buckets(True) == {
         "baseline_int16": [1024],
         "turboquant": [1024],
@@ -131,6 +138,7 @@ def test_default_remains_1_7b(benchmark: ModuleType) -> None:
         ("qwen3_0_6b", 112, 28.875),
         ("qwen3_1_7b", 112, 28.875),
         ("qwen3_4b", 144, 37.125),
+        ("qwen3_8b", 144, 37.125),
     ],
 )
 def test_model_specific_kv_memory(

@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
-"""One-run CL1024 comparison of legacy int16, FP16 attention and current TQ.
+"""One-run CL1024 comparison of FP16 attention and current TQ, optionally int16.
 
 Use explicit existing bundles; never rebuild or modify historical artifacts.
 Attempts are exclusive-create, including failed runs. All groups use the same
@@ -18,7 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from model_identity import sha256_file
+from model_identity import QWEN_SHAPES, sha256_file, validate_model
 from summarize_native_results import performance, read
 
 PROFILES = {
@@ -29,45 +29,108 @@ PROFILES = {
 SCRIPTS = Path(__file__).resolve().parent
 
 
+def validate_inputs(model_id: str, assets: dict, metadata: dict) -> tuple[int, int]:
+    """Validate explicit model identity; retain support for legacy 1.7B bundles."""
+    layers, _, _, _, head_dim = QWEN_SHAPES[model_id]
+    legacy = model_id == "qwen3_1_7b"
+    identities = [assets.get("model"), *(m.get("model") for m in metadata.values())]
+    if not legacy and any(identity is None for identity in identities):
+        raise ValueError("Explicit model/checkpoint identity is required")
+    present = [identity for identity in identities if identity is not None]
+    for identity in present:
+        validate_model(identity)
+        if identity["model_id"] != model_id or identity != present[0]:
+            raise ValueError("Model/tokenizer identity differs between groups/assets")
+    split_hashes = {m.get("split_manifest_sha256") for m in metadata.values()}
+    if not legacy and (None in split_hashes or len(split_hashes) != 1):
+        raise ValueError("Groups must share the same split checkpoint")
+    total = len(next(iter(metadata.values()))["parts"])
+    if total < 2 or (not present and total != 4):
+        raise ValueError("Unexpected split part count")
+    parts = {f"part{i}_of_{total}" for i in range(1, total + 1)}
+    for group, data in metadata.items():
+        if (
+            data["profile"] != PROFILES[group]
+            or data["context_length"] != 1024
+            or 1024 not in data.get("context_buckets", [1024])
+            or set(data["parts"]) != parts
+            or data.get("num_parts", total) != total
+        ):
+            raise ValueError(f"Unexpected bundle: {group}")
+    if assets.get("rope_half", head_dim // 2) != head_dim // 2:
+        raise ValueError("Wrong model-specific RoPE dimensions")
+    return total, layers
+
+
+def expected_kv_bytes(model_id: str, group: str) -> int:
+    layers, _, _, heads, dim = QWEN_SHAPES[model_id]
+    width = dim // 2 + 2 if group == "turboquant" else dim * 2
+    return layers * 2 * heads * 1024 * width
+
+
+def validate_audit(audit: dict, bundle: Path, layers: int) -> None:
+    if (
+        not audit["passed"]
+        or Path(audit["bundle"]).resolve() != bundle
+        or not audit["graphs"]
+        or any(g.get("violations") for g in audit["graphs"].values())
+    ):
+        raise ValueError("Compiled graph audit must pass for this bundle")
+    for ar in (1, 128):
+        observed = [
+            layer
+            for name, graph in audit["graphs"].items()
+            if name.startswith(f"{'token' if ar == 1 else 'prompt'}_ar{ar}_cl1024_")
+            for layer in graph["layers"]
+        ]
+        if sorted(observed) != list(range(layers)):
+            raise ValueError("Audit is missing/duplicating model layers")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "stage", choices=["push", "functional", "performance", "quality", "summarize"]
     )
+    parser.add_argument("--model-id", choices=list(QWEN_SHAPES), default="qwen3_1_7b")
+    parser.add_argument(
+        "--groups", choices=list(PROFILES), nargs="+", default=list(PROFILES)
+    )
     for group in PROFILES:
-        parser.add_argument(f"--{group}-bundle", type=Path, required=True)
+        parser.add_argument(f"--{group}-bundle", type=Path)
     parser.add_argument("--runner", type=Path, required=True)
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--reports", type=Path, required=True)
     parser.add_argument("--name", default="fp16_attention_20260929")
     args = parser.parse_args()
+    groups = args.groups
+    if len(set(groups)) != len(groups) or not {"fp16", "turboquant"} <= set(groups):
+        parser.error("Select distinct groups including fp16 and turboquant")
+    if any(getattr(args, g + "_bundle") is None for g in groups):
+        parser.error("Supply --<group>-bundle for every selected group")
     root = args.reports
     root.mkdir(parents=True, exist_ok=True)
     assets = read(args.assets / "assets.json")
     if (
         assets["context_length"] != 1024
-        or assets["prompt_tokens"] != 35
+        or not 0 < assets["prompt_tokens"] < 897
         or len(assets["wikitext_windows"]) != 4
     ):
-        raise ValueError("Expected unchanged 1.7B CL1024 assets")
+        raise ValueError("Expected CL1024 assets and four quality windows")
     for name, digest in assets["sha256"].items():
         if sha256_file(args.assets / name) != digest:
             raise ValueError(f"Asset identity changed: {name}")
-    bundles = {g: getattr(args, g + "_bundle").resolve() for g in PROFILES}
+    bundles = {g: getattr(args, g + "_bundle").resolve() for g in groups}
     metadata = {g: read(p / "convert_report.json") for g, p in bundles.items()}
-    for group, data in metadata.items():
-        if (
-            data["profile"] != PROFILES[group]
-            or data["context_length"] != 1024
-            or set(data["parts"]) != {f"part{i}_of_4" for i in range(1, 5)}
-        ):
-            raise ValueError(f"Unexpected bundle: {group}")
+    total, layers = validate_inputs(args.model_id, assets, metadata)
     tq = metadata["turboquant"]
     if (
         not tq.get("quantize_current_kv")
         or not tq.get("native_decoder")
         or tq["config"]["rotation"] != "dense_qr"
         or tq["config"].get("qjl")
+        or not tq.get("rotated_attention")
+        or tq.get("attention_tile") != 256
     ):
         raise ValueError("Expected Dense+Native K4/V4, QJL-off, quantized current KV")
     identity = {
@@ -81,13 +144,20 @@ def main() -> None:
                 "bundle": str(p),
                 "conversion_sha256": sha256_file(p / "convert_report.json"),
                 "bins_sha256": {
-                    f"part{i}_of_4.bin": sha256_file(p / f"part{i}_of_4.bin")
-                    for i in range(1, 5)
+                    f"part{i}_of_{total}.bin": sha256_file(
+                        p / f"part{i}_of_{total}.bin"
+                    )
+                    for i in range(1, total + 1)
                 },
             }
             for g, p in bundles.items()
         },
     }
+    if args.model_id != "qwen3_1_7b":
+        identity["model"] = assets["model"]
+        identity["turboquant_graph_audit_sha256"] = sha256_file(
+            root / "turboquant_graph_audit.json"
+        )
     experiment = root / "experiment.json"
     if experiment.exists():
         if read(experiment) != identity:
@@ -140,40 +210,48 @@ def main() -> None:
             != assets["sha256"][data["assets"]["tokens_file"]]
         ):
             raise ValueError("Wrong measurement input")
-        expected_bytes = int((28.875 if group == "turboquant" else 112) * 2**20)
+        if metadata[group].get("model") and (
+            data.get("model") != metadata[group]["model"]
+            or data.get("split_manifest_sha256")
+            != metadata[group].get("split_manifest_sha256")
+            or data["assets"].get("rope_sha256") != assets["sha256"][assets["rope"]]
+        ):
+            raise ValueError("Wrong runtime model/checkpoint/RoPE identity")
+        if (
+            group == "turboquant"
+            and data.get("native_decoder", {}).get("sha256")
+            != tq["native_decoder"]["libraries"]["hexagon-v81"]["sha256"]
+        ):
+            raise ValueError("Native decoder differs from build")
+        expected_bytes = expected_kv_bytes(args.model_id, group)
         if data["kv_store_bytes"] != expected_bytes:
-            raise ValueError("Unexpected 1.7B CL1024 host cache allocation")
+            raise ValueError("Unexpected model-specific CL1024 host cache allocation")
         if group == "fp16" and (
-            len(data["kv_streams"]) != 56
+            len(data["kv_streams"]) != layers * 2
             or any(s["dtype"] != "float16" for s in data["kv_streams"])
         ):
-            raise ValueError("Device cache is not 56 FP16 K/V streams")
+            raise ValueError(
+                "Device cache does not contain FP16 streams for every layer"
+            )
         return data
 
     if args.stage == "push":
         audit = read(root / "fp16_graph_audit.json")
-        if (
-            not audit["passed"]
-            or len(audit["graphs"]) != 6
-            or audit["config_hash"] != metadata["fp16"]["config_hash"]
-            or Path(audit["bundle"]).resolve() != bundles["fp16"]
-        ):
-            raise ValueError("Complete FP16 compiled graph audit must pass first")
-        for ar in (1, 128):
-            layers = [
-                layer
-                for name, graph in audit["graphs"].items()
-                if name.startswith(f"{'token' if ar == 1 else 'prompt'}_ar{ar}_cl1024_")
-                for layer in graph["layers"]
-            ]
-            if sorted(layers) != list(range(28)):
-                raise ValueError("FP16 audit is missing/duplicating model layers")
+        validate_audit(audit, bundles["fp16"], layers)
+        if audit["config_hash"] != metadata["fp16"]["config_hash"]:
+            raise ValueError("FP16 audit config differs from bundle")
+        if args.model_id != "qwen3_1_7b":
+            validate_audit(
+                read(root / "turboquant_graph_audit.json"),
+                bundles["turboquant"],
+                layers,
+            )
         for group, bundle in bundles.items():
             # Push writes runtime metadata; keep historical bundles immutable.
             staging = root / "staging" / group
             staging.mkdir(parents=True, exist_ok=True)
-            for i in range(1, 5):
-                target = staging / f"part{i}_of_4.bin"
+            for i in range(1, total + 1):
+                target = staging / f"part{i}_of_{total}.bin"
                 if not target.exists():
                     target.symlink_to(bundle / target.name)
             conversion = staging / "convert_report.json"
@@ -193,7 +271,7 @@ def main() -> None:
             )
     elif args.stage == "functional":
         checks = {}
-        for group in PROFILES:
+        for group in groups:
             reset = run(
                 group,
                 "reset",
@@ -204,7 +282,8 @@ def main() -> None:
                 len(sessions) == 2
                 and sessions[0]["generated"] == sessions[1]["generated"]
                 and all(
-                    len(s["generated"]) == 8 and s["cached_tokens_at_end"] == 42
+                    len(s["generated"]) == 8
+                    and s["cached_tokens_at_end"] == assets["prompt_tokens"] + 7
                     for s in sessions
                 )
             )
@@ -224,10 +303,10 @@ def main() -> None:
         if not all(c["reset"] for c in checks.values()):
             raise ValueError("Reset check must pass")
         for condition, tokens, prompt in (
-            ("short", "prompt_ids.bin", 35),
-            ("long", "boundary_prompt_cl1024.bin", 897),
+            ("short", assets["prompt_ids"], assets["prompt_tokens"]),
+            ("long", assets["boundary_prompt"], 897),
         ):
-            for group in PROFILES:
+            for group in groups:
                 run(
                     group,
                     f"{condition}_once",
@@ -250,11 +329,11 @@ def main() -> None:
                 )
     elif args.stage == "quality":
         for window in range(4):
-            for group in PROFILES:
+            for group in groups:
                 data = run(
                     group,
                     f"score_w{window}",
-                    ["--mode", "score", "--tokens", f"wikitext_w{window}.bin"],
+                    ["--mode", "score", "--tokens", assets["wikitext_windows"][window]],
                 )
                 if data["scored_tokens"] != 1023 or not math.isfinite(data["nll_sum"]):
                     raise ValueError("Invalid PPL scoring result")
@@ -266,13 +345,15 @@ def main() -> None:
             "groups": {},
         }
         devices = set()
-        for group in PROFILES:
+        for group in groups:
             windows = [read(root / f"{group}_score_w{i}.json") for i in range(4)]
             tokens = sum(w["scored_tokens"] for w in windows)
             nll = sum(w["nll_sum"] for w in windows)
             summary["groups"][group] = {
                 "diagnostic_only": not summary["functional"][group]["eos"],
-                "short": performance(root / f"{group}_short_once.json", 35),
+                "short": performance(
+                    root / f"{group}_short_once.json", assets["prompt_tokens"]
+                ),
                 "long": performance(root / f"{group}_long_once.json", 897),
                 "quality": {
                     "ppl": math.exp(nll / tokens),
