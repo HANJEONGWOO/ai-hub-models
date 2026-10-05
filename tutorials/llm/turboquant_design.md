@@ -2210,6 +2210,132 @@ TurboQuant **22.941/25.408/25.605 ms**다. 그래프의 past slot은 동일하�
 재현 명령은 README의 HTP optrace 절에 있다. Android main/smoke runner 빌드,
 Python 정적 검사와 TurboQuant 관련 **482 tests**를 통과했다.
 
-## 24. 출처
+## 24. Qwen3-8B FP16 attention / TurboQuant 비교 (2026-10-04)
+
+### 24.1 변경 범위와 검증
+
+- `qwen3_8b`를 명시적으로 선택할 수 있게 확장했다. 기본 모델은 계속
+  Qwen3-1.7B이며, 기존 int16/FP16/TQ 프로파일과 알고리즘 기본값은 유지한다.
+- 공개 v5 Qwen3-8B W4A16 checkpoint를 공통으로 사용했다. 36개 layer,
+  hidden size 4096, query 32 heads, KV 8 heads, head dimension 128이며
+  embedding + transformer 9개 layer씩 네 묶음의 **5-part** 구조다.
+- FP16은 `baseline_fp16_kv_fp16_attn`, 즉 **FP16 KV 저장 + FP16 입력 QK·AV**다.
+  전체 모델을 FP16으로 바꾼 것이 아니다. 원본 checkpoint의 가중치 정밀도
+  예외와 비-KV calibrated boundary를 유지하며 재보정/재학습하지 않았다.
+- TQ는 기존 **Dense QR + Native HVX LUT, K4/V4, QJL-off, tile256**을 유지했다.
+  현재 토큰 KV도 양자화한 후 attention에서 사용한다. 회전·codec·Native kernel
+  알고리즘은 이번 작업에서 변경하지 않았다.
+- FP16 최종 DLC 8개에서 36개 layer의 AR128/AR1 **QK·AV 4,608개** 입력과
+  KV I/O가 FP16인지, 숨은 int8 KV 경로나 current KV 우회가 없는지 검사했다.
+  원본 가중치와 parameter encodings 보존 검사도 통과했다.
+- 8B의 K/scalar division은 QAIRT에서 `Eltwise_Binary` operation 2로 나타난다.
+  FP16 감사기가 원본 ONNX `Div`와 동일하고 FP16 입출력·static scalar divisor를
+  가진 정확한 key-scaling 연산만 허용하도록 보완했다. 임의의 elementwise
+  연산을 허용하거나 실행 그래프를 수정한 것이 아니다.
+- TQ 최종 DLC 8개의 36개 layer에서도 Dense rotation, Native decoder,
+  현재 KV 양자화, tiled intermediate 제한을 검사해 통과했다.
+- 실기기의 FP16 KV stream 72개가 모두 `float16`임을 확인했다. 두 구성 모두
+  reset/EOS 검사를 통과했다. 이는 별도의 기능 검사이며 아래 성능 표와 섞지 않았다.
+- 관련 테스트 **508개 통과**, 수정 Python 파일 정적 검사 통과.
+
+### 24.2 측정 조건과 결과
+
+S26 Ultra / SM8850, QAIRT 2.48.0.260626, 공통 runner와 같은 tokenizer/RoPE/입력
+파일을 사용했다. 각 구성의 prefill/decode는 모두 **C1024 고정**, AR128/AR1이다.
+입력·바이너리·runner·그래프 감사 결과를 해시로 고정했다.
+
+성능은 구성별/입력 조건별 **각 1회**다. 생성 128개 중 decode 127 step을
+집계하며 모델 로딩은 TTFT에서 제외한다. profiling은 끈 상태이고 별도의
+온도 통제·반복 측정·분산 추정은 없다. 이전 모델의 측정값을 재사용하지 않았다.
+
+긴 입력: **897 prompt + 128 generated tokens**, 종료 cache 1024 tokens.
+
+| 지표 | FP16 KV + FP16 QK·AV | Dense+Native K4/V4 | TQ 변화율 |
+|---|---:|---:|---:|
+| TTFT (ms) | 1090.768 | 1297.877 | +18.99% |
+| prefill (tok/s) | 824.437 | 692.561 | -16.00% |
+| decode (tok/s) | 9.136 | 10.431 | +14.18% |
+| decode (ms/token) | 109.462 | 95.865 | -12.42% |
+| host KV (MiB) | 144.000 | 37.125 | -74.22% |
+| I/O buffer (MiB) | 329.699 | 115.949 | -64.83% |
+| 종료 VmRSS (MiB) | 492.770 | 186.602 | -62.13% |
+| process VmHWM (MiB) | 1463.125 | 1480.098 | +1.16% |
+| PPL (별도 4 window) | 12.086954 | 12.658172 | +4.73% |
+
+짧은 입력: **35 prompt + 128 generated tokens**, 동일하게 C1024 고정.
+
+| 지표 | FP16 KV + FP16 QK·AV | Dense+Native K4/V4 |
+|---|---:|---:|
+| TTFT (ms) | 131.167 | 159.545 |
+| prefill (tok/s) | 267.647 | 219.892 |
+| decode (tok/s) | 9.323 | 10.613 |
+| host KV (MiB) | 144.000 | 37.125 |
+| 종료 VmRSS (MiB) | 492.965 | 185.770 |
+| process VmHWM (MiB) | 1463.320 | 1479.227 |
+
+PPL은 같은 WikiText 1024-token window 4개에서 각 1023개, 총 **4092 scored
+tokens**의 NLL 합으로 계산했다. 아래 PPL의 산술평균이 아니다.
+
+| Window | FP16 PPL | TQ PPL |
+|---|---:|---:|
+| 0 | 7.715981 | 8.289953 |
+| 1 | 14.133772 | 15.106800 |
+| 2 | 12.785968 | 12.919370 |
+| 3 | 15.306808 | 15.867849 |
+
+### 24.3 해석과 한계
+
+이번 단회에서 TQ는 긴 입력 decode **+14.18%**, 짧은 입력 **+13.84%**를
+관측했다. 캐시와 종료 host RSS는 줄었지만, prefill은 느려지고 PPL은
+**+0.571218 (+4.73%)** 상승했다. 따라서 품질 손실 없는 가속이라고 주장하지
+않으며, 모델/문맥 전체에 대한 통계적인 성능 우세로 일반화하지 않는다.
+
+별도의 optrace를 추가하지 않고 기존 runner가 기록한 긴 입력 decode의
+step별 host wall time을 평균하면 다음과 같다.
+
+| 구간 (ms/step) | FP16 | TQ |
+|---|---:|---:|
+| host 입력 준비 (`prepare`) | 14.554 | 3.268 |
+| QNN part 실행 합 | 92.345 | 90.316 |
+| KV 저장 (`commit`) | 0.630 | 0.056 |
+
+관측된 decode 시간 차이 13.598 ms/token 가운데 큰 부분은 host 입력 준비
+감소 11.286 ms/step과 함께 나타난다. QNN 구간은 2.029 ms/step 감소에 그쳤다.
+즉, 이 결과를 NPU의 TurboQuant codec 자체가 FP16보다 빠르다는 뜻으로 해석하면
+안 된다. 위 세 구간은 argmax 등 모든 host 비용을 포함하지 않아 전체 token
+시간과 정확히 합산되지 않는다. FP16의 untiled/unrotated attention과 TQ의
+rotated tiled attention도 함께 달라, 압축만의 독립적인 효과를 분리한 실험은 아니다.
+
+종료 VmRSS와 로딩을 포함한 peak VmHWM은 서로 다른 지표다. 이번에는 종료 RSS는
+감소했지만 peak는 조금 증가했다. 둘 다 runner 프로세스의 지표이며 **기기/NPU
+전체 메모리 사용량이 아니다**. 그래프 정밀도·배선 검사 통과는 encoder의 golden
+수치 gate 통과와도 다르다. 기존 encoder 수치 gate 제한을 해결하거나 8B에서
+새로 검증한 작업은 아니며, 품질은 위 PPL과 제한된 기능 검사로 관측했다.
+
+### 24.4 산출물과 빌드 기록
+
+루트: `/mnt/d/ai-hub-models/binaries/turboquant/qwen3_8b_fp16_turboquant_20261003/`.
+디렉터리 날짜는 빌드 시작일이며 실기기 측정일은 2026-10-04다.
+
+- `split/`, `assets/`: 공통 checkpoint split과 모델별 입력·RoPE.
+- `fp16/`, `turboquant/`: 각 5개 context binary와 ONNX/DLC/변환 로그.
+- `runner/`: 공통 Android runner.
+- `reports/summary.json`: short/long/PPL 최종 비교.
+- `reports/experiment.json`: 모델/checkpoint, 바이너리, 입력, runner, 감사 해시.
+- `reports/{fp16,turboquant}_graph_audit.json`: 전체 compiled graph 검증.
+- `reports/functional.json`, `*_reset.json`, `*_eos.json`: 기능 검사 원본.
+- `reports/{fp16,turboquant}_{short,long}_once.json`: 구성·조건별 단회 성능 원본.
+- `reports/{fp16,turboquant}_score_w{0,1,2,3}.json`: window별 품질 원본.
+- `reports/build_*_part*.stdout.log`, `build_resource_usage.json`: 빌드 기록.
+
+두 구성의 10개 part를 순차 빌드한 시간은 **4:31:27**이다. split/입력 준비와
+실기기 평가는 제외한다. `/usr/bin/time -v`의 maximum RSS는 **24,430,828 KiB
+(약 23.30 GiB)**이며, 이는 build 프로세스/자식의 최대값이지 WSL 전체 메모리
+합계가 아니다. 빌드 중 확인한 WSL swap은 64 KiB로 유지됐다.
+
+재현 명령은 README의 Qwen3-8B 절에 있다. 새 측정에는 새 실험 디렉터리와
+기기 bundle 이름을 사용하며, 완료한 단회 측정을 덮어쓰거나 반복하지 않는다.
+
+## 25. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

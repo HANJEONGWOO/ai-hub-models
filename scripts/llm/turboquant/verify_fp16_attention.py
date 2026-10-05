@@ -13,7 +13,32 @@ from pathlib import Path
 from typing import Any
 
 import onnx
-from verify_kv_boundary import INT8_TYPES, PASS_THROUGH, parse_dlcinfo
+from verify_kv_boundary import INT8_TYPES, PASS_THROUGH, Op, parse_dlcinfo
+
+
+def is_fp16_key_scale(op: Op, source: dict[str, onnx.NodeProto]) -> bool:
+    """Recognize the compiled K/scalar Div used by the 4B/8B checkpoints.
+
+    QAIRT names this Eltwise_Binary, operation 2 (QnnOpDef.h). Accept only
+    the source-matched, FP16, static-scalar division, not arbitrary Eltwise ops.
+    """
+    node = source.get(op.name)
+    prefix = op.name.removesuffix("key_scaled")
+    return (
+        re.fullmatch(r"fp16_attn_\d+_head\d+_key_scaled", op.name) is not None
+        and op.op_type == "Eltwise_Binary"
+        and "operation: 2" in op.params
+        and node is not None
+        and node.op_type == "Div"
+        and list(node.input) == [prefix + "key_cat", prefix + "divisor"]
+        and [t.name for t in op.inputs] == list(node.input)
+        and [t.name for t in op.outputs] == [op.name]
+        and all(t.dtype == "Float_16" for t in (*op.inputs, *op.outputs))
+        and op.inputs[0].ttype != "STATIC"
+        and op.inputs[1].ttype == "STATIC"
+        and op.inputs[1].dims.replace(" ", "") == "1"
+        and op.outputs[0].dims == op.inputs[0].dims
+    )
 
 
 def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
@@ -24,6 +49,7 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
     info = parse_dlcinfo(bundle / f"{name}.dlcinfo.txt")
     model = onnx.load(bundle / f"{name}.onnx", load_external_data=False)
     source = {o: n for n in model.graph.node for o in n.output}
+    scalar_divisions = {op.name for op in info.ops if is_fp16_key_scale(op, source)}
     errors = []
     kv_names = {
         v.name
@@ -77,12 +103,12 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                 if tensor in wanted:
                     continue
                 producer = info.producer.get(tensor)
-                if producer is not None and producer.op_type in PASS_THROUGH | {
-                    "Convert",
-                    "Cast",
-                    "ElementWiseMultiply",
-                    "ElementWiseDivide",
-                }:
+                if producer is not None and (
+                    producer.op_type
+                    in PASS_THROUGH
+                    | {"Convert", "Cast", "ElementWiseMultiply", "ElementWiseDivide"}
+                    or producer.name in scalar_divisions
+                ):
                     pending_rhs.extend(
                         t.name for t in producer.inputs if t.ttype != "STATIC"
                     )
@@ -139,12 +165,12 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
             if op.name in products:
                 reached.add(op.name)
                 continue
-            if op.op_type not in PASS_THROUGH | {
-                "Convert",
-                "Cast",
-                "ElementWiseMultiply",
-                "ElementWiseDivide",
-            }:
+            if (
+                op.op_type
+                not in PASS_THROUGH
+                | {"Convert", "Cast", "ElementWiseMultiply", "ElementWiseDivide"}
+                and op.name not in scalar_divisions
+            ):
                 errors.append(f"Unexpected cache reader: {op.name}/{op.op_type}")
                 continue
             for tensor in op.outputs:

@@ -185,14 +185,18 @@ def test_fp16_configuration_and_fail_closed() -> None:
 @pytest.mark.parametrize(
     "fault", [None, "kv_io", "qk", "hidden_int8", "raw_current", "missing_product"]
 )
+@pytest.mark.parametrize("key_divisor", [None, 8.0])
 def test_compiled_audit_rejects_precision_and_wiring_regressions(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    fault: str | None,
+    key_divisor: float | None,
 ) -> None:
     scripts = Path(__file__).resolve().parents[4] / "scripts/llm/turboquant"
     monkeypatch.syspath_prepend(str(scripts))
     audit = importlib.import_module("verify_fp16_attention")
     boundary = importlib.import_module("verify_kv_boundary")
-    model, enc = attention_part(1)
+    model, enc = attention_part(1, key_divisor)
     result = use_fp16_kv_attention(
         apply_kv_profile(model, enc, CONFIG, 1, CONTEXT), CONFIG
     )
@@ -207,12 +211,15 @@ def test_compiled_audit_rejects_precision_and_wiring_regressions(
         if v.type.tensor_type.elem_type == TensorProto.FLOAT16
     }
     static = {t.name for t in inferred.graph.initializer}
+    for node in inferred.graph.node:
+        if node.op_type == "Cast" and node.input[0] in static:
+            static.update(node.output)
 
     def tensor(name: str) -> Any:
         return boundary.Tensor(
             name,
             "Float_16" if name in half else "uFxp_16",
-            "",
+            "1" if name in static else "",
             "STATIC" if name in static else "NATIVE",
         )
 
@@ -225,6 +232,9 @@ def test_compiled_audit_rejects_precision_and_wiring_regressions(
             [tensor(t) for t in n.input],
             [tensor(t) for t in n.output],
         )
+        if n.op_type == "Div" and n.name.endswith("key_scaled"):
+            op.op_type = "Eltwise_Binary"
+            op.params = ["operation: 2"]
         ops.append(op)
         for t in op.outputs:
             producers[t.name] = op
@@ -257,3 +267,44 @@ def test_compiled_audit_rejects_precision_and_wiring_regressions(
     (tmp_path / "graph.kv_edits.json").write_text(json.dumps(result.report()))
     report = audit.verify_graph(tmp_path, "graph")
     assert bool(report["violations"]) == (fault is not None)
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "operation", "dynamic", "vector", "int8", "source", "operands"]
+)
+def test_fp16_scalar_div_audit_is_narrow(
+    monkeypatch: pytest.MonkeyPatch, fault: str | None
+) -> None:
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[4] / "scripts/llm/turboquant")
+    )
+    audit = importlib.import_module("verify_fp16_attention")
+    boundary = importlib.import_module("verify_kv_boundary")
+    prefix = "fp16_attn_0_head0_"
+    source = onnx.helper.make_node(
+        "Div", [prefix + "key_cat", prefix + "divisor"], [prefix + "key_scaled"]
+    )
+    op = boundary.Op(
+        "1",
+        prefix + "key_scaled",
+        "Eltwise_Binary",
+        [
+            boundary.Tensor(prefix + "key_cat", "Float_16", "1,1,128,1024", "NATIVE"),
+            boundary.Tensor(prefix + "divisor", "Float_16", "1", "STATIC"),
+        ],
+        [boundary.Tensor(prefix + "key_scaled", "Float_16", "1,1,128,1024", "NATIVE")],
+        ["operation: 2"],
+    )
+    if fault == "operation":
+        op.params = ["operation: 0"]
+    elif fault == "dynamic":
+        op.inputs[1].ttype = "NATIVE"
+    elif fault == "vector":
+        op.inputs[1].dims = "128"
+    elif fault == "int8":
+        op.outputs[0].dtype = "uFxp_8"
+    elif fault == "source":
+        source.op_type = "Add"
+    elif fault == "operands":
+        op.inputs.reverse()
+    assert audit.is_fp16_key_scale(op, {op.name: source}) == (fault is None)
