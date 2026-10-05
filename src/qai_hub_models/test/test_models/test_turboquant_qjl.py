@@ -155,7 +155,7 @@ def test_qjl_tiled_attention(seq: int, tile: int, valid: int) -> None:
 def test_qjl_profile_isolation() -> None:
     assert (
         get_profile("k4_v4_scaled").config_hash()
-        == "a1bd2907c7f1352c7e3472d7022dcb4c11cf6cf85b361f5316a0d155697c3c62"
+        == "d7ac74594b85ffd81086018773add722de8e6b9f1eee7339b929f8510374be6e"
     )
     assert not get_profile("k4_v4_scaled").qjl
     assert CONFIG.format_version == 3

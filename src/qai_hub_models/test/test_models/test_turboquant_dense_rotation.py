@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import sys
@@ -99,6 +100,43 @@ def test_dense_default_cannot_overwrite_old_bundle(
             "--no-native-decoder",
         ],
     )
+    with pytest.raises(ValueError, match="metadata mismatch: config_hash"):
+        converter.main()
+    assert report.read_text() == original
+
+
+@pytest.mark.parametrize("context_only", [False, True])
+def test_tree_export_rejects_old_broadcast_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, context_only: bool
+) -> None:
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    converter = importlib.import_module("convert_parts")
+    old_config = get_profile("k4_v4_scaled").to_dict()
+    assert old_config.pop("scalar_indexing") == "lloyd_tree"
+    old_hash = hashlib.sha256(
+        json.dumps(old_config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    split = tmp_path / "split"
+    split.mkdir()
+    (split / "split_manifest.json").write_text('{"parts": {}}')
+    output = tmp_path / "old_bundle"
+    output.mkdir()
+    report = output / "convert_report.json"
+    original = json.dumps({"config_hash": old_hash})
+    report.write_text(original)
+    argv = [
+        "convert_parts",
+        "--split-dir",
+        str(split),
+        "--out",
+        str(output),
+        "--profile",
+        "k4_v4_scaled",
+        "--no-native-decoder",
+    ]
+    if context_only:
+        argv.append("--context-only")
+    monkeypatch.setattr(sys, "argv", argv)
     with pytest.raises(ValueError, match="metadata mismatch: config_hash"):
         converter.main()
     assert report.read_text() == original

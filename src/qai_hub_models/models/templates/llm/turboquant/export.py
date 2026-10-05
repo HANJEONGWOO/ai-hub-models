@@ -6,8 +6,9 @@
 
 The subgraphs use only ops the QNN HTP backend implements for FP16/INT32 tensors
 (QAIRT 2.48 op-def supplement): HTP has no bitwise ops and no UINT_8 arithmetic,
-so indices are counted with ``Greater`` + INT32 ``ReduceSum``, packed as
-``hi * 16 + lo`` in INT32 and only then cast to UINT8. Decode unpacks nibbles
+so indices use an exact Lloyd-Max comparison tree (four levels for 4-bit,
+three for QJL's 3-bit MSE stage), without an expanded threshold axis. They are
+packed as ``hi * 16 + lo`` in INT32 and only then cast to UINT8. Decode unpacks nibbles
 with exact float arithmetic and selects symmetric centroid pairs with small
 elementwise subgraphs. This avoids scalar ``Gather`` and the 15-fold expansion
 of the original threshold ladder. Tensors stay rank <= 4, with head_dim as
@@ -109,6 +110,77 @@ def byte_centroid_lut(bits: int, block_size: int) -> np.ndarray:
     return np.stack((centroids[values >> 4], centroids[values & 0xF]), axis=1)
 
 
+def _scalar_index_tree(
+    sg: Subgraph, src: str, bits: int, block_size: int, prefix: str
+) -> str:
+    """Exact ``searchsorted(boundaries, src, side='left')``, same shape as src.
+
+    Select one threshold at each level using earlier decisions. No Gather,
+    centroid-distance search, or all-boundary comparison/reduction is needed.
+    Leaf selection uses bit*hi + (1-bit)*lo: static/static Where fails HTP
+    detailed execution, while lo + bit*(hi-lo) can shift FP16 boundaries.
+    """
+    if bits not in (3, 4):
+        raise ValueError("Scalar tree requires the frozen 3/4-bit codebook.")
+    boundaries = load_boundaries(bits, block_size).astype(np.float32)
+
+    def constant(name: str, value: float) -> str:
+        return sg.const(
+            f"tq_scalar_b{bits}_d{block_size}_{name}",
+            np.array(value, dtype=np.float32),
+        )
+
+    def node(op: str, inputs: list[str], name: str, **attrs: Any) -> str:
+        out = prefix + name
+        sg.node(op, inputs, [out], **attrs)
+        return out
+
+    decisions: list[str] = []
+    decision_floats: list[tuple[str, str]] = []
+    terms: list[str] = []
+    for level in range(bits):
+        stride = 1 << (bits - 1 - level)
+        choices = [
+            constant(f"threshold_{i}", float(boundaries[i]))
+            for i in range(stride - 1, len(boundaries), 2 * stride)
+        ]
+        for previous in range(level - 1, -1, -1):
+            selected = []
+            for i in range(0, len(choices), 2):
+                label = f"level{level}_select{previous}_{i // 2}"
+                if previous == level - 1:
+                    bit_f, inv_f = decision_floats[previous]
+                    hi = node("Mul", [bit_f, choices[i + 1]], label + "_hi")
+                    lo = node("Mul", [inv_f, choices[i]], label + "_lo")
+                    selected.append(node("Add", [hi, lo], label))
+                else:
+                    selected.append(
+                        node(
+                            "Where",
+                            [decisions[previous], choices[i + 1], choices[i]],
+                            label,
+                        )
+                    )
+            choices = selected
+        decision = node("Greater", [src, choices[0]], f"level{level}_above")
+        decisions.append(decision)
+        if level < bits - 1:
+            bit_f = node(
+                "Cast", [decision], f"level{level}_float", to=TensorProto.FLOAT
+            )
+            inv_f = node("Sub", [constant("one", 1), bit_f], f"level{level}_inverse")
+            decision_floats.append((bit_f, inv_f))
+        bit = node("Cast", [decision], f"level{level}_bit", to=TensorProto.INT32)
+        weight = sg.const(
+            f"tq_scalar_weight_{stride}", np.array(stride, dtype=np.int32)
+        )
+        terms.append(node("Mul", [bit, weight], f"level{level}_weighted"))
+    index = terms[0]
+    for level, term in enumerate(terms[1:], 1):
+        index = node("Add", [index, term], f"sum{level}")
+    return index
+
+
 def encode_subgraph(
     config: TurboQuantConfig,
     spec: KVCodecSpec,
@@ -185,12 +257,6 @@ def encode_subgraph(
             [norm_out],
         )
 
-    # Keep head_dim innermost: HTP vectorises that axis. Putting the 15
-    # thresholds there instead makes both the broadcast and reduction slow.
-    boundaries = sg.const(
-        f"tq_boundaries_vector_b{spec.bits}_d{d}",
-        load_boundaries(spec.bits, d).astype(np.float32).reshape(1, 1, -1, 1),
-    )
     int64 = np.int64
     start0 = sg.const("tq_start0", np.array([0], dtype=int64))
     start1 = sg.const("tq_start1", np.array([1], dtype=int64))
@@ -202,14 +268,13 @@ def encode_subgraph(
     sg.node(
         "MatMul", [f"{p}unit", _rotation_name(sg, config, spec, True)], [f"{p}rotated"]
     )
+    # Preserve head_dim as the vectorized innermost axis, without a boundary axis.
+    index = _scalar_index_tree(sg, f"{p}rotated", spec.bits, d, p + "scalar_")
     sg.node(
         "Reshape",
-        [f"{p}rotated", sg.shape([heads, num_tokens, 1, d])],
-        [f"{p}rotated_ht1d"],
+        [index, sg.shape([heads, num_tokens, d])],
+        [f"{p}index"],
     )
-    sg.node("Greater", [f"{p}rotated_ht1d", boundaries], [f"{p}above"])
-    sg.node("Cast", [f"{p}above"], [f"{p}above_i32"], to=TensorProto.INT32)
-    sg.node("ReduceSum", [f"{p}above_i32", axis2], [f"{p}index"], keepdims=0)
     sg.node("Slice", [f"{p}index", start0, end_d, axis2, step2], [f"{p}index_hi"])
     sg.node("Slice", [f"{p}index", start1, end_d, axis2, step2], [f"{p}index_lo"])
     sg.node("Mul", [f"{p}index_hi", sixteen], [f"{p}index_hi_shifted"])
