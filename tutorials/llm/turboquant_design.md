@@ -2342,6 +2342,234 @@ rotated tiled attention도 함께 달라, 압축만의 독립적인 효과를 �
 재현 명령은 README의 Qwen3-8B 절에 있다. 새 측정에는 새 실험 디렉터리와
 기기 bundle 이름을 사용하며, 완료한 단회 측정을 덮어쓰거나 반복하지 않는다.
 
-## 25. 출처
+## 25. Structured 4-bit K codebook / Bit-plane QK 실험 (2026-10-06)
+
+### 25.1 범위와 고정 조건
+
+기존 TurboQuant 기준 구성 `k4_v4_scaled`와 CLI 기본값은 변경하지 않았다. Exact LM tree, Dense QR,
+K4/V4, QJL-off, current KV 양자화 후 attention, norm correction과 벡터당
+FP16 effective scale을 유지한다. **K codebook과 QK만** 선택형으로 추가했으며,
+V codebook·packing·decoder·AV·mask·softmax·GQA 매핑은 유지했다.
+
+| 구성 | profile | K centroid / QK |
+|---|---|---|
+| ① LM + LUT | `k4_v4_scaled` | 기존 LM / Native LUT + MatMul |
+| ② Structured + LUT | `k4s_v4_scaled` | 직접 최적화한 beta / Native LUT + MatMul |
+| ③ Structured + Bit-plane | `k4s_v4_bitplane` | ②와 같은 beta / HTP packed-K 직접 QK |
+
+①→②는 codebook 변경, ②→③은 QK 계산 방식 변경을 비교한다. 모든 구성은
+동일한 Native package를 사용하고 기존 cache와 새 profile의 혼용을 거부한다.
+실험의 빌드·입력·runner·Native library·configuration 해시는 별도로 동결한다.
+
+### 25.2 직접 beta 최적화
+
+`C[i] = sum(beta[m] * (2*bit_m(i)-1))`, beta[0]은 nibble의 LSB에 대응한다.
+기존 LM centroid를 fitting하지 않는다. Seed 20261006의 `N(0,1/128)` 표본
+262,144개와 8개 초기값에서 nearest assignment / 제약 최소제곱을 반복했다.
+양의 gap parameterization으로 `beta[m] > sum(beta[:m])`를 강제하므로 자연
+이진 index 순서를 유지한다. Centroid 정렬이나 bit-code 재매핑은 없다.
+학습 scalar MSE가 가장 낮은 후보를 선택했으며 전역 최적해라고 주장하지 않는다.
+
+저장된 FP32 beta는 LSB부터 다음과 같다.
+
+```text
+[0.01498864870518446, 0.029918959364295006,
+ 0.06052033230662346, 0.11758477240800858]
+parameters SHA-256:
+5adc305c768c0f4dd6331534e6ca3d58744572f3ff4b6962ff12fdba0b601737
+```
+
+계수·centroid 16개·midpoint 15개·seed·설정은 codec의
+`structured4_v1.json`에 저장한다. Encoder는 같은 exact tree에 새 K 경계를
+적용하고 새 centroid norm으로 scale을 계산한다. Nibble와 FP16 scale 하나 외에
+추가 토큰 metadata는 없다. 추론 중 계수를 학습하지 않는다.
+
+Seed 20261007의 독립 표본과 4,096개 isotropic KV 벡터를 사용한 offline 평가:
+
+| 지표 | LM | Structured |
+|---|---:|---:|
+| scalar MSE | 0.0000736193 | 0.0000884047 |
+| norm 보정 + FP16 scale/LUT/product 이후 KV MSE | 0.00917411 | 0.01096256 |
+| 벡터별 relative KV MSE 평균 | 0.00917563 | 0.01096041 |
+| cosine 평균 | 0.99541220 | 0.99451982 |
+
+Structured의 relative KV MSE가 약 **19.5% 증가**했다. 이는 이진 가산 구조와
+순서 제약 아래 얻은 결과이며, codebook 품질 향상으로 해석하지 않는다. Offline
+평가의 norm reduction은 float64이고 좌표·경계·LUT·scale·복원 곱을 FP16으로
+반영했다. 전체 HTP encoder의 모든 반올림을 모사한 값은 아니며, PPL과도 다르다.
+
+### 25.3 HTP 구현과 수치 검증
+
+`BitplaneQK4`는 packed K에서 bit를 추출하고 FP16 Query의 부호를 HVX 레지스터에서
+바꿔 FP32로 누적한다. 4개 beta로 가중합한 다음 token scale을 곱하고 FP16 score를
+출력한다. **FP16 K tile이나 전체 FP16 bit-plane tensor를 출력하지 않는다.**
+Query를 1-bit로 양자화하지 않는다. Host library는 HTP graph 준비용이며 새 op의
+host 실행은 실패하도록 되어 있다. 배포 실행에 CPU fallback은 없다.
+
+HTP가 raw UINT8 Concat을 지원하지 않으므로 past/current packed K를 합치지 않고
+각각 QK를 계산한 뒤 기존 score 정밀도 경계에서 합친다. Current QK는
+tile 사이에 공유한다. 기존 non-last tile score cropping도 그대로 유지한다.
+QAIRT의 FP32 상수 자동 FP16 변환을 막기 위해 공유 beta 4개는 16 raw constant
+bytes로 전달한다. 토큰별 metadata가 아니라 graph 상수다.
+
+수치·배선 검사 결과:
+
+- Host 회귀 테스트: **562 passed**. 모든 유한 FP16 index 입력, 경계 양옆·0·극단값,
+  대칭·단조성, packing, GQA, current/past, V graph 동일성, cache 혼용 거부 포함.
+- Native HVX simulation: nibble/sign/unaligned Query 256개 trial 포함 통과.
+- HTP 단독 structured encoder: AR1·AR128 기존 tolerance 통과.
+- **기존 LM encoder AR128은 norm relative error 0.00234788로 기존 0.002 gate 미통과**.
+  기준을 완화하지 않았다. Structured AR128은 0.00199808로 경계에 가깝다.
+- 실제 HTP GQA 통합 fixture: ②/③의 K/V packed 및 FP16 scale 출력 모두 동일.
+  Attention 출력 최대 절대차 0.00012207, 상대 L2 약 0.06%. 누적·곱셈·FP16
+  반올림 위치가 다르므로 bit-exact는 아니다.
+- 전체 모델 세 구성의 graph audit 통과. ③의 6개 attention ONNX/DLC에서 K
+  `Decode4`가 제거되고 V `Decode4`가 유지된다. 모든 `BitplaneQK4`의 입력은
+  `[Uint_8, Float_16, Float_16, Uint_8]`, 출력은 `Float_16`이다.
+  AR128 또는 AR1의 attention part 3개 합계로 QK custom op 2,240개가 남는다
+  (`28 layers × 16 query heads × (4 past tiles + 1 current)`).
+
+기존 단회 HTP QK 출력을 후처리한 pair 비교(AR128):
+
+| 변경 | QK RMSE | QK relative L2 | 합성 Attention relative L2 |
+|---|---:|---:|---:|
+| ①→② codebook | 0.1408691 | 14.1072% | 13.9465% |
+| ②→③ 연산 | 0.00040168 | 0.04023% | 0.06584% |
+
+이 표는 같은 Gaussian K/Query 입력에 대한 **방식 간 출력 차이**이지 실제 모델
+정답 대비 오차가 아니다. Nibble stress를 주입한 첫 4개 token은 제외했다.
+Attention 열은 실기기 QK 출력에 공통 synthetic V로 CPU 후처리한 수치 비교이며,
+별도 HTP Attention 실행이나 CPU 추론 fallback이 아니다.
+
+### 25.4 단독 Encode / QK 시간
+
+각 graph를 HTP에서 **1회만**, detailed profiling으로 실행했다. K head 8,
+GQA group 2, d128, QK의 K 길이 1024. Encode는 K encoder 전체이며 structured
+encoder는 ②/③이 같아 중복 측정하지 않았다. 단위는 **초**다.
+
+| Graph | ① LM + LUT | ② Structured + LUT | ③ Structured + Bit-plane |
+|---|---:|---:|---:|
+| Encode AR1 | 0.004726 | 0.004088 | ②와 동일 |
+| Encode AR128 | 0.005617 | 0.005613 | ②와 동일 |
+| packed K → QK AR1 | 0.007464 | 0.007378 | 0.008603 |
+| packed K → QK AR128 | 0.008087 | 0.007937 | 0.482638 |
+
+이것은 cold / 계측 실행의 accelerator 시간이다. 전체 모델의 layer 시간 합,
+비계측 TTFT, 또는 순수 op만의 정상상태 비용으로 해석하지 않는다. 특히 이 HVX
+구현은 prefill에서 각 query/key 쌍의 bit별 reduction을 수행해, 복원 tile을 없애도
+기존 MatMul보다 훨씬 느릴 수 있음을 관측했다. Busy-cycle 비중을 TTFT 감소율로
+바꾸지 않았으며 단회 표본에 통계적 유의성을 부여하지 않는다.
+
+단독 QK graph는 packed K 전체를 직접 입력하며 전체 모델의 past/current 분리
+배선과는 다르다. 같은 `native_v2` kernel/계수로 수집했지만, `micro_v2` manifest에는
+당시 통합 설정 이름인 `native_bitplane_v1`이 남아 있다. 최종 모델은 raw UINT8
+Concat을 제거한 `native_bitplane_v2` 통합이다. 기존 계측 파일을 덮어쓰거나 이
+통합 수정 뒤 단독 커널 측정을 반복하지 않았다.
+
+컴파일된 `tq_bitplane_dot_hvx`도 확인했다. 각 query/key dot마다 4개 벡터 합을
+scalar beta 가중합으로 넘기는 과정에서 512-byte stack frame과 128-byte vector
+store 4개가 생성된다. 따라서 **FP16 K tile을 없앴다는 것이 임시 메모리 접근이나
+전체 메모리 traffic을 없앴다는 뜻은 아니다**. 이 stack의 실제 메모리 계층별
+traffic은 측정하지 않았으므로 DRAM traffic 수치로 환산하지 않는다. Query/key
+쌍마다 반복하는 4개 reduction, 재적재 및 vector→scalar 전환이 이 첫 HVX 구현의
+구조적 비용이다. 바이너리 검사만으로 각 비용의 지연 기여율을 단정하지 않는다.
+
+### 25.5 전체 모델 비교 및 산출물
+
+Qwen3-1.7B W4A16 / SM8850 V81, **CL1024 고정**, 같은 split·입력·runner·Native
+package로 세 구성을 새로 빌드하고 측정했다. 프로파일링을 끈 상태에서 조건별
+**1회**, 128 token 생성이며 TTFT는 모델 로딩 시간을 제외한다. 아래 값은 이전
+실험의 수치를 혼합한 표가 아니다. 최종 기계 판독용 집계는
+`reports/comparison.json`이다.
+
+긴 입력: **897 prompt + 128 generated tokens**.
+
+| 지표 | ① LM + LUT | ② Structured + LUT | ③ Structured + Bit-plane |
+|---|---:|---:|---:|
+| TTFT (s) | 0.520532 | 0.518740 | 18.479991 |
+| prefill (tok/s) | 1724.541 | 1730.626 | 48.542 |
+| decode (tok/s) | 37.908 | 37.888 | 20.168 |
+| decode (ms/token) | 26.380 | 26.394 | 49.584 |
+| host KV (MiB) | 28.875 | 28.875 | 28.875 |
+| I/O buffer (MiB) | 96.929 | 96.929 | 96.929 |
+| 종료 VmRSS (MiB) | 149.965 | 150.086 | 152.113 |
+| process VmHWM (MiB) | 604.730 | 604.793 | 605.051 |
+| PPL (별도 4 window) | 25.660831 | 28.736641 | 28.564720 |
+
+짧은 입력: **35 prompt + 128 generated tokens**, 동일한 CL1024 고정.
+
+| 지표 | ① LM + LUT | ② Structured + LUT | ③ Structured + Bit-plane |
+|---|---:|---:|---:|
+| TTFT (s) | 0.064253 | 0.061366 | 2.313866 |
+| prefill (tok/s) | 546.792 | 572.874 | 15.129 |
+| decode (tok/s) | 38.994 | 39.380 | 20.672 |
+| 종료 VmRSS (MiB) | 141.805 | 150.020 | 151.672 |
+| process VmHWM (MiB) | 604.992 | 604.871 | 604.984 |
+
+추가 실행 없이 같은 긴 입력 run의 step 기록을 집계한 wall time 평균:
+
+| 구간 (ms/decode step) | ① LM + LUT | ② Structured + LUT | ③ Structured + Bit-plane |
+|---|---:|---:|---:|
+| host 입력 준비 | 1.041 | 1.153 | 1.736 |
+| QNN part 실행 합 | 24.874 | 24.642 | 46.458 |
+| KV 저장 | 0.0107 | 0.0123 | 0.0229 |
+
+QNN 값은 호출의 host wall time이며 순수 QK 커널 시간은 아니다. Argmax 등 모든
+host 비용이 위 세 항목에 포함되지는 않아 전체 token 시간과 정확히 합산되지 않는다.
+
+PPL은 서로 다른 WikiText 1024-token window 4개를 각 한 번씩 평가했다. Window당
+1023개, 총 **4092 scored tokens**의 NLL 합으로 계산했으며 아래 PPL의 산술평균이 아니다.
+
+| Window | ① LM + LUT | ② Structured + LUT | ③ Structured + Bit-plane |
+|---|---:|---:|---:|
+| 0 | 13.876348 | 15.497888 | 16.329878 |
+| 1 | 33.952901 | 38.861729 | 36.654845 |
+| 2 | 25.053085 | 26.867261 | 27.018207 |
+| 3 | 36.734116 | 42.143049 | 41.166981 |
+
+이번 결과의 해석:
+
+- **①→② codebook 변경:** 긴 입력 decode는 -0.054%로 단회 오차와 구분할 수 있는
+  성능 우세를 주장하지 않는다. PPL은 **+11.99%** 상승했다. Offline MSE도 악화되어
+  이 제약 codebook을 품질 개선이라고 평가하지 않는다.
+- **②→③ 계산 방식 변경:** 긴 입력 TTFT는 **35.62배**, decode 처리량은
+  **-46.77%**였다. 첫 HVX 구현의 4개 reduction·vector/scalar 전환·세분화된 custom
+  op 호출은 최적화된 MatMul을 대체할 만큼 효율적이지 않았다. 비용별 기여율을
+  따로 분리 계측한 것은 아니므로 각각의 정확한 지연 비중은 단정하지 않는다.
+- ③의 PPL은 ②보다 **0.60% 낮았지만**, ①보다는 **11.32% 높았다**. Window별
+  방향도 섞여 있다. 작은 단독 QK 오차가 전체 모델의 PPL 동일성을 보장하지 않으며,
+  FP16 반올림·누적 방식 변경에 따른 추가 차이를 그대로 기록한다. 실제 모델
+  내부에서 차이가 누적되는 위치를 별도 계측한 결과는 아니다.
+- 세 구성은 nibble + FP16 scale 형식이 같으므로 host KV와 I/O 저장량도 같다.
+  K 복원 tile 제거는 graph audit로 확인했지만, **측정한 host 메모리 지표에서
+  이득은 관측하지 못했다**. RSS/HWM은 runner 프로세스의 지표이며 기기/NPU 전체
+  메모리나 VTCM peak를 측정한 값이 아니다.
+- 성능 6 run + 품질 12 run의 전후 snapshot 36개에서 Android thermal status는
+  모두 0, battery sensor는 26.2~29.0°C였다. 이는 측정 전후의 관측이며 실행 중
+  peak 온도나 throttling이 전혀 없었음을 보증하지 않는다. 온도를 강제로
+  제어하거나 재측정하지 않았다.
+
+따라서 **기존 기준 경로와 CLI 기본값을 유지**한다. 새 profile 두 개는 codebook
+품질과 계산 방식의 영향을 분리하는 연구용 구현으로 남긴다. 이 결과를 모든
+Bit-plane 설계나 다른 모델 크기에서의 성능 한계로 일반화하지 않는다. 기존 LM
+encoder의 수치 gate 미통과도 해결된 것으로 처리하지 않았다.
+
+루트: `/mnt/d/ai-hub-models/binaries/turboquant/structured_bitplane_20261006/`.
+
+- `fit.json`, `offline_comparison.json`: beta 탐색 및 독립 품질 평가.
+- `native_v2/`: 동일 HTP/host Native package와 HVX 검증 산출물.
+- `micro_v2/{comparison,paired_qk_comparison}.json`: 단회 Encode/QK와 출력 비교.
+- `integration_v2/pair_comparison.json`: actual HTP current/past/GQA 통합 출력 비교.
+- `lm/`, `structured_lut/`, `bitplane/`: 최종 ONNX/DLC/context binary.
+- `reports/`: 변환 로그, graph 감사, 동결 identity, 단회 성능·PPL 원본과 요약.
+- `reports/*.environment_{before,after}.json`: 측정 구간 밖에서 읽은 기기 상태.
+- `reports/*_once.log`, `*_score_w*.log`: 기기 원본 로그. 실행기 stdout은 별도
+  `*.stdout.log`에 보존한다.
+
+초기 beta float 상수 / UINT8 Concat 준비 실패 산출물도 보존했다. 준비 실패를
+성능 측정으로 세지 않으며, 성공한 기기 측정을 반복하거나 최선값을 선택하지
+않았다. 재현 명령은 `scripts/llm/turboquant/README.md`의 Structured K 절에 있다.
+
+## 26. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

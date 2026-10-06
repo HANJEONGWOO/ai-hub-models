@@ -8,14 +8,15 @@
 #include <string.h>
 #ifdef __hexagon__
 #include "hvx_decode.h"
+#include "hvx_bitplane.h"
 #endif
 
 namespace {
 constexpr const char* kPackage = "TurboQuantNative";
-const char* kOps[] = {"Decode4"};
+const char* kOps[] = {"Decode4", "BitplaneQK4"};
 Qnn_ApiVersion_t apiVersion = QNN_HTP_API_VERSION_INIT;
 Qnn_Version_t opVersion = {1, 0, 0};
-QnnOpPackage_Info_t packageInfo = {kPackage, kOps, nullptr, 1, nullptr, 0,
+QnnOpPackage_Info_t packageInfo = {kPackage, kOps, nullptr, 2, nullptr, 0,
     QNN_SDK_BUILD_ID, &apiVersion, nullptr, &opVersion, {0}};
 bool initialized = false;
 
@@ -37,8 +38,10 @@ Qnn_ErrorHandle_t info(const QnnOpPackage_Info_t** value) {
 Qnn_ErrorHandle_t validate(Qnn_OpConfig_t op) {
   if (op.version != QNN_OPCONFIG_VERSION_1 || !op.v1.packageName ||
       !op.v1.typeName || strcmp(op.v1.packageName, kPackage) ||
-      strcmp(op.v1.typeName, kOps[0]) || op.v1.numOfParams != 0 ||
-      op.v1.numOfInputs != 3 || op.v1.numOfOutputs != 1)
+      op.v1.numOfParams != 0 || op.v1.numOfOutputs != 1)
+    return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
+  if (!((strcmp(op.v1.typeName, kOps[0]) == 0 && op.v1.numOfInputs == 3) ||
+        (strcmp(op.v1.typeName, kOps[1]) == 0 && op.v1.numOfInputs == 4)))
     return QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE;
   return QNN_SUCCESS;
 }
@@ -107,6 +110,57 @@ uint32_t decode(QHPI_RuntimeHandle* handle, uint32_t nout, QHPI_Tensor** outputs
 float cost(uint32_t, const QHPI_Tensor* const* inputs) {
   return 100.0f + 20.0f * elements(qhpi_tensor_shape(inputs[1]));
 }
+
+uint32_t bitplane(QHPI_RuntimeHandle* handle, uint32_t nout, QHPI_Tensor** outputs,
+                  uint32_t nin, const QHPI_Tensor* const* inputs) {
+#ifndef __hexagon__
+  // Host library is for HTP preparation only, never a CPU execution fallback.
+  return QHPI_ERROR_FATAL;
+#else
+  if (nin != 4 || nout != 1) return QHPI_ERROR_FATAL;
+  const auto p = qhpi_tensor_shape(inputs[0]);
+  const auto s = qhpi_tensor_shape(inputs[1]);
+  const auto q = qhpi_tensor_shape(inputs[2]);
+  const auto o = qhpi_tensor_shape(outputs[0]);
+  if (p.rank != 4 || s.rank != 4 || q.rank != 4 || o.rank != 4 ||
+      p.dims[1] != 1 || p.dims[3] != 64 || q.dims[3] != 128 ||
+      s.dims[0] != p.dims[0] || s.dims[1] != 1 || s.dims[2] != p.dims[2] ||
+      s.dims[3] != 1 || q.dims[0] != p.dims[0] ||
+      o.dims[0] != q.dims[0] || o.dims[1] != q.dims[1] ||
+      o.dims[2] != q.dims[2] || o.dims[3] != p.dims[2] ||
+      elements(qhpi_tensor_shape(inputs[3])) != 16 ||
+      qhpi_element_type_size(qhpi_tensor_type(inputs[3])) != 1 ||
+      qhpi_element_type_size(qhpi_tensor_type(inputs[0])) != 1)
+    return QHPI_ERROR_FATAL;
+  const auto* packed = static_cast<const uint8_t*>(qhpi_tensor_raw_data(inputs[0]));
+  const auto* scale = static_cast<const __fp16*>(qhpi_tensor_raw_data(inputs[1]));
+  const auto* query = static_cast<const uint16_t*>(qhpi_tensor_raw_data(inputs[2]));
+  const auto* betaBytes = qhpi_tensor_raw_data(inputs[3]);
+  auto* output = static_cast<__fp16*>(qhpi_tensor_raw_data(outputs[0]));
+  if (!packed || !scale || !query || !betaBytes || !output) return QHPI_ERROR_FATAL;
+  float beta[4];
+  memcpy(beta, betaBytes, sizeof(beta));
+  const uint32_t total = elements(o), tokens = p.dims[2];
+  const uint32_t slices = qhpi_num_slices(handle), slice = qhpi_slice_number(handle);
+  if (!slices || !tokens) return QHPI_ERROR_FATAL;
+  const uint32_t begin = uint64_t(total) * slice / slices;
+  const uint32_t end = uint64_t(total) * (slice + 1) / slices;
+  for (uint32_t i = begin; i < end; ++i) {
+    const uint32_t qr = i / tokens, token = i % tokens;
+    const uint32_t head = qr / (q.dims[1] * q.dims[2]);
+    const uint32_t row = head * tokens + token;
+    output[i] = tq_bitplane_dot_hvx(packed + row * 64, query + qr * 128, beta)
+                * float(scale[row]);
+  }
+  return QHPI_SUCCESS;
+#endif
+}
+
+float bitplaneCost(uint32_t, const QHPI_Tensor* const* inputs) {
+  const auto p = qhpi_tensor_shape(inputs[0]);
+  const auto q = qhpi_tensor_shape(inputs[2]);
+  return 100.0f + 150.0f * p.dims[2] * elements(q) / 128;
+}
 QHPI_Tensor_Signature_v1 inputSignatures[] = {
     {QHPI_ELEMENT_TYPE_ANY, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM},
     {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM},
@@ -115,6 +169,13 @@ QHPI_Tensor_Signature_v1 outputSignatures[] = {
     {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM}};
 QHPI_Kernel_v1 kernel = {};
 QHPI_OpInfo_v1 op = {};
+QHPI_Tensor_Signature_v1 bitplaneInputs[] = {
+    {QHPI_ELEMENT_TYPE_ANY, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM},
+    {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM},
+    {QHPI_ELEMENT_TYPE_ANY, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM}};
+QHPI_Kernel_v1 bitplaneKernel = {};
+QHPI_OpInfo_v1 allOps[2] = {};
 }  // namespace
 
 extern "C" Qnn_ErrorHandle_t TurboQuantInterfaceProvider(QnnOpPackage_Interface_t* out) {
@@ -146,6 +207,19 @@ extern "C" const char* qhpi_init() {
   op.name = "TurboQuantNative::Decode4";
   op.num_kernels = 1;
   op.kernels = &kernel;
-  qhpi_register_ops_v1(1, &op, kPackage);
+  bitplaneKernel.function_name = "tq_bitplane_qk4";
+  bitplaneKernel.function = bitplane;
+  bitplaneKernel.resources = QHPI_RESOURCE_HVX;
+  bitplaneKernel.multithreaded = true;
+  bitplaneKernel.min_inputs = 4;
+  bitplaneKernel.input_signature = bitplaneInputs;
+  bitplaneKernel.min_outputs = 1;
+  bitplaneKernel.output_signature = outputSignatures;
+  bitplaneKernel.cost_function = bitplaneCost;
+  allOps[0] = op;
+  allOps[1].name = "TurboQuantNative::BitplaneQK4";
+  allOps[1].num_kernels = 1;
+  allOps[1].kernels = &bitplaneKernel;
+  qhpi_register_ops_v1(2, allOps, kPackage);
   return kPackage;
 }

@@ -33,7 +33,7 @@ export defaults, and need setting up separately on a different machine.
 All newly exported TurboQuant encoders use exact Lloyd-Max tree search:
 four dependent comparisons for 4-bit K/V, three for the QJL 3-bit MSE stage.
 The all-boundary broadcast/count implementation has been removed; there is
-no strategy flag or additional profile. Existing profile names and commands
+no scalar-indexing strategy flag. Existing profile names and commands
 continue to work. The offline NumPy oracle remains `searchsorted(..., side="left")`.
 
 Codebooks, boundary ties (lower index), Dense rotation, norm/effective-scale
@@ -51,6 +51,122 @@ Historical reports remain readable, but their performance is not a new tree meas
 This change is covered by CPU graph/oracle, boundary/FP16-domain, packing,
 QJL/Native and metadata regression tests. No model rebuild or device performance
 measurement is performed as part of this code-only switch.
+
+## Structured K codebook and Bit-plane QK (experimental opt-ins)
+
+The unchanged TurboQuant baseline remains `k4_v4_scaled`: exact LM tree, Dense QR,
+K4/V4, QJL off, quantized current KV, FP16 effective scales and Native LUT.
+Existing CLI defaults are untouched (the generic converter still defaults to
+`baseline_int8` when `--profile` is omitted).
+Two explicit profiles separate codebook quality from QK implementation:
+
+| Profile | K codebook | QK | V/AV |
+|---|---|---|---|
+| `k4_v4_scaled` | Frozen Lloyd–Max | Native LUT + MatMul | Unchanged |
+| `k4s_v4_scaled` | Four shared optimized beta coefficients | Native LUT + MatMul | Unchanged |
+| `k4s_v4_bitplane` | Same structured coefficients | HTP `BitplaneQK4` | Unchanged |
+
+`structured4_v1.json` under the codec package freezes beta (LSB first), all
+16 centroids, 15 midpoint thresholds, seed, constraints and a SHA-256 digest.
+`C[i] = sum_m beta[m] * (2*bit_m(i)-1)`. The optimizer uses Gaussian
+`N(0,1/128)` samples and eight initializations. Four strictly positive gaps
+enforce `beta[m] > sum(beta[:m])`, hence natural binary code order without
+sorting/remapping codes. Assignment and constrained least-squares alternate;
+there is no fit to the old LM centroids and no global-optimum claim.
+The selected objective is training scalar MSE; independent held-out scalar
+MSE and post-norm/FP16 reconstruction error are reported separately.
+The offline fitter requires SciPy (`nnls`); this run used NumPy 2.4.4 and
+SciPy 1.17.1 with `OPENBLAS_NUM_THREADS=1`. Deployment loads frozen constants
+and does not run SciPy or coefficient optimization.
+
+The encoder uses the existing exact tree with the new K thresholds and uses
+the new K centroids for norm correction. Nibble packing and one FP16 scale per
+vector are unchanged. All V constants and the V/AV path remain the old LM path.
+Structured K and legacy cache/config hashes differ and mixed caches are rejected.
+
+`BitplaneQK4` reads packed K, FP16 scale and rotated FP16 Query and directly
+outputs scores. The HVX kernel extracts bits, flips Query signs in registers,
+accumulates in FP32, weights the four sums and applies token scale last.
+It never writes an FP16 K tile or a full FP16 bit-plane tensor. Query is not
+1-bit quantized. Both past and current K use the packed-cache precision;
+GQA mapping, attention scaling, score dtype/encoding boundary, mask, softmax and
+V/AV remain in the surrounding graph. The old non-last-tile score cropping
+policy is preserved. Past/current scores are computed separately (current QK
+is shared across tiles), then concatenated; HTP has no raw UINT8 Concat.
+The four shared FP32 beta constants are transported as
+16 raw constant bytes to prevent QAIRT from silently rounding them to FP16;
+this adds **no per-token metadata**. The host library prepares graphs only;
+there is no CPU fallback kernel. CPU oracles are strictly test utilities.
+
+The arithmetic is equivalent to structured LUT QK in real numbers, but not
+bit-exact to FP16 LUT reconstruction/multiplication. The implementation is an
+experimental correctness baseline, **not a guaranteed speedup**: scalar
+reductions on HVX can lose to HMX MatMul, especially in prefill.
+
+Reproduce into a fresh directory (1.7B, fixed CL1024, no default model changes):
+
+```bash
+TQ_WORK=/mnt/d/ai-hub-models/binaries/turboquant/structured_bitplane_new
+TQ_PACKAGE="$TQ_WORK/native"
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python -m pytest \
+    src/qai_hub_models/test/test_models/test_turboquant* -q
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/fit_structured_codebook.py \
+    --out "$TQ_WORK/fit/structured4_v1.json" --report "$TQ_WORK/fit/report.json"
+cmp "$TQ_WORK/fit/structured4_v1.json" \
+    src/qai_hub_models/models/templates/llm/turboquant/structured4_v1.json
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/analyze_structured_codebook.py \
+    --out "$TQ_WORK/offline_comparison.json"
+venv/bin/python scripts/llm/turboquant/native_decoder/build.py \
+    --out "$TQ_PACKAGE" --test-hvx
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/validate_structured_htp.py all \
+    --work-dir "$TQ_WORK/micro" --package "$TQ_PACKAGE" \
+    --device-dir /data/local/tmp/qaihm_turboquant/structured_bitplane_new_micro
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/compare_structured_qk.py \
+    --work-dir "$TQ_WORK/micro" --out "$TQ_WORK/micro/paired_qk_comparison.json"
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/validate_bitplane_integration.py \
+    --work-dir "$TQ_WORK/integration_bp" --package "$TQ_PACKAGE" \
+    --device-dir /data/local/tmp/qaihm_turboquant/structured_new_integration_bp
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/validate_bitplane_integration.py \
+    --profile k4s_v4_scaled --work-dir "$TQ_WORK/integration_lut" \
+    --package "$TQ_PACKAGE" \
+    --device-dir /data/local/tmp/qaihm_turboquant/structured_new_integration_lut
+PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+    scripts/llm/turboquant/validate_bitplane_integration.py \
+    --work-dir "$TQ_WORK/integration_bp" --compare-with "$TQ_WORK/integration_lut" \
+    --package "$TQ_PACKAGE" \
+    --device-dir /data/local/tmp/qaihm_turboquant/structured_new_integration_bp
+bash scripts/llm/turboquant/qnn_runner/build_android.sh "$TQ_WORK/runner"
+for stage in build audit push performance quality summarize; do
+    PYTHONPATH=src OPENBLAS_NUM_THREADS=1 venv/bin/python \
+        scripts/llm/turboquant/benchmark_structured_once.py "$stage" \
+        --root "$TQ_WORK" --package "$TQ_PACKAGE" \
+        --runner "$TQ_WORK/runner/qnn-llm-runner" \
+        --name structured_bitplane_new || break
+done
+```
+
+Inspect the micro comparison's validation fields before full-model use; existing
+LM encoder FP16 tolerance failures remain failures and are not relaxed. The
+micro tool records **one detailed-profile execute per graph** (shared structured
+encoder measured only once), not warmed/repeated best-of timings. These isolated
+Encode and packed-K-to-QK timings include diagnostic overhead; they are not sums
+of full-model layer latency. Full-model timing is **unprofiled**, once per
+short/long condition per group. Quality uses four *distinct* WikiText windows
+once each, not four repetitions of the same input. Attempt files prevent silent
+retries. Historical experiments are never overwritten.
+Read-only battery/thermal snapshots are saved before and after each full-model
+run, outside the timed runner; they do not actively control device temperature.
+
+Use `reports/comparison.json` for TTFT/decode/PPL, actual host KV/I/O allocation,
+end VmRSS and process VmHWM; these process metrics do not measure total HTP/VTCM
+memory. The experiment identity freezes context/runner/package/input hashes.
+Busy-cycle shares must not be interpreted as TTFT savings.
 
 ## FP16 KV + FP16-input attention control (opt-in)
 

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Host Hexagon libnative test of packing, LUT layout, FP16 multiply and tails.
 #include "hvx_decode.h"
+#include "hvx_bitplane.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <vector>
@@ -30,4 +32,26 @@ int main() {
     }
   }
   puts("HVX packing, LUT lane order, FP16 products, unaligned I/O and odd tails passed");
+  const float beta[4] = {0.01f, 0.023f, 0.051f, 0.12f};
+  for (unsigned trial = 0; trial < 256; ++trial) {
+    uint8_t packed[65];
+    __fp16 query[129];
+    for (unsigned i = 0; i < 64; ++i) packed[i + 1] = (i * 131 + trial) % 256;
+    for (unsigned j = 0; j < 128; ++j) query[j + 1] = (int((j * 73 + trial) % 199) - 99) / 32.0f;
+    float expected = 0;
+    for (unsigned m = 0; m < 4; ++m) {
+      float sum = 0;
+      for (unsigned j = 0; j < 128; ++j) {
+        const unsigned z = j % 2 ? packed[1 + j / 2] & 15 : packed[1 + j / 2] >> 4;
+        sum += float(query[j + 1]) * ((z >> m) & 1 ? 1 : -1);
+      }
+      expected += beta[m] * sum;
+    }
+    const float actual = tq_bitplane_dot_hvx(packed + 1, reinterpret_cast<uint16_t*>(query + 1), beta);
+    if (fabs(actual - expected) > 1e-5f) {
+      printf("Bitplane trial=%u actual=%g expected=%g\n", trial, actual, expected);
+      return 3;
+    }
+  }
+  puts("HVX bit-plane signed sums, natural nibble bits and unaligned inputs passed");
 }

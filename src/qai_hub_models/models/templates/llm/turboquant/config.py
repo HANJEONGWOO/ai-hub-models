@@ -61,8 +61,13 @@ class KVCodecSpec:
     kind: CodecKind
     bits: int = 0
     seed: int = 0
+    codebook: str = "lloyd_max"
 
     def __post_init__(self) -> None:
+        if self.codebook not in ("lloyd_max", "structured4_v1") or (
+            self.codebook != "lloyd_max" and (not self.is_polar or self.bits != 4)
+        ):
+            raise ValueError("Unsupported codebook for this codec")
         if self.kind != CodecKind.POLAR and (self.bits != 0 or self.seed != 0):
             raise ValueError(f"{self.kind.name} codec takes no bits or seed.")
         if self.kind == CodecKind.POLAR and self.bits not in (3, 4):
@@ -88,7 +93,10 @@ class KVCodecSpec:
         return self.kind != CodecKind.BASELINE
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
+        data = {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
+        if self.codebook != "lloyd_max":
+            data["codebook"] = self.codebook
+        return data
 
 
 BASELINE = KVCodecSpec(CodecKind.BASELINE)
@@ -111,9 +119,26 @@ class TurboQuantConfig:
     format_version: int = FORMAT_VERSION
     precomputed_norm: bool = False
     qjl: bool = False
+    bitplane_qk: bool = False
     reference_commit: str = field(default=REFERENCE_COMMIT)
 
     def __post_init__(self) -> None:
+        if (self.key.codebook != "lloyd_max" or self.bitplane_qk) and not (
+            self.key.codebook == "structured4_v1"
+            and self.value.codebook == "lloyd_max"
+            and self.key.bits == self.value.bits == 4
+            and not self.qjl
+            and self.precomputed_norm
+            and self.norm_correction
+            and self.norm_dtype == "float16"
+            and self.block_size == 128
+            and self.rotation == Rotation.DENSE_QR
+        ):
+            raise ValueError(
+                "Structured K requires Dense K4/V4, QJL-off, FP16 effective scales"
+            )
+        if self.value.codebook != "lloyd_max":
+            raise ValueError("Structured codebooks are K-only; V must remain Lloyd-Max")
         if any(s.is_fp16 for s in self.codecs) and not all(
             s.is_fp16 for s in self.codecs
         ):
@@ -216,6 +241,16 @@ class TurboQuantConfig:
             # Fixed implementation, not a selectable strategy. Invalidate old
             # broadcast bundles even though the codebook/cache ABI is unchanged.
             data["scalar_indexing"] = "lloyd_tree"
+        if self.key.codebook != "lloyd_max":
+            from qai_hub_models.models.templates.llm.turboquant.structured import (
+                load_parameters,
+            )
+
+            parameters = load_parameters()
+            data["structured_key"] = parameters
+            data["qk_implementation"] = (
+                "native_bitplane_v2" if self.bitplane_qk else "native_lut"
+            )
         if self.fp16_attention:
             data["attention"] = {
                 "kv_storage": "float16",
@@ -248,6 +283,16 @@ class TurboQuantConfig:
                 data[name]["codebook_sha256"] = CODEBOOK_SHA256[
                     (spec.bits, self.block_size)
                 ]
+                if spec.codebook != "lloyd_max":
+                    from qai_hub_models.models.templates.llm.turboquant.reference import (
+                        load_codebook,
+                    )
+
+                    data[name]["codebook_sha256"] = hashlib.sha256(
+                        load_codebook(spec.bits, self.block_size, spec.codebook)
+                        .astype("<f8")
+                        .tobytes()
+                    ).hexdigest()
                 if self.rotation == Rotation.FWHT:
                     # Preserve the FWHT sign hashes; indexing identity is separate.
                     data[name]["signs_sha256"] = FWHT_SIGNS_SHA256[
@@ -309,6 +354,15 @@ PROFILES: dict[str, TurboQuantConfig] = {
     "k8_v3": TurboQuantConfig("k8_v3", BASELINE, _polar(3, VALUE_SEED)),
     "k4_v3": TurboQuantConfig("k4_v3", _polar(4, KEY_SEED), _polar(3, VALUE_SEED)),
 }
+
+# Explicit opt-ins; keep all baseline/default names and serialized hashes intact.
+for _name, _bitplane in (("k4s_v4_scaled", False), ("k4s_v4_bitplane", True)):
+    PROFILES[_name] = replace(
+        PROFILES["k4_v4_scaled"],
+        profile=_name,
+        key=KVCodecSpec(CodecKind.POLAR, 4, KEY_SEED, "structured4_v1"),
+        bitplane_qk=_bitplane,
+    )
 
 
 def get_profile(name: str, rotation: Rotation | None = None) -> TurboQuantConfig:

@@ -30,6 +30,7 @@ from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
 from qai_hub_models.models.templates.llm.turboquant.native_decoder import (
     NATIVE_DOMAIN,
     NATIVE_OP,
+    native_table,
 )
 from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
     _head_concat,
@@ -129,9 +130,7 @@ def quantize_current_attention(
             restored = native(
                 io.packed_out,
                 io.norm_out,
-                "tq_native_key3_centroids_fp16"
-                if config.qjl and kind == "key"
-                else "tq_native_centroids_fp16",
+                native_table(config, kind),
                 prefix,
                 heads,
                 seq,

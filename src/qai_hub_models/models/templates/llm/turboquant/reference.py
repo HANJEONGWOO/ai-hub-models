@@ -39,9 +39,26 @@ from qai_hub_models.models.templates.llm.turboquant.constants import (
 NORM_CORRECTION_EPS = 1e-10
 
 
-@cache
-def load_codebook(bits: int, block_size: int) -> np.ndarray:
+def load_codebook(
+    bits: int, block_size: int, codebook: str = "lloyd_max"
+) -> np.ndarray:
     """Frozen centroids, float64 ascending. Verified against the recorded digest."""
+    if codebook != "lloyd_max":
+        from qai_hub_models.models.templates.llm.turboquant.structured import (
+            STRUCTURED,
+            load_parameters,
+        )
+
+        if codebook != STRUCTURED or (bits, block_size) != (4, 128):
+            raise ValueError("Unsupported structured codebook")
+        centroids = np.asarray(load_parameters()["centroids"], dtype="<f8")
+        centroids.setflags(write=False)
+        return centroids
+    return _load_legacy_codebook(bits, block_size)
+
+
+@cache
+def _load_legacy_codebook(bits: int, block_size: int) -> np.ndarray:
     centroids = np.array(
         [float.fromhex(h) for h in CODEBOOK_HEX[(bits, block_size)]], dtype="<f8"
     )
@@ -52,9 +69,10 @@ def load_codebook(bits: int, block_size: int) -> np.ndarray:
     return centroids
 
 
-@cache
-def load_boundaries(bits: int, block_size: int) -> np.ndarray:
-    centroids = load_codebook(bits, block_size)
+def load_boundaries(
+    bits: int, block_size: int, codebook: str = "lloyd_max"
+) -> np.ndarray:
+    centroids = load_codebook(bits, block_size, codebook)
     boundaries = (centroids[:-1] + centroids[1:]) / 2.0
     boundaries.setflags(write=False)
     return boundaries
@@ -172,8 +190,8 @@ class PolarQuantReference:
         self.block_size = block_size
         self.norm_correction = norm_correction
         self.precomputed_norm = precomputed_norm
-        self.centroids = load_codebook(spec.bits, block_size)
-        self.boundaries = load_boundaries(spec.bits, block_size)
+        self.centroids = load_codebook(spec.bits, block_size, spec.codebook)
+        self.boundaries = load_boundaries(spec.bits, block_size, spec.codebook)
         self.rotation = make_rotation(rotation, spec.seed, block_size)
 
     def _check_input(self, x: np.ndarray) -> np.ndarray:

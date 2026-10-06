@@ -33,6 +33,9 @@ from typing import Any
 import onnx
 from model_identity import sha256_file
 
+from qai_hub_models.models.templates.llm.turboquant.bitplane_attention import (
+    use_bitplane_qk,
+)
 from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_profile
 from qai_hub_models.models.templates.llm.turboquant.current_attention import (
     quantize_current_attention,
@@ -145,6 +148,8 @@ def apply_profile(
         result = add_qjl_attention(result, config)
     if config.enabled and args.quantize_current_kv:
         result = quantize_current_attention(result, config)
+    if config.bitplane_qk:
+        result = use_bitplane_qk(result, config)
     # Initializers keep their external-data location, so expose the weights file here.
     for data in onnx_path.parent.glob("*.data"):
         link = out / data.name
@@ -395,11 +400,16 @@ def main() -> None:
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     args = parser.parse_args()
-    scaled = args.profile in ("k4_v4_scaled", "k3qjl_v4_scaled")
+    scaled = args.profile in (
+        "k4_v4_scaled",
+        "k3qjl_v4_scaled",
+        "k4s_v4_scaled",
+        "k4s_v4_bitplane",
+    )
     if args.native_decoder is None:
         args.native_decoder = scaled
     if args.native_decoder and not scaled:
-        parser.error("Native Decode4 requires k4_v4_scaled or k3qjl_v4_scaled")
+        parser.error("Native Decode4 requires a supported scaled TurboQuant profile")
     if args.attention_tile is None:
         args.attention_tile = 256 if scaled else 0
     if args.rotated_attention is None:
@@ -421,8 +431,10 @@ def main() -> None:
         "k4_v4",
         "k4_v4_scaled",
         "k3qjl_v4_scaled",
+        "k4s_v4_scaled",
+        "k4s_v4_bitplane",
     ):
-        parser.error("--attention-tile requires a k4_v4 or k3qjl_v4_scaled profile")
+        parser.error("--attention-tile requires a supported K4/V4 or K3+QJL/V4 profile")
     if args.rotated_attention and (not scaled or not args.attention_tile):
         parser.error(
             "--rotated-attention requires a supported scaled profile and --attention-tile"
@@ -431,6 +443,15 @@ def main() -> None:
         args.native_decoder and args.rotated_attention and args.attention_tile
     ):
         parser.error("k3qjl_v4_scaled requires native rotated tiled attention")
+    if args.profile in ("k4s_v4_scaled", "k4s_v4_bitplane") and not (
+        args.native_decoder
+        and args.rotated_attention
+        and args.attention_tile
+        and args.quantize_current_kv
+    ):
+        parser.error(
+            "Structured experiments require Native rotated tiled attention and quantized current KV"
+        )
     if args.native_decoder_package:
         args.native_decoder_package = args.native_decoder_package.expanduser().resolve()
         if not args.rotated_attention:
@@ -447,6 +468,12 @@ def main() -> None:
         if not (args.native_decoder_package / "manifest.json").is_file():
             parser.error(
                 f"Missing native decoder manifest in {args.native_decoder_package}"
+            )
+        if args.profile == "k4s_v4_bitplane" and "BitplaneQK4" not in json.loads(
+            (args.native_decoder_package / "manifest.json").read_text()
+        ).get("operations", []):
+            parser.error(
+                "Build a new HTP native package containing BitplaneQK4; no fallback is allowed"
             )
     buckets = sorted({*args.context_buckets, args.context_length})
     if any(c <= 1 or c > args.context_length for c in buckets):

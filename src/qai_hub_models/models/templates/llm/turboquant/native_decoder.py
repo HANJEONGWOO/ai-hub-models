@@ -21,6 +21,14 @@ NATIVE_DOMAIN = "turboquant"
 NATIVE_OP = "Decode4"
 
 
+def native_table(config: TurboQuantConfig, kind: str) -> str:
+    if kind == "key" and config.key.codebook != "lloyd_max":
+        return "tq_native_key_structured_centroids_fp16"
+    if kind == "key" and config.qjl:
+        return "tq_native_key3_centroids_fp16"
+    return "tq_native_centroids_fp16"
+
+
 def use_native_decoder(
     result: SurgeryResult, config: TurboQuantConfig
 ) -> SurgeryResult:
@@ -53,6 +61,15 @@ def use_native_decoder(
             load_codebook(4, 128).astype(np.float16).reshape(1, 1, 1, 16), table_name
         )
     )
+    if config.key.codebook != "lloyd_max":
+        graph.initializer.append(
+            numpy_helper.from_array(
+                load_codebook(4, 128, config.key.codebook)
+                .astype(np.float16)
+                .reshape(1, 1, 1, 16),
+                native_table(config, "key"),
+            )
+        )
     if config.qjl:
         graph.initializer.append(
             numpy_helper.from_array(
@@ -84,9 +101,7 @@ def use_native_decoder(
                         [
                             prefix + "packed",
                             scale16,
-                            "tq_native_key3_centroids_fp16"
-                            if config.qjl and kind == "key"
-                            else table_name,
+                            native_table(config, kind),
                         ],
                         [output16],
                         domain=NATIVE_DOMAIN,

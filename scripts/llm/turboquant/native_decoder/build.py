@@ -63,11 +63,12 @@ def main() -> None:
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "source_files": {
             name: hashlib.sha256(source.with_name(name).read_bytes()).hexdigest()
-            for name in ("decoder.cpp", "hvx_decode.h", "Decode4.xml")
+            for name in ("decoder.cpp", "hvx_decode.h", "hvx_bitplane.h", "Decode4.xml")
         },
         "qairt_sdk": str(args.sdk),
         "hexagon_tools": str(args.hexagon_tools),
         "libraries": {},
+        "operations": ["Decode4", "BitplaneQK4"],
     }
     for target, command in targets.items():
         output = args.out / target / "libTurboQuantNative.so"

@@ -111,7 +111,12 @@ def byte_centroid_lut(bits: int, block_size: int) -> np.ndarray:
 
 
 def _scalar_index_tree(
-    sg: Subgraph, src: str, bits: int, block_size: int, prefix: str
+    sg: Subgraph,
+    src: str,
+    bits: int,
+    block_size: int,
+    prefix: str,
+    codebook: str = "lloyd_max",
 ) -> str:
     """Exact ``searchsorted(boundaries, src, side='left')``, same shape as src.
 
@@ -122,11 +127,12 @@ def _scalar_index_tree(
     """
     if bits not in (3, 4):
         raise ValueError("Scalar tree requires the frozen 3/4-bit codebook.")
-    boundaries = load_boundaries(bits, block_size).astype(np.float32)
+    boundaries = load_boundaries(bits, block_size, codebook).astype(np.float32)
+    suffix = "" if codebook == "lloyd_max" else "_" + codebook
 
     def constant(name: str, value: float) -> str:
         return sg.const(
-            f"tq_scalar_b{bits}_d{block_size}_{name}",
+            f"tq_scalar_b{bits}_d{block_size}{suffix}_{name}",
             np.array(value, dtype=np.float32),
         )
 
@@ -269,7 +275,9 @@ def encode_subgraph(
         "MatMul", [f"{p}unit", _rotation_name(sg, config, spec, True)], [f"{p}rotated"]
     )
     # Preserve head_dim as the vectorized innermost axis, without a boundary axis.
-    index = _scalar_index_tree(sg, f"{p}rotated", spec.bits, d, p + "scalar_")
+    index = _scalar_index_tree(
+        sg, f"{p}rotated", spec.bits, d, p + "scalar_", spec.codebook
+    )
     sg.node(
         "Reshape",
         [index, sg.shape([heads, num_tokens, d])],
@@ -297,10 +305,11 @@ def encode_subgraph(
             y_hat = _select_centroid(
                 sg,
                 f"{p}scale_index",
-                load_codebook(spec.bits, d).astype(np.float32),
+                load_codebook(spec.bits, d, spec.codebook).astype(np.float32),
                 spec.bits,
                 d,
                 p + "scale_",
+                codebook=spec.codebook,
             )
             sg.node("Mul", [y_hat, y_hat], [f"{p}scale_sq"])
             sg.node("ReduceSum", [f"{p}scale_sq", axis3], [f"{p}scale_sum"], keepdims=1)
@@ -324,6 +333,7 @@ def _select_centroid(
     bits: int,
     block_size: int,
     prefix: str,
+    codebook: str = "lloyd_max",
 ) -> str:
     """Exact 8/16-entry lookup on integer indices, using symmetric affine pairs.
 
@@ -354,6 +364,8 @@ def _select_centroid(
         slope = centroids[count // 2 + offset + 1] - centroids[count // 2 + offset]
         base = centroids[count // 2 + offset] - offset * slope
         tag = f"tq_centroid_b{bits}_d{block_size}_pair{pair}"
+        if codebook != "lloyd_max":
+            tag += "_" + codebook
         sg.node(
             "Mul",
             [f"{p}magnitude_index", scalar(tag + "_slope", slope)],
@@ -451,7 +463,7 @@ def decode_subgraph(
         [f"{p}nibble_pairs", sg.shape([lead[0], lead[1], num_tokens, d])],
         [f"{p}index_f"],
     )
-    centroids = load_codebook(spec.bits, d).astype(np.float32)
+    centroids = load_codebook(spec.bits, d, spec.codebook).astype(np.float32)
     index_f = f"{p}index_f"
     if spec.bits == 3:
         eight = sg.const("tq_eight_f", np.array(8, dtype=np.float32))
@@ -463,7 +475,7 @@ def decode_subgraph(
             [f"{p}mse_index"],
         )
         index_f = f"{p}mse_index"
-    y_hat = _select_centroid(sg, index_f, centroids, spec.bits, d, p)
+    y_hat = _select_centroid(sg, index_f, centroids, spec.bits, d, p, spec.codebook)
     y_unit = y_hat
     if config.norm_correction and not config.precomputed_norm:
         sg.node("Mul", [y_hat, y_hat], [f"{p}sq"])

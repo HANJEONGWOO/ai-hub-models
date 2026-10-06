@@ -29,6 +29,8 @@ def profiler(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         ("tq_key_0_enc_scalar_level0_above", "encode.scalar_index", "key"),
         ("tq_value_4_enc_scalar_level3_select2_0_hi", "encode.scalar_index", "value"),
         ("tq_key_0_enc_scalar_sum3", "encode.scalar_index", "key"),
+        ("tq_attn_0_tile0_head0_q0_score_bitplane_score16", "attention.qk", "key"),
+        ("tq_bitplane_0_tile0_head0_packed", "layout_precision", "key"),
         ("tq_value_4_enc_scale_len", "encode.scale_correction", "value"),
         ("tq_value_4_enc_index_hi", "encode.pack", "value"),
         ("tq_key_27_tile768_native_fp16", "decode.native_past", "key"),

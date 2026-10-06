@@ -3,6 +3,16 @@
 <OpDefCollection PackageName="TurboQuantNative" Domain="turboquant" Version="1.0" UseQHPI="true">
   <OpDefList>
     <OpDef>
+      <Name>BitplaneQK4</Name>
+      <Description><Content>HTP HVX packed structured Key signed Query accumulation; no restored K tensor.</Content></Description>
+      <Input><Name>packed</Name><Description><Content>MSB-first nibbles [heads,1,tokens,64]</Content></Description><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_UINT_8</Datatype><Shape><Rank>4D</Rank><Text>heads,1,tokens,64</Text></Shape></Input>
+      <Input><Name>scale</Name><Description><Content>FP16 effective scale [heads,1,tokens,1]</Content></Description><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype><Shape><Rank>4D</Rank><Text>heads,1,tokens,1</Text></Shape></Input>
+      <Input><Name>query</Name><Description><Content>Rotated FP16 Query [heads,groups,queries,128]</Content></Description><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype><Shape><Rank>4D</Rank><Text>heads,groups,queries,128</Text></Shape></Input>
+      <Input><Name>beta</Name><Description><Content>Four shared little-endian FP32 coefficients as 16 raw constant bytes, LSB first. Prevents implicit FP16 constant rounding.</Content></Description><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_UINT_8</Datatype><Shape><Rank>4D</Rank><Text>1,1,4,4</Text></Shape></Input>
+      <Output><Name>score</Name><Description><Content>FP16 scores [heads,groups,queries,tokens]</Content></Description><Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype><Shape><Rank>4D</Rank><Text>heads,groups,queries,tokens</Text></Shape></Output>
+      <SupportedBackend>HTP</SupportedBackend>
+    </OpDef>
+    <OpDef>
       <Name>Decode4</Name>
       <Description><Content>MSB-first packed 4-bit centroid indices times a precomputed FP16 scale. No inverse rotation.</Content></Description>
       <Input>

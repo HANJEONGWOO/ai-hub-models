@@ -67,11 +67,16 @@ def semantic_stage(name: str) -> tuple[str, int | None, str]:
         layer, tail = int(match.group(1)), match.group(2)
         if re.fullmatch(r"head\d+_q\d+_(rotated|scaled)", tail):
             return "attention.query_rotate", layer, "query"
-        if re.fullmatch(r"tile\d+_head\d+_q\d+_score", tail):
+        if re.fullmatch(r"tile\d+_head\d+_q\d+_score(_bitplane_score16)?", tail):
+            return "attention.qk", layer, "key"
+        if re.fullmatch(r"head\d+_q\d+_current_bitplane_score16", tail):
             return "attention.qk", layer, "key"
         if re.fullmatch(r"tile\d+_head\d+_q\d+_(partial|sum)", tail):
             return "attention.av", layer, "value"
         return "layout_precision", layer, ""
+    match = re.match(r"tq_bitplane_(\d+)_", name)
+    if match:
+        return "layout_precision", int(match.group(1)), "key"
     match = re.match(r"fp16_attn_(\d+)_head\d+_q\d+_(qk|av)_half$", name)
     if match:
         return (
