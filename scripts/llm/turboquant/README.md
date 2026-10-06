@@ -28,6 +28,30 @@ The D drive must be mounted; explicitly choosing another output directory still
 uses that directory. These directory links are machine-local, not Git-tracked
 export defaults, and need setting up separately on a different machine.
 
+## Scalar indexing: tree search only
+
+All newly exported TurboQuant encoders use exact Lloyd-Max tree search:
+four dependent comparisons for 4-bit K/V, three for the QJL 3-bit MSE stage.
+The all-boundary broadcast/count implementation has been removed; there is
+no strategy flag or additional profile. Existing profile names and commands
+continue to work. The offline NumPy oracle remains `searchsorted(..., side="left")`.
+
+Codebooks, boundary ties (lower index), Dense rotation, norm/effective-scale
+correction, packing, current-KV policy and Native LUT decoding are unchanged.
+Threshold leaves use `bit*hi + (1-bit)*lo`, avoiding static/static HTP `Where`
+and preserving FP16 boundary values exactly.
+
+Compressed configurations now record `scalar_indexing: lloyd_tree` in their
+config/hash. Old broadcast bundles are rejected by conversion/reuse guards:
+use a **new output directory and rebuild the ONNX/DLC/context binaries**.
+Existing binaries are not automatically rewritten. The KV storage ABI is
+unchanged; uncompressed INT8/INT16/FP16 baseline configuration hashes are unchanged.
+Historical reports remain readable, but their performance is not a new tree measurement.
+
+This change is covered by CPU graph/oracle, boundary/FP16-domain, packing,
+QJL/Native and metadata regression tests. No model rebuild or device performance
+measurement is performed as part of this code-only switch.
+
 ## FP16 KV + FP16-input attention control (opt-in)
 
 `baseline_fp16_kv_fp16_attn` is a separate, uncompressed control. It does **not**

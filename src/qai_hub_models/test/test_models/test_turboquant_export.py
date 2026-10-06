@@ -12,15 +12,20 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import pytest
+from onnx import TensorProto, helper, numpy_helper
 
 from qai_hub_models.models.templates.llm.turboquant.config import (
     BASELINE,
     get_profile,
 )
 from qai_hub_models.models.templates.llm.turboquant.export import (
+    Subgraph,
+    _finish,
+    _scalar_index_tree,
     build_decode_model,
     build_encode_model,
     byte_centroid_lut,
+    encode_subgraph,
 )
 from qai_hub_models.models.templates.llm.turboquant.numerics import (
     FLOAT32_GRAPH,
@@ -31,6 +36,7 @@ from qai_hub_models.models.templates.llm.turboquant.numerics import (
 from qai_hub_models.models.templates.llm.turboquant.packing import pack_indices
 from qai_hub_models.models.templates.llm.turboquant.reference import (
     PolarQuantReference,
+    load_boundaries,
     load_codebook,
 )
 
@@ -130,15 +136,111 @@ def test_decode_has_no_threshold_expansion() -> None:
         assert np.prod(dims) <= HEADS * tokens * D, (info.name, dims)
 
 
-def test_encode_comparisons_keep_head_dim_innermost() -> None:
+@pytest.mark.parametrize("profile", ["k4_v4", "k4_v4_scaled", "k3qjl_v4_scaled"])
+@pytest.mark.parametrize("which", ["key", "value"])
+@pytest.mark.parametrize("tokens", [1, 128])
+def test_encode_uses_only_unexpanded_scalar_tree(
+    profile: str, which: str, tokens: int
+) -> None:
+    config = get_profile(profile)
+    spec = getattr(config, which)
+    shape = [1, HEADS, tokens, D]
+    sg = encode_subgraph(
+        config, spec, "x", "packed", "norm", (1, HEADS), tokens, "enc_"
+    )
     model = onnx.shape_inference.infer_shapes(
-        build_encode_model(CONFIG, CONFIG.key, HEADS, 128)
+        _finish(
+            sg,
+            "encode",
+            [helper.make_tensor_value_info("x", TensorProto.FLOAT, shape)],
+            [
+                helper.make_tensor_value_info(
+                    "packed", TensorProto.UINT8, [1, HEADS, tokens, D // 2]
+                ),
+                helper.make_tensor_value_info(
+                    "norm", TensorProto.FLOAT, [1, HEADS, tokens, 1]
+                ),
+            ],
+        )
     )
     shapes = {
         v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
         for v in model.graph.value_info
     }
-    assert shapes["enc_above"] == [HEADS, 128, 15, D]
+    scalar = [n for n in model.graph.node if n.name.startswith("enc_scalar_")]
+    comparisons = [n for n in scalar if n.op_type == "Greater"]
+    assert len(comparisons) == spec.bits
+    assert all(shapes[n.output[0]] == shape for n in scalar)
+    assert all(
+        n.op_type not in {"Gather", "ReduceSum", "ArgMin", "TopK"} for n in scalar
+    )
+    assert "enc_above" not in shapes and "enc_above_i32" not in shapes
+    assert not any(
+        t.name.startswith("tq_boundaries_vector") for t in model.graph.initializer
+    )
+    assert all(np.prod(dims) <= HEADS * tokens * D for dims in shapes.values())
+
+
+def run_scalar_tree(bits: int, values: np.ndarray) -> np.ndarray:
+    sg = Subgraph()
+    output = _scalar_index_tree(sg, "y", bits, D, "scalar_")
+    dtype = TensorProto.FLOAT
+    if values.dtype == np.float16:
+        dtype = TensorProto.FLOAT16
+        # Model the HTP FP16 elementwise path without running a device benchmark.
+        for tensor in sg.initializers.values():
+            if tensor.data_type == TensorProto.FLOAT:
+                tensor.CopyFrom(
+                    numpy_helper.from_array(
+                        numpy_helper.to_array(tensor).astype(np.float16), tensor.name
+                    )
+                )
+        for node in sg.nodes:
+            for attr in node.attribute:
+                if (
+                    node.op_type == "Cast"
+                    and attr.name == "to"
+                    and attr.i == TensorProto.FLOAT
+                ):
+                    attr.i = TensorProto.FLOAT16
+    model = _finish(
+        sg,
+        "scalar_tree",
+        [helper.make_tensor_value_info("y", dtype, list(values.shape))],
+        [helper.make_tensor_value_info(output, TensorProto.INT32, list(values.shape))],
+    )
+    return run(model, {"y": values})[0]
+
+
+@pytest.mark.parametrize("bits", [3, 4])
+def test_scalar_tree_exact_boundaries_and_neighbors(bits: int) -> None:
+    boundaries = load_boundaries(bits, D).astype(np.float32)
+    x = np.r_[
+        boundaries,
+        np.nextafter(boundaries, -np.inf),
+        np.nextafter(boundaries, np.inf),
+        np.linspace(-1, 1, 10001),
+        -0.0,
+        0.0,
+        -65504,
+        65504,
+    ].astype(np.float32)
+    np.testing.assert_array_equal(
+        run_scalar_tree(bits, x.reshape(1, 1, 1, -1)).ravel(),
+        np.searchsorted(boundaries, x, side="left"),
+    )
+
+
+@pytest.mark.parametrize("bits", [3, 4])
+def test_scalar_tree_all_finite_fp16_inputs(bits: int) -> None:
+    x = np.arange(65536, dtype=np.uint16).view(np.float16)
+    x = np.sort(x[np.isfinite(x)])
+    boundaries = load_boundaries(bits, D).astype(np.float16)
+    index = run_scalar_tree(bits, x.reshape(1, 1, 1, -1)).ravel()
+    np.testing.assert_array_equal(index, np.searchsorted(boundaries, x, side="left"))
+    assert index.min() == 0 and index.max() == (1 << bits) - 1
+    assert np.all(np.diff(index) >= 0)
+    assert np.all(index[x == 0] == (1 << (bits - 1)) - 1)
 
 
 @pytest.mark.parametrize(

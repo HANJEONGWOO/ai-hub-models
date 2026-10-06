@@ -44,7 +44,8 @@ def semantic_stage(name: str) -> tuple[str, int | None, str]:
             sub = tail[4:]
             if sub.startswith("rotated"):
                 stage = "encode.rotate"
-            elif sub in {"above", "above_i32", "index"}:
+            # Retain old event names for historical reports, not an export path.
+            elif sub in {"above", "above_i32", "index"} or sub.startswith("scalar_"):
                 stage = "encode.scalar_index"
             elif sub.startswith(("index_hi", "index_lo", "byte_")):
                 stage = "encode.pack"

@@ -1,6 +1,12 @@
 # Qwen3 TurboQuant KV-cache — 설계(ABI·수치 계약)와 P0–P3 결과
 
 > 현재 기본 회전은 dense QR이며 QJL은 off다(§16). §15까지의 실측은 WHT 경로의 이력이다.
+>
+> Scalar 인덱싱은 이제 tree search만 사용한다(4-bit 4단계, QJL 3-bit MSE 3단계).
+> Broadcast 비교·합산 생성 경로는 제거했으며 codebook·packing·Native decoder는 유지한다.
+> 기존 profile 이름은 같지만 구성 해시가 달라지므로 새 바이너리를 빌드해야 한다.
+> 아래 실측 수치는 이번 tree-only 전환의 재측정 결과가 아닌 기존 실험 이력이다.
+> [현재 구현과 빌드 안내](../../scripts/llm/turboquant/README.md#scalar-indexing-tree-search-only)
 
 작성일: 2026-09-15 · 작업 브랜치: `turboquant-kv-cache` (기준 commit `2a895603e`)
 

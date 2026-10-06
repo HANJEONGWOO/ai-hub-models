@@ -306,7 +306,17 @@ def test_config_hash_is_stable_and_sensitive() -> None:
     assert data["key"]["rotation_f32_sha256"] != data["value"]["rotation_f32_sha256"]
 
 
-def test_dense_default_and_legacy_hash_compatibility() -> None:
+@pytest.mark.parametrize("name", list(PROFILES))
+def test_scalar_indexing_identity_is_fixed_for_compressed_profiles(name: str) -> None:
+    config = get_profile(name)
+    data = config.to_dict()
+    if config.enabled:
+        assert data["scalar_indexing"] == "lloyd_tree"
+    else:
+        assert "scalar_indexing" not in data
+
+
+def test_dense_default_and_tree_identity() -> None:
     dense = get_profile("k4_v4_scaled")
     legacy = get_profile("k4_v4_scaled", Rotation.FWHT)
     assert dense.rotation == Rotation.DENSE_QR
@@ -314,10 +324,16 @@ def test_dense_default_and_legacy_hash_compatibility() -> None:
     assert dense.precomputed_norm and dense.norm_correction
     assert dense.to_dict()["qjl"] is False
     assert dense.config_hash() != legacy.config_hash()
-    # These identities come from the pre-dense on-device comparison bundles.
-    assert legacy.config_hash() == (
+    # Only the indexing identity changes; historical codebook/rotation metadata stays.
+    old = legacy.to_dict()
+    assert old.pop("scalar_indexing") == "lloyd_tree"
+    old_hash = hashlib.sha256(
+        json.dumps(old, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert old_hash == (
         "94bf3075bfa7443d6aa34f804809f2662d45a7d262019fa9f5c670868a2b142d"
     )
+    assert legacy.config_hash() != old_hash
     assert get_profile("baseline_int16_kv").config_hash() == (
         "26072b4c1cb6c7388a6ba8ae2e499046dfc25ffee3230b8d2f542c0d207a2e00"
     )

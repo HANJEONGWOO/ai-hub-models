@@ -212,6 +212,10 @@ class TurboQuantConfig:
         }
         if self.precomputed_norm:
             data["norm_representation"] = "effective_scale"
+        if self.enabled:
+            # Fixed implementation, not a selectable strategy. Invalidate old
+            # broadcast bundles even though the codebook/cache ABI is unchanged.
+            data["scalar_indexing"] = "lloyd_tree"
         if self.fp16_attention:
             data["attention"] = {
                 "kv_storage": "float16",
@@ -245,7 +249,7 @@ class TurboQuantConfig:
                     (spec.bits, self.block_size)
                 ]
                 if self.rotation == Rotation.FWHT:
-                    # Keep historical FWHT hashes/cache identities unchanged.
+                    # Preserve the FWHT sign hashes; indexing identity is separate.
                     data[name]["signs_sha256"] = FWHT_SIGNS_SHA256[
                         (spec.seed, self.block_size)
                     ]
@@ -308,7 +312,7 @@ PROFILES: dict[str, TurboQuantConfig] = {
 
 
 def get_profile(name: str, rotation: Rotation | None = None) -> TurboQuantConfig:
-    """Get a profile; an explicit rotation reproduces historical FWHT bundles."""
+    """Get a profile; an explicit rotation selects the legacy FWHT rotation."""
     if name == "qjl_reference":
         raise NotImplementedError(
             "qjl_reference is a research option outside the first milestone; "
