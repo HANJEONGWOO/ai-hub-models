@@ -2820,6 +2820,189 @@ Heatmap 첫 생성은 환경의 matplotlib 누락으로 중단됐다. 이미 생
 행렬을 보존하고 matplotlib를 설치한 뒤 **저장된 결과의 시각화만** 실행했다.
 선택·학습·품질 평가를 유리한 결과를 얻기 위해 다시 실행한 것이 아니다.
 
-## 27. 출처
+## 27. 동일 validation의 Attention MSE–NLL 비교 (2026-10-09)
+
+### 27.1 목적·고정 조건
+
+§26에서는 추가 validation의 Attention MSE와 **다른 heldout 문서**의 PPL을
+비교했다. 이번 실험은 동일한 validation 입력에서 MSE 감소와 전체 모델 NLL
+감소의 방향을 비교하여, 데이터 집합 차이와 국소 목적함수의 한계를 구분할
+근거를 얻는 후속 평가다. 새 회전 선택·학습·재보정·코드북 변경은 하지 않는다.
+
+브랜치 `exp/k-rotation-mse-nll-validation`은 깨끗한
+`exp/k-dense-layer-selection-diagnostics`의 `fcb01938c`에서 분기했다.
+A(shared seed42), B(shared seed48), P(per-layer)의 기존 행렬과 모델 바이너리,
+HTP runner를 그대로 재사용한다. LM tree/codebook, Dense rotation, Native LUT,
+K4/V4, QJL-off, current-KV 압축, norm correction/FP16 effective scale, V 경로와
+W4A16 가중치·calibration도 동일하다. **기본값은 A(seed42) 그대로다.**
+
+원본: `/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_followup_20261009/`.
+새 루트: `/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_mse_nll_20261009/`.
+원본 payload는 새 디렉터리에서 읽기용 링크로 참조하고, runtime metadata와
+실험 결과는 새 디렉터리에만 기록한다. 원본 결과를 덮어쓰지 않는다.
+
+### 27.2 입력·측정·집계
+
+기존 `data_manifest.json` SHA256:
+`121b9a93b6170089e499e1490f1f1acdfe9b15a839d7e74108ef46013736a1ee`.
+WikiText-2-raw revision `b08601e04326c79dfdd32d625aee71d232d685c3`의 로컬
+validation parquet를 사용한다. 원본 문서의 ID/text hash와 offset을 검증하고,
+기존 로컬 tokenizer로 재토큰화하여 저장된 int32 token bytes와 동일함을 확인했다.
+새로 표본을 뽑거나 offset을 이동하지 않았다.
+
+| validation 문서 | 토큰 offset | 입력 길이 | scored tokens | token SHA256 앞 12자 |
+|---|---:|---:|---:|---|
+| Slammiversary (2008) | 51 | 1024 | 1023 | `47a4b8fafca9` |
+| Sorry (Madonna song) | 1009 | 1024 | 1023 | `dd8ae4dfc448` |
+| Meridian, Mississippi | 1386 | 1024 | 1023 | `8d0d2d55d44b` |
+| Fort Scott National Historic Site | 980 | 1024 | 1023 | `b4fd419bbace` |
+
+기기/실행 조건은 이전과 같은 S26 Ultra SM8850, HTP V81, QAIRT 2.48,
+CL1024다. 기존 runner의 teacher-forced `score` 경로는 정답 입력을 AR128
+chunk로 처리하고 위치 `i`의 logits로 토큰 `i+1`을 평가한다. 첫 토큰은
+target에서 제외되어 문서마다 **1023개**, 구성마다 **4092개**를 scoring한다.
+추론 CPU fallback, capture/optrace/추가 profiling은 사용하지 않는다.
+
+문서별 사전 고정 실행 순서는 `ABP / BPA / PAB / ABP`다. 이는 **12건의
+단회 측정**이며 반복 측정이 아니다. 기존 heldout 4문서는 새 asset 디렉터리에
+넣지 않았고 실행하지 않는다. 새 asset에는 validation token 파일 4개와 RoPE만
+포함한다. 실패한 attempt는 보존하고 자동 반복하지 않는다.
+
+NLL은 자연로그 기준이며 문서별 NLL 합과 평균(nats/token)을 모두 보존한다.
+전체 PPL은 `exp(sum(document_nll_sum) / sum(scored_tokens))`다. 문서 PPL의
+산술평균이나 MSE로부터 PPL을 추정하는 방식은 사용하지 않는다.
+
+Attention MSE는 기존 `cpu_quality.json`의 A/B/P 값을 **재사용**한다.
+이 값은 같은 4문서, 28레이어, 문서당 query 위치 `31,63,...,1023` 32개와
+모든 head를 대상으로 하며, FP16-KV 경로에서 고정한 레이어별 캡처 입력에
+대한 CPU hard-forward 오차다. NLL은 전체 모델의 1023개 target을 평가한다.
+따라서 문서·window는 같지만 **표본 위치·손실 단위·입력 전파 방식까지 같은
+지표는 아니다**. 기존 파일에는 문서별 MSE가 없어 새 계산 없이 문서별
+MSE–NLL 상관계수나 특정 문서×레이어의 원인 기여를 산출할 수 없다.
+
+### 27.3 측정 결과
+
+12건 모두 성공했고 각 구성의 scored tokens는 4092개다. 원본 139개 파일의
+해시와 기기 runner/SDK/native package/context/config 23개 파일의 해시를
+검증했다. 측정 전후 변경이 없으며 재빌드·MSE 재계산·heldout 실행은 0회다.
+기존 경로를 포함한 **CPU 회귀 테스트 574개 통과**, Ruff/format과
+`git diff --check`도 통과했다. 기존 Swig deprecation warning 2개는 유지된다.
+
+| 지표 | A: shared42 | B: shared48 | P: per-layer |
+|---|---:|---:|---:|
+| Validation Attention MSE (기존) | 0.167874188 | 0.152565078 | **0.149340947** |
+| Validation 전체 NLL 합 (신규) | 14114.674230 | **13863.953050** | 14076.306940 |
+| Validation 평균 NLL (nats/token, 신규) | 3.449334 | **3.388063** | 3.439958 |
+| Validation PPL (신규) | 31.479416 | **29.608540** | 31.185639 |
+
+문서별 평균 NLL과 변화량(모두 nats/token, **음수가 개선**):
+
+| 문서 | A | B | P | B−A | P−A | P−B |
+|---|---:|---:|---:|---:|---:|---:|
+| Slammiversary (2008) | 3.408223 | 3.302679 | 3.368685 | −0.105545 | −0.039538 | +0.066006 |
+| Sorry (Madonna song) | 3.712231 | 3.620146 | 3.690066 | −0.092085 | −0.022165 | +0.069921 |
+| Meridian, Mississippi | 3.175224 | 3.141347 | 3.191663 | −0.033877 | +0.016439 | +0.050316 |
+| Fort Scott National Historic Site | 3.501658 | 3.488080 | 3.509416 | −0.013578 | +0.007759 | +0.021336 |
+| 전체 | 3.449334 | 3.388063 | 3.439958 | −0.061271 | −0.009376 | **+0.051895** |
+
+| 문서별 PPL | A | B | P |
+|---|---:|---:|---:|
+| Slammiversary (2008) | 30.211524 | **27.185367** | 29.040323 |
+| Sorry (Madonna song) | 40.945042 | **37.343001** | 40.047498 |
+| Meridian, Mississippi | 23.932169 | **23.135007** | 24.328849 |
+| Fort Scott National Historic Site | 33.170397 | **32.723058** | 33.428755 |
+
+집계에는 JSON의 `nll_sum`을 사용했다. 위 문서 PPL도 이 합으로부터 재계산한
+값이며, runner가 별도로 반올림해 출력한 `ppl`과는 마지막 자리가 미세하게
+다를 수 있다. 문서별 원시 NLL 합은 `document_nll.{json,csv}`에 모두 보존했다.
+
+| 비교 (후보/기준) | Attention MSE 변화 | 평균 NLL 변화 | PPL 변화 | NLL 개선 문서 |
+|---|---:|---:|---:|---:|
+| B/A | −9.119% | −0.061271 | −5.943% | 4/4 |
+| P/A | −11.040% | −0.009376 | −0.933% | 2/4 |
+| **P/B** | **−2.113%** | **+0.051895** | **+5.327%** | **0/4** |
+
+**핵심 관측은 동일 validation에서도 P/B가 `MSE 개선 + NLL 악화`라는 것이다.**
+이전 heldout에서는 P/B PPL이 25.553117→26.618682(+4.170%)로 악화됐고,
+이번 같은-validation에서는 29.608540→31.185639(+5.327%)로 악화됐다.
+서로 다른 문서 집합의 PPL 절댓값을 직접 성능 차이로 해석하지 않는다.
+다만 validation/test **문서 차이만**으로 이전 역전을 설명하기는 어렵다는
+근거가 추가됐다. P/B 악화는 특정 한 문서에만 국한되지 않고 4문서 모두에서
+나타났다. P/A는 앞 2문서 개선·뒤 2문서 악화로 평균 이득이 작다.
+
+### 27.4 해석과 다음 목적함수에 대한 판단
+
+이 결과는 **Attention MSE의 작은 추가 감소를 NLL 개선의 충분조건으로
+사용할 수 없다**는 사례다. B/A에서는 두 지표가 함께 개선되므로 “Attention
+MSE와 NLL은 전혀 상관없다”는 결론도 아니다. 3개 고정 구성·4개 validation
+window만으로 모집단 상관계수나 통계적 유의성을 주장하지 않는다.
+
+가능한 설명은 아래와 같지만, 각 원인의 기여를 분리한 실험은 아니다.
+
+1. **오차의 크기와 다음 토큰에 미치는 영향은 다르다.** Attention 출력의
+   제곱거리에는 이후 projection/residual/MLP/LM head가 어떤 오차 방향을
+   증폭하는지, 정답 토큰 확률이 얼마나 변하는지가 직접 반영되지 않는다.
+   따라서 출력 MSE가 작아져도 정답 NLL은 커질 수 있다.
+2. **고정 참조 입력과 실제 전체 모델 입력은 다르다.** 기존 MSE는 FP16-KV
+   경로의 레이어별 Q/K/V를 고정한다. 전체 TQ 모델에서는 앞 레이어의 변화가
+   뒤 레이어의 입력과 양자화 index까지 바꿀 수 있다. 독립적인 레이어별 MSE
+   감소를 합친 값은 전체 모델 NLL의 합이나 보장이 아니다.
+3. **레이어·위치 가중이 다르다.** 저장된 추가 validation MSE에서 B의 마지막
+   4개 레이어(24–27)가 절대 손실의 **68.27%**를 차지한다. P/B는 18레이어
+   개선·5악화·5동일이며, 개선의 주요 기여는 26/20/22지만 27/24는 악화됐다.
+   아래 기여도는 MSE 합산 값이지 NLL 악화의 인과 기여도가 아니다.
+
+   | 레이어 | P/B 레이어 MSE 변화 | 전체 평균 MSE의 P−B 기여 |
+   |---|---:|---:|
+   | 26 | −7.746% | −0.002060512 |
+   | 20 | −17.067% | −0.001318231 |
+   | 22 | −8.110% | −0.000770064 |
+   | 27 | +4.119% | +0.001548152 |
+   | 24 | +2.927% | +0.000425472 |
+
+   MSE는 32개 query 위치만 보며 NLL은 1023개 target을 본다. 특히 MSE의 마지막
+   query 1023은 이 window 안에서 next-token NLL target이 없으므로, 같은 문서라도
+   정확히 같은 위치 집합이 아니다. 문서×레이어별 MSE는 저장되어 있지 않아
+   어느 문서의 어떤 레이어가 NLL을 악화시켰는지는 이번 결과만으로 알 수 없다.
+4. **CPU surrogate와 HTP 수치 차이도 남아 있다.** 기존 encoder 수치 검증 실패와
+   FP32 oracle 차이를 이번 실험에서 해결했다고 간주하지 않는다. 새 probe를
+   수행하지 않았으므로 이 차이의 NLL 영향도 따로 분리하지 않았다.
+
+다음 연구에서는 **최종 후보 선택·승격 기준을 전체 모델 validation NLL로
+두고, Attention MSE는 저비용 사전 선별/진단 지표로 사용하는 편이 타당하다.**
+학습 목적함수 자체를 바꾼다면 정답-token NLL 또는 동일 W4A16 FP16-KV 참조의
+최종-logit KL처럼 출력 분포를 직접 다루는 목적을 검토할 근거가 생겼다.
+하지만 어느 목적이 최적인지, 미분 근사와 HTP hard forward에서도 개선되는지는
+**아직 검증하지 않았다**. 레이어 정규화 MSE만으로 해결된다고 보장하지도 않는다.
+향후 선택 데이터와 독립 heldout을 구분해야 하며, 이번 4문서는 이미 관측된
+validation이므로 새 unbiased test 결과로 취급하지 않는다.
+
+이번 작업은 여기서 종료한다. **A/B/P 행렬·바이너리·기본 seed42는 그대로이며,
+새 학습·회전 선택·목적함수 구현·재빌드·4B 확장·추가 측정은 하지 않았다.**
+
+### 27.5 재현·산출물
+
+재현 명령은 README의 “Same-validation Attention MSE versus whole-model NLL”에
+있다. `benchmark_rotation_mse_nll.py`의 `freeze → push → score → summarize`
+순서로 새 루트에 실행한다. 빌드/학습 단계는 제공하지 않는다.
+
+- `protocol.json`, `data_manifest.json`: 단회 평가 범위와 validation-only 입력.
+- `source_identity.json`, `reports/experiment.json`: 원본 보존·실행 파일·바이너리·설정·코드·SDK hash.
+- `attention_mse.json`: 기존 A/B/P MSE와 레이어별 값, 출처 hash.
+- `reports/{A,B,P}_validation_w{0,1,2,3}.json`: 원시 HTP scoring 결과와 실행 로그/attempt/snapshot.
+- `reports/device_before.json`, `device_after.json`, `preservation.json`: 기기 payload와 원본 보존 검증.
+- `reports/document_nll.{json,csv}`, `document_deltas.csv`, `summary.csv`, `comparison.json`: 문서별/전체 NLL·PPL와 MSE 비교.
+- `reports/layer_mse_contributions.csv`: 저장된 MSE의 레이어별 합산 기여도. NLL의 인과 기여도가 아니다.
+- `reports/cpu_tests.xml`: 574개 CPU 회귀 테스트 결과.
+
+새 protocol SHA256:
+`5243fa53b67bd01c326d4fe789a02279ba4e4ae48a7f3561a5c39de392faadb9`.
+재사용 runner SHA256:
+`1bf86a6ccc5829a4ea33b12a3000d3fd45736de201b80334eca8b9418ebc3f7c`.
+A/B/P config hash는 각각 `d7ac74594b85…`, `c4ccc9eec29a…`, `d1880b99ec22…`로
+이전과 동일하다. 전체 hash와 12개 context binary의 hash는
+`reports/experiment.json`, 기기의 실제 hash는 `device_before/after.json`에 있다.
+
+## 28. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

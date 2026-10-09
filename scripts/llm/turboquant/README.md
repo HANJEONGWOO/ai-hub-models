@@ -203,6 +203,52 @@ it was not built or device-tested. Long decode medians were 37.661 / 37.684 /
 context binaries. Neither candidate was promoted; default A and all old results
 remain unchanged. See `k_rotation_followup_20261009/reports/comparison.json`.
 
+## Same-validation Attention MSE versus whole-model NLL (evaluation only)
+
+`benchmark_rotation_mse_nll.py` reuses the followup's immutable A/B/P binaries,
+rotations, runner and saved validation Attention MSE. It scores exactly the same
+four validation windows (Slammiversary, Sorry, Meridian, Fort Scott) once per
+configuration, CL1024 / 1023 next-token targets per document. No heldout inputs,
+new captures, MSE recomputation, compilation, selection or training are involved.
+The fresh asset directory contains only those four token files and RoPE. Original
+text, offset and token bytes are verified using the pinned local dataset/tokenizer.
+Runtime metadata and reports are written only to a fresh experiment directory;
+binary payloads are immutable links to the originals. Local and device hashes are
+checked, and an existing attempt is never automatically retried or overwritten.
+
+```bash
+export PYTHONPATH=src
+export OPENBLAS_NUM_THREADS=1
+TQ_NLL=/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_mse_nll_new
+TQ_FOLLOW=/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_followup_20261009
+venv/bin/python scripts/llm/turboquant/benchmark_rotation_mse_nll.py freeze \
+  --root "$TQ_NLL" --source "$TQ_FOLLOW"
+for stage in push score summarize; do
+  venv/bin/python scripts/llm/turboquant/benchmark_rotation_mse_nll.py "$stage" \
+    --root "$TQ_NLL" || break
+done
+```
+
+The fixed document orders are ABP / BPA / PAB / ABP, **not repetitions**.
+`reports/document_nll.{json,csv}`, `document_deltas.csv`, `summary.csv`,
+`layer_mse_contributions.csv` and `comparison.json` retain all measurements.
+NLL uses natural logarithms; aggregate PPL is `exp(sum(NLL) / 4092)`, not an
+arithmetic mean of document PPL. Saved MSE covers 32 query positions/window;
+NLL covers all 1023 next-token targets. Per-document MSE was not saved, so no
+documentwise MSE–NLL coefficient or layerwise causal attribution is claimed.
+These already-observed validation documents are not a new heldout evaluation.
+Defaults and the old encoder numerical-validation status are unchanged.
+
+The 2026-10-09 same-validation result is **not monotonic in Attention MSE**:
+A/B/P mean NLL is 3.449334 / 3.388063 / 3.439958 and PPL is
+31.479416 / 29.608540 / 31.185639. P improves aggregate Attention MSE by 2.11%
+versus B, but worsens NLL by 0.051895 nats/token and PPL by 5.33%; NLL is worse
+on all four documents. B improves both metrics versus A. This is evidence against
+treating a small local-MSE gain as a sufficient whole-model quality criterion,
+not proof of no statistical correlation or a particular causal mechanism.
+Use whole-model validation NLL as an adoption gate; new objective/training work
+was not performed. See design §27 and `k_rotation_mse_nll_20261009/reports/`.
+
 ## FP16 KV + FP16-input attention control (opt-in)
 
 `baseline_fp16_kv_fp16_attn` is a separate, uncompressed control. It does **not**
