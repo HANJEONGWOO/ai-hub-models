@@ -69,6 +69,8 @@ class LlmSession {
   int contextLength() const { return options_.contextLength; }
   // Row i of the last step's valid logits, dequantized.
   void logitsRow(int i, std::vector<float>& out) const;
+  // Offline data collection only. Never called during performance evaluation.
+  void captureAttention(const std::string& directory, const std::string& tag) const;
   size_t vocabSize() const;
 
   double loadSeconds() const { return loadSeconds_; }

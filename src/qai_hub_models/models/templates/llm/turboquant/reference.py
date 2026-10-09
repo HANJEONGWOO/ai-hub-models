@@ -150,6 +150,24 @@ def make_rotation(
     return DenseQRRotation(seed, block_size)
 
 
+def rotation_for_spec(
+    rotation: Rotation, spec: KVCodecSpec, block_size: int
+) -> FWHTRotation | DenseQRRotation:
+    if spec.dense_matrix is None:
+        return make_rotation(rotation, spec.seed, block_size)
+    from qai_hub_models.models.templates.llm.turboquant.rotation_artifact import (
+        validate_matrix,
+    )
+
+    if rotation != Rotation.DENSE_QR:
+        raise ValueError("An explicit Dense matrix cannot be used with FWHT")
+    result = object.__new__(DenseQRRotation)
+    result.q = validate_matrix(spec.dense_matrix, block_size).astype(np.float64)
+    result.q.setflags(write=False)
+    result.block_size = block_size
+    return result
+
+
 def nearest_centroid_indices(values: np.ndarray, boundaries: np.ndarray) -> np.ndarray:
     """Index of the nearest centroid; a value exactly on a boundary maps to the lower one."""
     return np.searchsorted(boundaries, values, side="left").astype(np.uint8)
@@ -174,7 +192,7 @@ class PolarQuantReference:
         self.precomputed_norm = precomputed_norm
         self.centroids = load_codebook(spec.bits, block_size)
         self.boundaries = load_boundaries(spec.bits, block_size)
-        self.rotation = make_rotation(rotation, spec.seed, block_size)
+        self.rotation = rotation_for_spec(rotation, spec, block_size)
 
     def _check_input(self, x: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64)

@@ -40,7 +40,7 @@ from qai_hub_models.models.templates.llm.turboquant.config import (
 from qai_hub_models.models.templates.llm.turboquant.reference import (
     load_boundaries,
     load_codebook,
-    make_rotation,
+    rotation_for_spec,
 )
 
 OPSET = 17
@@ -94,7 +94,7 @@ def _rotation_name(
     sg: Subgraph, config: TurboQuantConfig, spec: KVCodecSpec, transpose: bool
 ) -> str:
     d = config.block_size
-    matrix = make_rotation(config.rotation, spec.seed, d).matrix()
+    matrix = rotation_for_spec(config.rotation, spec, d).matrix()
     suffix = "_t" if transpose else ""
     value = matrix.T if transpose else matrix
     return sg.const(

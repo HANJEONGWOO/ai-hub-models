@@ -47,6 +47,9 @@ from qai_hub_models.models.templates.llm.turboquant.native_decoder import (
     use_native_decoder,
 )
 from qai_hub_models.models.templates.llm.turboquant.qjl import add_qjl_attention
+from qai_hub_models.models.templates.llm.turboquant.rotation_artifact import (
+    with_key_rotation,
+)
 from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
     tile_kv_attention,
 )
@@ -122,8 +125,9 @@ def apply_profile(
     out: Path,
 ) -> tuple[Path, Path, dict[str, Any]]:
     """Apply the profile to this graph; baseline graphs are converted as exported."""
-    config = get_profile(
-        args.profile, Rotation(args.rotation) if args.rotation else None
+    config = with_key_rotation(
+        get_profile(args.profile, Rotation(args.rotation) if args.rotation else None),
+        getattr(args, "key_rotation_file", None),
     )
     model = onnx.load(str(onnx_path), load_external_data=False)
     if not config.modifies_graph or not any(
@@ -145,6 +149,13 @@ def apply_profile(
         result = add_qjl_attention(result, config)
     if config.enabled and args.quantize_current_kv:
         result = quantize_current_attention(result, config)
+    capture = None
+    if getattr(args, "capture_attention", False):
+        from qai_hub_models.models.templates.llm.turboquant.attention_capture import (
+            add_attention_capture,
+        )
+
+        capture = add_attention_capture(result, seq_len)
     # Initializers keep their external-data location, so expose the weights file here.
     for data in onnx_path.parent.glob("*.data"):
         link = out / data.name
@@ -155,6 +166,8 @@ def apply_profile(
     new_encodings = out / f"{name}.encodings"
     new_encodings.write_text(json.dumps(result.encodings))
     report = result.report()
+    if capture is not None:
+        report["attention_capture"] = capture
     (out / f"{name}.kv_edits.json").write_text(json.dumps(report, indent=1) + "\n")
     actions = [e["action"] for e in report["encoding_edits"]]
     summary = {
@@ -342,6 +355,16 @@ def main() -> None:
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--profile", default="baseline_int8")
     parser.add_argument(
+        "--key-rotation-file",
+        type=Path,
+        help="Opt-in K-only shared Dense rotation artifact; defaults unchanged.",
+    )
+    parser.add_argument(
+        "--capture-attention",
+        action="store_true",
+        help="Offline W4A16 FP16-KV Q/K/V/O collection only, never a timing graph.",
+    )
+    parser.add_argument(
         "--rotation",
         choices=[r.value for r in Rotation],
         help="PolarQuant rotation (default: dense_qr); fwht reproduces old bundles.",
@@ -395,6 +418,12 @@ def main() -> None:
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     args = parser.parse_args()
+    if args.capture_attention and args.profile != "baseline_fp16_kv_fp16_attn":
+        parser.error("--capture-attention requires the FP16-KV reference profile")
+    if args.key_rotation_file and args.profile != "k4_v4_scaled":
+        parser.error(
+            "--key-rotation-file requires the existing LM K4/V4 scaled profile"
+        )
     scaled = args.profile in ("k4_v4_scaled", "k3qjl_v4_scaled")
     if args.native_decoder is None:
         args.native_decoder = scaled
@@ -404,6 +433,15 @@ def main() -> None:
         args.attention_tile = 256 if scaled else 0
     if args.rotated_attention is None:
         args.rotated_attention = scaled
+    if args.key_rotation_file and not (
+        args.native_decoder
+        and args.rotated_attention
+        and args.quantize_current_kv
+        and args.attention_tile == 256
+    ):
+        parser.error(
+            "The K-only rotation experiment requires Native rotated tiled256 attention and compressed current KV"
+        )
     if args.native_decoder_package and (not args.native_decoder or not scaled):
         parser.error(
             "--native-decoder-package requires a supported scaled profile "
@@ -460,8 +498,9 @@ def main() -> None:
     num_parts = len(manifest["parts"])
     report_path = out / "convert_report.json"
     report = json.loads(report_path.read_text()) if report_path.exists() else {}
-    config = get_profile(
-        args.profile, Rotation(args.rotation) if args.rotation else None
+    config = with_key_rotation(
+        get_profile(args.profile, Rotation(args.rotation) if args.rotation else None),
+        args.key_rotation_file,
     )
     current_kv = bool(config.enabled and args.quantize_current_kv)
     if report or args.context_only:
@@ -492,6 +531,8 @@ def main() -> None:
                     f"Existing bundle metadata mismatch: {key}; use a new output "
                     "directory for a different rotation or compilation configuration."
                 )
+        if report.get("capture_attention", False) != args.capture_attention:
+            raise ValueError("Cannot mix captured and uninstrumented graphs")
     report.update(
         {
             "context_length": args.context_length,
@@ -511,6 +552,8 @@ def main() -> None:
         }
     )
     report.setdefault("parts", {})
+    if args.capture_attention:
+        report["capture_attention"] = True
     if "model" in manifest:
         report["model"] = manifest["model"]
         report["split_manifest_sha256"] = sha256_file(split_dir / "split_manifest.json")

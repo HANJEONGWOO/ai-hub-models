@@ -43,6 +43,7 @@ struct Args {
   std::vector<int32_t> eos{151645, 151643};
   std::string report = "report.json";
   std::string dumpLogits;
+  std::string captureDirectory;
   std::string graphSuffix;
   int profileDecodeStep = -1;
   std::vector<int> profileDecodeSteps;
@@ -97,6 +98,7 @@ Args parseArgs(int argc, char** argv) {
   a.nGen = std::stoi(get("--n-gen", std::to_string(a.nGen)));
   a.report = get("--report", a.report);
   a.dumpLogits = get("--dump-logits", "");
+  a.captureDirectory = get("--capture-attention-dir", "");
   a.graphSuffix = get("--graph-suffix", "");
   a.profileDecodeStep = std::stoi(get("--profile-decode-step", "-1"));
   a.optraceDirectory = get("--optrace-dir", "");
@@ -365,6 +367,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> chunk(tokens.begin() + start, tokens.begin() + start + count);
         const bool profiled = first && (args.profilePrefillAll || (args.profilePrefill && start == chunks.back().first));
         StepRecord rec = session.step(chunk, prefillAr, profiled);
+        if (!args.captureDirectory.empty()) session.captureAttention(args.captureDirectory, "s" + std::to_string(s) + "_t" + std::to_string(start));
         steps.push_back(stepJson(rec, profiled ? "prefill_profiled" : "prefill"));
         if (profiled) profiles.push_back(profileJson(rec, args.profilePrefillAll ? "prefill_offset_" + std::to_string(start) : "prefill_last_chunk"));
         if (args.mode == "score") {

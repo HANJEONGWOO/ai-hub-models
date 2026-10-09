@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,9 @@ from verify_kv_boundary import INT8_TYPES, WIDE_TYPES, parse_dlcinfo, walk_back
 
 from qai_hub_models.models.templates.llm.turboquant.config import Rotation, get_profile
 from qai_hub_models.models.templates.llm.turboquant.reference import make_rotation
+from qai_hub_models.models.templates.llm.turboquant.rotation_artifact import (
+    validate_matrix,
+)
 
 
 def rotation_only_change(left: onnx.GraphProto, right: onnx.GraphProto) -> bool:
@@ -55,7 +59,19 @@ def verify_rotations(graph: onnx.GraphProto, config: dict[str, Any]) -> list[str
     d = config["block_size"]
     for kind in ("key", "value"):
         spec = config[kind]
-        matrix = make_rotation(rotation, spec["seed"], d).matrix().astype("<f4")
+        if spec.get("dense_matrix_f32_sha256"):
+            name = f"tq_rotation_t_{rotation.value}_s{spec['seed']}_d{d}"
+            if kind != "key" or name not in actual:
+                errors.append("Missing/unsupported K rotation override")
+                continue
+            matrix = validate_matrix(actual[name].T, d)
+            if (
+                hashlib.sha256(matrix.astype("<f4").tobytes()).hexdigest()
+                != spec["dense_matrix_f32_sha256"]
+            ):
+                errors.append("Explicit K matrix checksum mismatch")
+        else:
+            matrix = make_rotation(rotation, spec["seed"], d).matrix().astype("<f4")
         if rotation == Rotation.DENSE_QR and hashlib.sha256(
             matrix.tobytes()
         ).hexdigest() != spec.get("rotation_f32_sha256"):
@@ -314,6 +330,19 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
     elif current_entries:
         errors.append("Current-token policy disagrees with graph manifest.")
     current = get_profile(conversion["profile"], Rotation(config["rotation"]))
+    if config["key"].get("dense_matrix_f32_sha256"):
+        rotation_name = f"tq_rotation_t_{config['rotation']}_s{config['key']['seed']}_d{config['block_size']}"
+        values = next(
+            numpy_helper.to_array(t).T
+            for t in graph.initializer
+            if t.name == rotation_name
+        )
+        current = replace(
+            current,
+            key=replace(
+                current.key, dense_matrix=tuple(float(x) for x in values.ravel())
+            ),
+        )
     if current.config_hash() != conversion["config_hash"]:
         errors.append("Bundle rotation/config hash does not match current constants.")
     errors.extend(verify_rotations(graph, config))

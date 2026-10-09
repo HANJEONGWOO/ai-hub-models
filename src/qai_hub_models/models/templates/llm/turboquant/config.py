@@ -61,9 +61,13 @@ class KVCodecSpec:
     kind: CodecKind
     bits: int = 0
     seed: int = 0
+    # Opt-in, immutable row-major FP32 orthogonal matrix. Never changes V implicitly.
+    dense_matrix: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
-        if self.kind != CodecKind.POLAR and (self.bits != 0 or self.seed != 0):
+        if self.kind != CodecKind.POLAR and (
+            self.bits != 0 or self.seed != 0 or self.dense_matrix is not None
+        ):
             raise ValueError(f"{self.kind.name} codec takes no bits or seed.")
         if self.kind == CodecKind.POLAR and self.bits not in (3, 4):
             raise ValueError(
@@ -88,7 +92,14 @@ class KVCodecSpec:
         return self.kind != CodecKind.BASELINE
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
+        data = {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
+        if self.dense_matrix is not None:
+            from qai_hub_models.models.templates.llm.turboquant.rotation_artifact import (
+                matrix_digest,
+            )
+
+            data["dense_matrix_f32_sha256"] = matrix_digest(self.dense_matrix)
+        return data
 
 
 BASELINE = KVCodecSpec(CodecKind.BASELINE)
@@ -114,6 +125,29 @@ class TurboQuantConfig:
     reference_commit: str = field(default=REFERENCE_COMMIT)
 
     def __post_init__(self) -> None:
+        if self.value.dense_matrix is not None:
+            raise ValueError("This experiment permits a K-only rotation override.")
+        if self.key.dense_matrix is not None:
+            from qai_hub_models.models.templates.llm.turboquant.rotation_artifact import (
+                validate_matrix,
+            )
+
+            if not isinstance(self.key.dense_matrix, tuple):
+                raise ValueError("Explicit rotation constants must be immutable tuples.")
+            if (
+                self.profile != "k4_v4_scaled"
+                or self.rotation != Rotation.DENSE_QR
+                or self.qjl
+                or self.key.bits != 4
+                or self.value.bits != 4
+                or not self.precomputed_norm
+                or not self.norm_correction
+                or self.norm_dtype != "float16"
+            ):
+                raise ValueError(
+                    "K rotation override requires the unchanged Dense K4/V4 scaled path."
+                )
+            validate_matrix(self.key.dense_matrix, self.block_size)
         if any(s.is_fp16 for s in self.codecs) and not all(
             s.is_fp16 for s in self.codecs
         ):
@@ -257,11 +291,11 @@ class TurboQuantConfig:
                     # Hash the actual exported R, not just its seed: QR can
                     # depend on the host LAPACK build. R.T is derived from R.
                     from qai_hub_models.models.templates.llm.turboquant.reference import (
-                        make_rotation,
+                        rotation_for_spec,
                     )
 
-                    matrix = make_rotation(
-                        self.rotation, spec.seed, self.block_size
+                    matrix = rotation_for_spec(
+                        self.rotation, spec, self.block_size
                     ).matrix()
                     data[name]["rotation_f32_sha256"] = hashlib.sha256(
                         matrix.astype("<f4").tobytes()

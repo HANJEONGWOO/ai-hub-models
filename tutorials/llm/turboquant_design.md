@@ -2342,6 +2342,195 @@ rotated tiled attention도 함께 달라, 압축만의 독립적인 효과를 �
 재현 명령은 README의 Qwen3-8B 절에 있다. 새 측정에는 새 실험 디렉터리와
 기기 bundle 이름을 사용하며, 완료한 단회 측정을 덮어쓰거나 반복하지 않는다.
 
-## 25. 출처
+## 25. K-only Dense rotation 품질 실험 (2026-10-06)
+
+### 25.1 범위와 사전 고정 조건
+
+브랜치 `exp/k-dense-rotation-quality`, 시작점 main `83d1fa64c`.
+Qwen3-1.7B W4A16 / CL1024에서 **K와 대응 Query의 공유 128×128 상수만**
+교체하는 선택형 `--key-rotation-file`을 추가했다. 기본 profile/hash는 유지한다.
+LM exact tree·LM centroid·Native LUT·Dense MatMul, K4/V4, QJL-off,
+current KV 압축, norm correction·벡터당 FP16 effective scale은 유지한다.
+V 회전(seed 542)·V codebook·AV·가중치·calibration은 바꾸지 않는다.
+Structured/Bit-plane 코드는 사용하지 않는다.
+
+같은 W4A16 모델의 FP16-KV/FP16-input QK·AV 경로를 HTP에서 실행하여 실제
+Q/K/V와 AV의 FP16 출력을 수집했다. 수집 모델에는 진단 출력만 추가하고,
+그 실행의 TTFT/처리량은 성능표에서 제외한다. Hugging Face FP-weight 모델이나
+Gaussian 데이터로 대체하지 않았다. WikiText-2 raw의 고정 revision에서 문서가
+겹치지 않는 train 4 / validation 2 / test 4개의 1024-token window를 고정했다.
+모든 28개 레이어와 16개 Query head를 사용하고, 평가 Query 위치는 31,63,…,1023이다.
+
+- A: 기존 seed 42 Dense QR.
+- B: 미리 정한 seed 42…49 가운데 validation Attention 출력 MSE 최소 후보.
+- C: B에서 시작한 hard-forward STE 학습의 validation 최적 checkpoint.
+  step 0(B)도 선택 가능하도록 **학습 전에** 고정했다.
+
+Forward는 실제 hard LM 경계 선택, FP16 정규화·회전·scale·Native LUT 곱,
+encoder affine-pair centroid의 norm correction, 기존 score/softmax affine grid와
+tiled AV를 반영한다. Gradient는 인덱스 선택/FP16·affine 반올림에 identity STE,
+norm correction에는 미분 가능한 근사를 사용한다. Adam(lr 0.001) 뒤 매 step
+FP64 SVD/polar projection으로 직교성을 복원한다. 이는 진정한 Riemannian Adam이나
+전역 최적화를 주장하는 구현이 아니다. 최대 240 step, validation 간격 20,
+patience 4이며 평가에는 gradient 근사를 쓰지 않는다.
+
+CPU의 FP32 reduction 후 FP16 출력 반올림은 HTP 누적·융합과 bit-exact하지 않다.
+CPU FP16 참조와 실제 수집된 HTP 참조의 상대 L2 오차는 validation **0.8413%**,
+heldout **0.8416%**로 사전 2% 참조 검사 기준을 통과했다.
+
+### 25.2 CPU 품질과 학습의 음성 결과
+
+| 구성 | Validation Attention MSE | Heldout Attention MSE | Heldout 상대 L2 |
+|---|---:|---:|---:|
+| A: random seed 42 | 0.16839448 | 0.15896428 | 17.2682% |
+| B: 선택된 seed 48 | 0.14597851 | 0.14389551 | 16.4294% |
+| C: 학습 checkpoint 선택 결과 | 0.14597851 | 0.14389551 | 16.4294% |
+
+B는 A 대비 heldout MSE가 **9.48% 감소**했다. 그러나 학습 후 validation MSE는
+step 20/40/60/80에서 각각 0.15642765/0.15479669/0.15436155/0.15302483으로,
+모두 B보다 나빴다. 80 step에서 조기 종료했고 step 0이 선택됐다.
+따라서 **C의 최종 행렬은 B와 정확히 같다. 추가 학습의 이득은 관측하지 못했다.**
+C를 별도의 성공한 learned rotation으로 해석해서는 안 된다. 후속 탐색 범위나
+학습량을 확대하지 않았다. 이 Attention MSE 감소만으로 PPL 개선을 주장하지 않는다.
+
+B의 MSE가 줄어든 레이어는 28개 중 12개다. 전체 절대 MSE 감소는 주로
+25–27번 레이어에서 발생했고, 일부 다른 레이어는 악화됐다. 따라서 이 목적함수의
+개선을 모든 레이어의 균일한 개선이나 end-to-end 언어 모델 품질 개선으로
+동일시하지 않는다. 최종 PPL은 선택에 사용하지 않은 같은 네 문서에서 별도로 측정한다.
+
+A/B의 FP32 직교성 spectral error는 각각 7.26e-8/7.18e-8이다.
+실제 FP16 배포 상수에서는 6.02e-4/5.82e-4로, 완전한 직교성을 가정하지 않는다.
+실제 Q/K 표본의 양자화 없는 QK 비교에서 FP64 계산 최대 절대 오차는
+2.22e-6/1.64e-6, FP16 계산 상대 L2 차이는 0.1898%/0.1382%였다.
+행렬·설정 해시가 다른 cache를 혼용하는 것은 거부한다.
+그래프 배선/이름을 유지하기 위해 K 상수의 기호에는 기존 `s42`가 남지만,
+B/C의 실제 계수는 seed 48 행렬이며 내용 해시로 검증한다. artifact의 seed와
+matrix hash가 실제 회전을 식별한다. 현재 CPU 회귀 검사는 **545개 통과**했다.
+
+### 25.3 HTP probe와 기존 encoder 제한
+
+실제 heldout Q/K/V의 첫 레이어를 사용한 2 KV head × GQA 2 probe를
+AR1/AR128, current/past KV 포함 조건에서 HTP로 실행했다. probe는 codec 주변이
+FP16인 기능 검사이며, 전체 모델의 calibrated Attention 품질/성능 측정은 아니다.
+
+| 비교 (상대 L2) | A AR1 | A AR128 | B/C AR1 | B/C AR128 |
+|---|---:|---:|---:|---:|
+| FP32 그래프 oracle 대비 전체 probe | 3.0709% | 5.1086% | 1.4975% | 5.3013% |
+| 실제 HTP current codes/scale을 고정한 Attention oracle | 0.1155% | 0.1074% | 0.1385% | 0.1092% |
+
+첫 비교는 encoder의 hard 경계 인덱스 차이까지 포함하여 일부가 3% gate를
+**통과하지 못했다**. 이를 통과로 바꾸거나 tolerance를 높이지 않았다.
+원인을 분리하기 위해 이미 저장된 HTP current code/scale과 기존 past cache를
+CPU FP16 Attention oracle에 넣은 두 번째 검사를 추가했다. 이 검사는 같은 3%
+기준을 통과하지만 **encoder 또는 전체 FP32 oracle 일치 검사를 대신하지 않는다**.
+별도 encoder golden gate도 AR128 K effective scale에서 A/B/C 모두 실패했다.
+AR1 K/V 및 AR128 V는 통과했다. 기존 encoder 제한을 해결했다는 주장은 하지 않는다.
+
+probe는 `libQnnHtp.so`와 기존 Native Decode4 package로 실행했다. CPU는 offline
+비교에만 사용하고 추론 fallback은 추가하지 않았다. 최초 비교의 파일명 suffix
+오류와 실패한 원본 report도 보존했고, 원인 분리에는 기기 재실행이 필요하지 않았다.
+
+### 25.4 전체 모델 검증·실기기 성능
+
+전체 모델 A/B/C 빌드 및 그래프 감사는 통과했다. 각 구성의 6개 Attention
+그래프(3개 transformer part × prefill/decode)에서 ONNX MatMul 합은 10,530개,
+quantized DLC MatMul 합은 7,168개로 같았다. Dense MatMul 등의 lowering 때문에
+ONNX와 DLC의 개수가 서로 같아야 한다는 뜻은 아니다. K 상수 외 ONNX 내용,
+calibration 해시, DLC의 연산 연결·순서·파라미터·dtype·shape는 모두 같았다.
+QNN이 임의로 생성한 RMSNorm 연산 표시 이름의 숫자 ID만 비교에서 정규화했고,
+tensor 이름/연결은 생략하지 않았다. 수집 당시의 원본 가중치·calibration 해시도
+변하지 않았다.
+
+최종 HTP context의 I/O dtype·layout·KV 형식도 동일했다. 다만
+`qnn-context-binary-utility`는 내부 최종 스케줄/물리 layout을 노출하지 않으므로,
+**DLC 이후 내부 스케줄까지 동일함을 증명한 것은 아니다**. 이 범위를 감사
+report에 함께 기록했다.
+
+실기기 조건은 S26 Ultra / SM8850, QAIRT 2.48.0.260626, CL1024 고정,
+AR128 prefill / AR1 decode이다. 35+128 및 897+128 token 조건마다
+`ABC → BCA → CAB`의 세 교차 순서로 각 구성 3회 측정한다. 모델 로딩을 TTFT에서
+제외하고 capture/optrace/profiling을 끈다. 세 표본의 중앙값과 min/max를 모두
+보존하며, 온도·배터리 snapshot도 남긴다. 별도의 온도 통제나 통계적 동등성
+검정을 수행한 것은 아니다. PPL은 미사용 test 문서 4개에서 각 1회, 총 4092
+scored tokens의 NLL 합으로 계산하며 window별 PPL의 산술평균을 쓰지 않는다.
+생성 128개 중 첫 토큰은 prefill에서 얻고 decode는 127 step이다.
+따라서 긴 입력의 종료 cache는 897 + 127 = 1024 tokens다.
+
+비계측 성능 18회는 완료했다. 표는 **중앙값 [min, max]**이며 C는 B로 복귀한
+동일 행렬이다. 원본 세 표본도 `reports/comparison.json`에 보존한다.
+
+긴 입력: **897 prompt + 128 generated tokens**, 종료 cache 1024 tokens.
+
+| 지표 | A: seed 42 | B: 선택 seed 48 | C: B로 복귀 |
+|---|---:|---:|---:|
+| TTFT (ms) | 560.217 [559.081, 560.620] | 554.752 [550.116, 560.893] | 560.591 [559.218, 564.616] |
+| prefill (tok/s) | 1604.049 [1602.786, 1607.262] | 1619.579 [1602.031, 1633.612] | 1602.871 [1590.866, 1606.843] |
+| decode (tok/s) | 37.598 [37.582, 37.716] | 37.628 [37.618, 37.652] | 37.706 [37.626, 37.760] |
+| host KV (MiB) | 28.875 | 28.875 | 28.875 |
+| I/O buffer (MiB) | 96.929 | 96.929 | 96.929 |
+| 종료 VmRSS (MiB) | 150.309 [150.215, 150.355] | 150.285 [150.203, 150.340] | 150.309 [150.246, 150.590] |
+| process VmHWM (MiB) | 604.938 [604.770, 604.961] | 604.898 [604.680, 604.984] | 605.055 [605.008, 605.098] |
+
+짧은 입력: **35 prompt + 128 generated tokens**, CL1024 고정.
+
+| 지표 | A | B | C |
+|---|---:|---:|---:|
+| TTFT (ms) | 65.632 [64.812, 66.248] | 66.751 [64.855, 67.372] | 63.962 [62.813, 66.072] |
+| prefill (tok/s) | 536.491 [532.205, 542.851] | 528.135 [523.416, 541.981] | 549.830 [533.618, 560.284] |
+| decode (tok/s) | 38.579 [38.566, 39.214] | 38.563 [38.507, 39.287] | 38.569 [38.547, 38.686] |
+| 종료 VmRSS (MiB) | 150.094 [137.762, 150.395] | 150.172 [150.039, 150.285] | 150.137 [149.867, 150.352] |
+| process VmHWM (MiB) | 604.934 [604.664, 605.023] | 604.730 [604.688, 604.813] | 604.934 [604.746, 605.000] |
+
+짧은 입력의 host KV/I/O buffer도 위와 같다. VmRSS/VmHWM은 runner 프로세스의
+지표이지 기기/NPU 전체 메모리 사용량이 아니다. 종료 RSS의 개별 표본 차이를
+KV 압축률 차이로 해석하지 않는다. 긴 입력 decode 중앙값의 B/A 차이는 약
+**+0.08%**, C/A는 **+0.29%**로, 속도 우세를 주장할 근거로 삼지 않는다.
+동일 행렬인 B/C 사이에도 시간 차이가 있어 이를 학습 효과로 해석할 수 없다.
+KV 저장량은 세 구성 모두 정확히 **30,277,632 bytes**다.
+
+성능 실행 전후 snapshot에서 배터리 온도는 **26.7–29.7°C**, thermal status는
+모두 0이었다. 이는 클록/온도가 완전히 통제됐거나 throttling이 전혀 없었음을
+증명하는 계측은 아니다.
+
+PPL도 세 구성 모두 완료했다. **이번 문서/offset은 과거 성능표의 네 window와
+다르므로, 과거 PPL 수치와 직접 비교하지 않는다.**
+
+| 평가 문서 | A PPL | B PPL | C PPL |
+|---|---:|---:|---:|
+| Christopher Gore | 49.203175 | 36.240163 | 36.240163 |
+| Kirby's Block Ball | 36.065251 | 38.914408 | 38.914408 |
+| Dvorak technique | 26.861372 | 25.046458 | 25.046458 |
+| Du Fu | 37.067404 | 36.422089 | 36.422089 |
+| 전체 NLL 기반 PPL (4092 tokens) | **36.458652** | **33.678515** | **33.678515** |
+
+B는 A보다 전체 PPL이 **7.63% 감소**했지만 4개 문서 중 하나는 악화됐고,
+Christopher Gore의 개선이 크다. 따라서 모델/데이터 전반에 대한 일관된 개선이나
+통계적 유의성을 주장하지 않는다. B/C의 window별 PPL은 저장된 정밀도에서 같다.
+
+**핵심 판정: C가 B보다 좋아지는 조건은 충족하지 못했다.** 현재 공유 회전·STE·
+학습률·조기 종료 조건에서 학습의 추가 이득은 없었다. 이번에 관측한 이득은
+validation으로 선택한 random rotation B의 효과이며, 성공한 learned rotation의
+기여로 제시해서는 안 된다. 다른 학습법의 가능성 전체를 부정하는 결과도 아니다.
+이 실험에서는 후속 탐색 범위를 확대하지 않고 A/B/C와 음성 학습 결과를 보존했다.
+**기본 profile과 seed 42는 변경하지 않았다.**
+
+### 25.5 재현과 산출물
+
+루트: `/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_quality_20261006/`.
+재현 명령은 `scripts/llm/turboquant/README.md`의 K-only Dense rotation 절에 있다.
+
+- `protocol.json`, `data_manifest.json`, `capture_identity.json`: 사전 조건·데이터·원본 해시.
+- `capture_bundle/`, `captures/`, `samples/`: W4A16 참조 바이너리와 실제 Q/K/V/O.
+- `selection.json`, `training.json`, `cpu_quality.json`: 후보·학습·heldout 결과.
+- `rotations/{A,B,C}.json`, `rotation_validation.json`: 행렬·직교성·QK·설정 해시.
+- `probes/{A,B,C}/validation_isolated.json`: 전체/분리 Attention 오차 및 encoder gate.
+- `A/`, `B/`, `C/`, `runner/`, `reports/`: 실기기 바이너리·로그·비교 결과.
+- `reports/graph_audit.json`, `reports/experiment.json`: 원본/그래프/바이너리/기기/입력 검증 해시.
+- `reports/{A,B,C}_reset.json`: 두 session reset 검사 원본(모두 통과).
+- `reports/{A,B,C}_{short,long}_r{0,1,2}.json`: 비계측 성능 18회 원본.
+- `reports/{A,B,C}_test_w{0,1,2,3}.json`: PPL 12회 원본(문서당 단회).
+- `reports/comparison.json`: 전체 표본·중앙값/min/max·NLL 기반 PPL·C rollback 여부.
+
+## 26. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

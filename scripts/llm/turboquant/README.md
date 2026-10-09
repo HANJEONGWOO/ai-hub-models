@@ -52,6 +52,88 @@ This change is covered by CPU graph/oracle, boundary/FP16-domain, packing,
 QJL/Native and metadata regression tests. No model rebuild or device performance
 measurement is performed as part of this code-only switch.
 
+## K-only Dense rotation quality experiment (opt-in)
+
+`--key-rotation-file <artifact.json>` replaces **only** the shared K rotation
+constant in `k4_v4_scaled`. The matching Query rotation uses the same constant.
+It retains LM-tree / LM centroids / Native LUT, Dense MatMul geometry, K4/V4,
+QJL-off, quantized current KV, norm correction and one FP16 effective scale.
+V rotation (seed 542), V codebook, AV, weights, and calibration are unchanged.
+No Structured codebook or Bit-plane operator is involved. Omit the new flag to
+retain the existing default and its unchanged configuration hash.
+
+The experiment uses Qwen3-1.7B CL1024 and one 128x128 K matrix shared across all
+layers and KV heads. A is seed 42, B is selected from seeds 42..49 by validation
+Attention MSE, and C is initialized from B and trained offline. FP32 orthogonality
+is validated; the existing deployment rounds the matrix to FP16. Artifact and
+matrix hashes are recorded; cache configuration hashes prevent mixed rotations.
+
+Data collection uses **the same W4A16 HTP model with the FP16-KV attention path**,
+not a Hugging Face FP-weight proxy. Collection-only graphs expose Q and Attention
+outputs alongside existing current K/V outputs. Those instrumented runs are
+explicitly excluded from performance results. Four training, two validation,
+and four heldout 1024-token windows come from distinct WikiText articles and
+official train/validation/test splits, frozen before rotation selection.
+
+Offline training uses hard LM bins in every forward and identity STE gradients
+for discrete selection / FP16 and affine rounding. Adam (lr 0.001) is followed
+by an FP64 polar/SVD orthogonal retraction each step, for at most 240 steps,
+validation every 20, patience four. B itself is an eligible step-zero C checkpoint.
+The CPU model emulates encoder affine-pair centroid arithmetic for norm correction,
+Native FP16 LUT products, global masked softmax and tiled AV. CPU operation-output
+rounding does not claim bit-exact HTP reductions or fused quantization; an FP16
+reference-fidelity check and subsequent actual HTP probe are separate gates.
+No Gaussian samples are used to select or learn the rotation.
+
+Reproduction (fresh output root required; existing attempts/results are preserved):
+
+```bash
+export PYTHONPATH=src
+export OPENBLAS_NUM_THREADS=1
+TQ_ROT=/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_quality_new
+TQ_SPLIT=/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_w4a16_split
+mkdir -p "$TQ_ROT/reports"
+venv/bin/python scripts/llm/turboquant/learn_key_rotation.py freeze --root "$TQ_ROT"
+venv/bin/python scripts/llm/turboquant/rotation_data.py prepare --root "$TQ_ROT"
+venv/bin/python scripts/llm/turboquant/convert_parts.py \
+  --split-dir "$TQ_SPLIT" --out "$TQ_ROT/capture_bundle" \
+  --profile baseline_fp16_kv_fp16_attn --context-length 1024 --capture-attention
+bash scripts/llm/turboquant/qnn_runner/build_android.sh "$TQ_ROT/runner"
+venv/bin/python scripts/llm/turboquant/rotation_data.py capture --root "$TQ_ROT"
+venv/bin/python scripts/llm/turboquant/rotation_data.py pack --root "$TQ_ROT"
+venv/bin/python scripts/llm/turboquant/learn_key_rotation.py train --root "$TQ_ROT"
+venv/bin/python scripts/llm/turboquant/learn_key_rotation.py heldout --root "$TQ_ROT"
+for group in A B C; do
+  venv/bin/python scripts/llm/turboquant/rotation_probe.py all --root "$TQ_ROT" --group "$group" || break
+  venv/bin/python scripts/llm/turboquant/benchmark_key_rotation.py build --root "$TQ_ROT" --group "$group" || break
+done
+for stage in audit push functional performance quality summarize; do
+  venv/bin/python scripts/llm/turboquant/benchmark_key_rotation.py "$stage" --root "$TQ_ROT" || break
+done
+```
+
+Performance uses three predeclared crossed orders (`ABC`, `BCA`, `CAB`) for both
+35+128 and 897+128 token conditions, without profiling or capture outputs. All
+samples and median/min/max are retained; quality uses four heldout windows once
+each, with aggregate PPL computed from total NLL. Three repeats are descriptive,
+not proof of statistical equivalence. Existing encoder numerical-gate failures
+are reported separately and their tolerance is not relaxed. The primary question
+is whether C improves heldout quality over B at unchanged runtime and KV storage;
+negative outcomes do not trigger a larger training/search campaign.
+
+The HTP probe reports both the unconditioned FP32 graph-oracle error and an
+isolated FP16 Attention error using HTP's actual current codes/scales. The latter
+does not waive encoder or full-graph failures; both are retained in
+`probes/<group>/validation_isolated.json`. See design §25 for the experiment and
+its limitations, including a step-zero C rollback when training does not beat B.
+
+In the 2026-10-06 run, B selected seed 48: heldout CPU Attention MSE fell 9.48%
+and device PPL fell from 36.458652 to 33.678515 on four new heldout documents.
+Training stopped at step 80 without beating B, so C selected step zero and is
+identical to B. This is a random-selection result, **not a learned-rotation gain**.
+Long-input decode medians were A/B/C 37.598/37.628/37.706 tok/s, with 28.875 MiB
+KV in every run. Defaults remain unchanged; older PPL tables use different windows.
+
 ## FP16 KV + FP16-input attention control (opt-in)
 
 `baseline_fp16_kv_fp16_attn` is a separate, uncompressed control. It does **not**

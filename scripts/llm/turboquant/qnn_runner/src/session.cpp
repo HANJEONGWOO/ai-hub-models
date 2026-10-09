@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <regex>
 #include <stdexcept>
@@ -357,6 +358,36 @@ StepRecord LlmSession::step(const std::vector<int32_t>& tokens, int ar, bool pro
   record.commitSeconds = since(commitStart);
   record.totalSeconds = since(stepStart);
   return record;
+}
+
+void LlmSession::captureAttention(const std::string& directory, const std::string& tag) const {
+  if (!lastAr_) fail("capture before execution");
+  const GraphSet& set = *sets_.at({lastAr_, lastContext_});
+  std::string metadata = "{\"ar\":" + std::to_string(lastAr_) + ",\"new_tokens\":" + std::to_string(lastNew_) + ",\"cached_after\":" + std::to_string(cached_) + ",\"tensors\":{";
+  size_t count = 0;
+  for (const auto& [name, owned] : set.buffers) {
+    if (name.rfind("capture_attn_", 0) != 0 && !std::regex_match(name, kKvOut)) continue;
+    const Buffer& buffer = *owned;
+    const TensorMeta& meta = *buffer.meta;
+    const size_t elements = buffer.data.size() / meta.elementBytes();
+    std::vector<float> values(elements);
+    for (size_t i = 0; i < elements; ++i) values[i] = decodeScalar(meta, buffer.data.data() + i * meta.elementBytes());
+    const std::string file = tag + "_" + name + ".f32";
+    FILE* stream = std::fopen((directory + "/" + file).c_str(), "wbx");
+    if (!stream) fail("cannot exclusively create capture " + file);
+    const size_t written = std::fwrite(values.data(), sizeof(float), values.size(), stream);
+    std::fclose(stream);
+    if (written != values.size()) fail("short capture write");
+    metadata += (count++ ? "," : "") + std::string("\"") + name + "\":{\"file\":\"" + file + "\",\"shape\":[";
+    for (size_t i = 0; i < meta.dims.size(); ++i) metadata += (i ? "," : "") + std::to_string(meta.dims[i]);
+    metadata += "]}";
+  }
+  if (!count) fail("capture graph has no tensors");
+  metadata += "}}\n";
+  FILE* stream = std::fopen((directory + "/" + tag + ".json").c_str(), "wx");
+  if (!stream) fail("cannot create capture manifest");
+  std::fwrite(metadata.data(), 1, metadata.size(), stream);
+  std::fclose(stream);
 }
 
 size_t LlmSession::vocabSize() const {
