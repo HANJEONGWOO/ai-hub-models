@@ -578,7 +578,7 @@ def apply_kv_profile(
         if match is None:
             continue
         kind, layer = match.group(1), int(match.group(2))
-        spec = config.key if kind == "key" else config.value
+        spec = config.codec_for_layer(kind, layer)
         if not spec.modifies_graph:
             continue
         dims = _dims(value)

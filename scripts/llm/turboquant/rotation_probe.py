@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -66,7 +67,10 @@ def build(args: argparse.Namespace, config: TurboQuantConfig) -> None:
     work.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(4)
     fixture.CONTEXT = 1024
-    data = np.load(args.root / "samples/test_0_layer00.npz")
+    sample_file = (
+        getattr(args, "sample_file", None) or args.root / "samples/test_0_layer00.npz"
+    )
+    data = np.load(sample_file)
     env = qairt_env(args.sdk, args.qnn_python)
     args.native_decoder_package = args.package
     for seq in args.tokens:
@@ -255,7 +259,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("build", "run", "compare", "all"))
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--group", choices=list("ABC"), required=True)
+    parser.add_argument("--group", choices=list("ABCPD"), required=True)
+    parser.add_argument("--sample-file", type=Path)
+    parser.add_argument("--matrix-layer", type=int)
     parser.add_argument(
         "--package",
         type=Path,
@@ -265,11 +271,14 @@ def main() -> None:
     )
     args = parser.parse_args()
     args.work_dir = args.root / "probes" / args.group
+    if args.matrix_layer is not None:
+        args.work_dir /= f"layer{args.matrix_layer:02d}"
     args.device_dir = (
         "/data/local/tmp/qaihm_turboquant/"
         + experiment_name(args.root)
         + "_probe_"
         + args.group
+        + (f"_l{args.matrix_layer}" if args.matrix_layer is not None else "")
     )
     args.sdk, args.qnn_python, args.adb, args.ndk = (
         DEFAULT_SDK,
@@ -282,6 +291,14 @@ def main() -> None:
         get_profile("k4_v4_scaled"),
         None if args.group == "A" else args.root / f"rotations/{args.group}.json",
     )
+    if config.key_layers:
+        if args.matrix_layer is None:
+            parser.error(
+                "Layer policy requires --matrix-layer for the single-layer probe"
+            )
+        config = replace(
+            config, key=config.key_for_layer(args.matrix_layer), key_layers=()
+        )
     if args.stage in ("build", "all"):
         build(args, config)
     if args.stage in ("run", "all"):

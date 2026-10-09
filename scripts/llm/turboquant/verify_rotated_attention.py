@@ -57,8 +57,20 @@ def verify_rotations(graph: onnx.GraphProto, config: dict[str, Any]) -> list[str
     expected = set()
     rotation = Rotation(config["rotation"])
     d = config["block_size"]
-    for kind in ("key", "value"):
-        spec = config[kind]
+    graph_layers = sorted(
+        {
+            int(m.group(1))
+            for out in graph.output
+            if (m := re.fullmatch(r"tq_key_(\d+)_packed_out", out.name))
+        }
+    )
+    specs = (
+        [("key", config["key_layers"][layer]) for layer in graph_layers]
+        if config.get("key_layers")
+        else [("key", config["key"])]
+    )
+    specs.append(("value", config["value"]))
+    for kind, spec in specs:
         if spec.get("dense_matrix_f32_sha256"):
             name = f"tq_rotation_t_{rotation.value}_s{spec['seed']}_d{d}"
             if kind != "key" or name not in actual:
@@ -88,6 +100,28 @@ def verify_rotations(graph: onnx.GraphProto, config: dict[str, Any]) -> list[str
                 errors.append(f"Incorrect/missing rotation constant: {name}")
     if set(actual) != expected:
         errors.append("Unexpected rotation constants in source graph.")
+    if config.get("key_layers"):
+        for layer in graph_layers:
+            spec = config["key_layers"][layer]
+            expected_name = f"tq_rotation_t_{rotation.value}_s{spec['seed']}_d{d}"
+            encoder = [
+                n for n in graph.node if n.output[0] == f"tq_key_{layer}_enc_rotated"
+            ]
+            queries = [
+                n
+                for n in graph.node
+                if n.op_type == "MatMul"
+                and n.output[0].startswith(f"tq_attn_{layer}_")
+                and n.input[1].startswith("tq_rotation_t_")
+            ]
+            if (
+                len(encoder) != 1
+                or not queries
+                or any(n.input[1] != expected_name for n in encoder + queries)
+            ):
+                errors.append(
+                    f"K and Query do not use the same assigned rotation: layer {layer}"
+                )
     return errors
 
 
@@ -343,7 +377,17 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                 current.key, dense_matrix=tuple(float(x) for x in values.ravel())
             ),
         )
-    if current.config_hash() != conversion["config_hash"]:
+    current_hash = current.config_hash()
+    if config.get("key_layers"):
+        expected_config = current.to_dict()
+        expected_config["key_layers"] = config["key_layers"]
+        expected_config["key_rotation_sharing"] = "per_layer_all_kv_heads"
+        if expected_config != config:
+            errors.append("Non-K configuration changed in layer rotation bundle")
+        current_hash = hashlib.sha256(
+            json.dumps(expected_config, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    if current_hash != conversion["config_hash"]:
         errors.append("Bundle rotation/config hash does not match current constants.")
     errors.extend(verify_rotations(graph, config))
     if config.get("qjl"):

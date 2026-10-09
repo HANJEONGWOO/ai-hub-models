@@ -176,7 +176,7 @@ def _restore_tile(
     sg.extend(
         decode_subgraph(
             config,
-            getattr(config, io.kind),
+            config.codec_for_layer(io.kind, io.layer),
             packed,
             norm,
             restored,
@@ -288,7 +288,12 @@ def tile_kv_attention(
                     dest = prefix + kind + "_rotated"
                     sg.node(
                         "MatMul",
-                        [src, _rotation_name(sg, config, getattr(config, kind), True)],
+                        [
+                            src,
+                            _rotation_name(
+                                sg, config, config.codec_for_layer(kind, layer), True
+                            ),
+                        ],
                         [dest],
                     )
                     if kind == "key":
@@ -307,7 +312,12 @@ def tile_kv_attention(
                         )
                     keys.node(
                         "MatMul",
-                        [query, _rotation_name(keys, config, config.key, True)],
+                        [
+                            query,
+                            _rotation_name(
+                                keys, config, config.key_for_layer(layer), True
+                            ),
+                        ],
                         [dest],
                     )
                     queries[qk.output[0]] = dest

@@ -134,6 +134,75 @@ identical to B. This is a random-selection result, **not a learned-rotation gain
 Long-input decode medians were A/B/C 37.598/37.628/37.706 tok/s, with 28.875 MiB
 KV in every run. Defaults remain unchanged; older PPL tables use different windows.
 
+## Per-layer K selection and shared-update diagnosis (opt-in)
+
+`--key-rotation-file` also accepts `qaihm-k-layer-dense-rotation-v1` artifacts.
+Each layer shares one fixed K matrix across its KV heads; its Query uses the same
+matrix. Matrices with the same seed are shared as constants within a graph.
+The policy's layer order and matrix hashes are included in the cache/config hash.
+Missing layers, tampered matrices and mixed cache policies are rejected. The V
+path and default shared seed42 profile are unchanged. This is not Structured
+codebook or Bit-plane attention.
+
+The followup freezes its protocol/data before any new losses. P selects each
+layer's minimum **original validation absolute MSE** among seeds42..49, without
+changing the criterion. Four additional validation documents gate promotion;
+four new heldout test documents are reserved for whole-model PPL. A/B binaries
+are hash-checked and reused, with new writable wrapper directories for runtime
+metadata. No original experiment result is overwritten.
+
+Independently, shared B is diagnosed using fixed original train/validation subsets
+(windows0,1; layers0,4,8,12,16,20,24,27; eight fixed query positions; all heads).
+Three independent one-step Adam+STE+SVD updates use lr1e-3/1e-4/1e-5. Only if train
+hard loss improves is one predeclared-best learning rate continued to 20 total
+steps; B remains step zero. Learned D and layer-selected P are never combined.
+D must improve both fixed subsets, full original validation and new validation
+before HTP/full-model evaluation; otherwise it is retained as a negative diagnosis.
+
+Fresh-root reproduction (requires the original experiment, cached WikiText data,
+local SDK/device and `matplotlib` for the scientific heatmap):
+
+```bash
+export PYTHONPATH=src
+export OPENBLAS_NUM_THREADS=1
+TQ_FOLLOW=/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_followup_new
+TQ_ORIGINAL=/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_quality_20261006
+venv/bin/python scripts/llm/turboquant/rotation_followup.py freeze \
+  --root "$TQ_FOLLOW" --source "$TQ_ORIGINAL"
+venv/bin/python scripts/llm/turboquant/rotation_followup.py analyze --root "$TQ_FOLLOW"
+venv/bin/python scripts/llm/turboquant/rotation_followup.py diagnose --root "$TQ_FOLLOW"
+venv/bin/python scripts/llm/turboquant/rotation_data.py capture --root "$TQ_FOLLOW" --splits validation
+venv/bin/python scripts/llm/turboquant/rotation_data.py pack --root "$TQ_FOLLOW" --splits validation
+venv/bin/python scripts/llm/turboquant/rotation_followup.py validate --root "$TQ_FOLLOW"
+venv/bin/python scripts/llm/turboquant/rotation_followup.py invariants --root "$TQ_FOLLOW"
+venv/bin/python scripts/llm/turboquant/benchmark_rotation_followup.py probes --root "$TQ_FOLLOW"
+# Build only a candidate listed in cpu_quality.json / accepted_groups.
+venv/bin/python scripts/llm/turboquant/benchmark_rotation_followup.py build --root "$TQ_FOLLOW" --group P
+for stage in audit push functional performance quality summarize; do
+  venv/bin/python scripts/llm/turboquant/benchmark_rotation_followup.py "$stage" --root "$TQ_FOLLOW" || break
+done
+```
+
+If D independently passes its gates, build it with `--group D` before `audit`;
+the frozen four-group crossed order is then used. Otherwise the orders are
+`ABP`, `BPA`, `PAB`, three repeats each for 35+128 and 897+128 tokens, CL1024.
+Old encoder numerical failures and unconditioned FP32-oracle Attention errors
+remain explicit; conditioned Attention checks do not waive them.
+
+Outputs include `layer_selection.json`, `reports/layer_seed_table.csv`, PNG/SVG
+heatmaps, `diagnostics/` per-step logs/matrices, `diagnostics.json`,
+`cpu_quality.json`, `rotations/P.json`, and the actual device reports. Detailed
+followup results and limitations are recorded in design §26.
+
+The 2026-10-09 run is a **negative whole-model result**: P improved new-validation
+Attention MSE by 2.11% versus B but worsened heldout PPL by 4.17%
+(A/B/P 25.051740 / 25.553117 / 26.618682 on four new documents). Shared D's selected
+step16 improved its fixed subset but worsened full original/new validation, so
+it was not built or device-tested. Long decode medians were 37.661 / 37.684 /
+37.722 tok/s, all with 28.875 MiB KV and 96.929 MiB I/O. P added 524 KiB of actual
+context binaries. Neither candidate was promoted; default A and all old results
+remain unchanged. See `k_rotation_followup_20261009/reports/comparison.json`.
+
 ## FP16 KV + FP16-input attention control (opt-in)
 
 `baseline_fp16_kv_fp16_attn` is a separate, uncompressed control. It does **not**

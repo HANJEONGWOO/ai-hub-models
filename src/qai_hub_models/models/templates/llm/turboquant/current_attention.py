@@ -152,7 +152,7 @@ def quantize_current_attention(
             sg.extend(
                 decode_subgraph(
                     config,
-                    getattr(config, kind),
+                    config.codec_for_layer(kind, io.layer),
                     io.packed_out,
                     scale,
                     restored,

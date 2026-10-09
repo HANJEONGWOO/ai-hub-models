@@ -169,7 +169,7 @@ class TurboQuantKVCache:
         self.layers = [
             (
                 PackedKVStore(
-                    config.key,
+                    config.key_for_layer(layer),
                     config,
                     num_kv_heads,
                     head_dim,
@@ -185,7 +185,7 @@ class TurboQuantKVCache:
                     batch_size,
                 ),
             )
-            for _ in range(num_layers)
+            for layer in range(num_layers)
         ]
         self._length = 0
 

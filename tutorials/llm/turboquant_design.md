@@ -2531,6 +2531,295 @@ validation으로 선택한 random rotation B의 효과이며, 성공한 learned 
 - `reports/{A,B,C}_test_w{0,1,2,3}.json`: PPL 12회 원본(문서당 단회).
 - `reports/comparison.json`: 전체 표본·중앙값/min/max·NLL 기반 PPL·C rollback 여부.
 
-## 26. 출처
+## 26. K Dense 후속 실험: 레이어별 선택과 공유 학습 진단 (2026-10-09)
+
+### 26.1 보존·사전 고정·데이터
+
+`exp/k-dense-rotation-quality`의 커밋 `08dab2d3d`에서 깨끗한 상태를 확인하고
+`exp/k-dense-layer-selection-diagnostics`를 생성했다. §25의 기존 결과는
+수정하지 않았다. A=공유 seed42, B=공유 seed48이며 기존 C=B는 성공한 학습
+비교군이 아니다. 아래 D는 **B에서 독립적으로 시작한 새로운 진단 후보**다.
+
+원본 `selection.json`의 SHA256:
+`e27cc8de47f3684e410af0cbe7319b7c015f57750b4c596b6c4a1346c9388b73`.
+원본 파일·행렬·A/B 바이너리 해시는 `source_identity.json`에 고정했다.
+후속 protocol SHA256:
+`edc73ebe08ca6cd346ab19967af68fee82198ee253570de1fd57da69bf4f047d`.
+
+LM exact tree/codebook, Dense MatMul, K4/V4, QJL-off, 압축된 current KV,
+norm correction/FP16 effective scale, V seed542, W4A16 가중치와 calibration은
+유지했다. **기본 profile은 여전히 공유 seed42**다. P와 D는 결합하지 않는다.
+
+추가 범위는 실행 전에 고정했다. WikiText revision은 §25와 같으며, 원본
+실험의 10개 문서 제목을 제외한 문서에서 seed20261009로 1024-token window를
+선택했다. 문서/offset/token 해시는 `data_manifest.json`에 기록했다.
+
+| 용도 | 문서 |
+|---|---|
+| 추가 validation 4개 | Slammiversary (2008), Sorry (Madonna song), Meridian, Mississippi, Fort Scott National Historic Site |
+| 최종 heldout test 4개 | Head VI, Brad Stevens, Chad at the 2008 Summer Olympics, Typhoon Krosa (2013) |
+
+추가 validation의 Q/K/V/O는 기존 **동일 W4A16 FP16-KV HTP 캡처 바이너리**로
+수집했다. 새로운 참조 모델 학습·calibration·전체 모델 재빌드부터 시작하지
+않았다. test 문서는 후보 선택/gradient/조기 종료에 사용하지 않는다. 과거
+기본 PPL window와도 64-token 연속 중복이 없음을 별도로 확인했다.
+
+### 26.2 P: 레이어별 seed 선택
+
+원본 `selection.json`의 28×8 `layer_mse`를 그대로 재사용하여 각 레이어의
+**절대 Attention MSE** 최소 seed를 선택했다. 상대오차는 함께 보고하지만
+선택 기준으로 바꾸지 않았다. 같은 레이어의 8개 KV head는 같은 K 행렬을
+사용하고, 대응 Query도 그 행렬로 회전한다.
+
+0-based layer0..27의 선택 결과:
+
+```text
+42 42 42 48 47 42 49 46 44 44 46 46 49 43
+48 49 45 42 49 45 46 48 47 48 42 48 49 49
+```
+
+`reports/layer_seed_table.csv`에는 28×8 절대 MSE와 상대 L2, A/B 대비 P의
+증감률, `(baseline_layer_MSE - P_layer_MSE)/28` 기여도와 전체 감소분 중
+비중이 있다. `reports/layer_seed_heatmap.{png,svg}`는 같은 데이터의
+log10 절대 MSE와 B 대비 상대 MSE 변화다. 검은 사각형은 선택된 seed다.
+
+| CPU 고정 캡처 Attention MSE | A | B | P | P/B 변화 |
+|---|---:|---:|---:|---:|
+| 원본 선택 validation (2문서) | 0.168394484 | 0.145978511 | 0.136319352 | −6.6168% |
+| 추가 validation (4문서) | 0.167874188 | 0.152565078 | 0.149340947 | **−2.1133%** |
+| 추가 validation 상대 L2 | 0.180432920 | 0.172009084 | 0.170181860 | — |
+
+추가 validation에서 P는 A 대비 11.04% 감소했다. B 대비 **18개 레이어 개선,
+5개 악화, 5개 동일**이며 악화 레이어는 0,13,19,24,27이다. 특히 선택
+validation에서 가장 큰 P/B 이득을 제공한 layer27이 추가 문서에서는 가장
+큰 악화 기여를 보였다. 새 문서의 주요 개선 기여는 layer26,20,22다.
+따라서 모든 레이어에 일관된 우세나 데이터 전반의 최적 seed를 주장하지 않는다.
+새 문서의 동일한 레이어별 상대오차·개선/악화·기여도 표는
+`reports/extra_validation_layers.csv`에 있다. 레이어별 최소 MSE의 합은
+**고정 FP16-KV 참조 캡처의 국소 Attention 오차**이며,
+이후 레이어 입력까지 달라지는 전체 모델 PPL의 개선을 의미하지 않는다.
+
+P policy SHA256:
+`0be77a66d419d3fe8340e6269ed22ce1489608c525cc710323531b80985be7f6`.
+P configuration SHA256:
+`d1880b99ec2225ab0c46d68374a5e3c83b5ca2c50bc6615fdb9bb4264d897e9e`.
+행렬별 FP32 hash는 `rotations/P.json`과 `rotation_validation.json`에 있다.
+기존 A/B QR 행렬이 현재 생성기에서도 원본 hash와 일치함을 확인했다.
+
+### 26.3 공유 B의 업데이트 진단 — D는 승격하지 않음
+
+기존 train/validation 각각 window0,1과 layer0,4,8,12,16,20,24,27을 고정했다.
+Query 위치는 31,159,287,415,543,671,799,927이며 모든 head를 사용했다.
+각 학습률은 독립적인 B 행렬과 새 Adam 상태에서 시작한다. 기존 hard LM
+forward, identity STE, FP16/affine rounding, norm correction, Adam 기본값과
+매 step FP64 SVD/polar 직교 투영은 바꾸지 않았다.
+
+| 고정 subset hard MSE | B step0 | lr1e-3 step1 | lr1e-4 step1 | lr1e-5 step1 |
+|---|---:|---:|---:|---:|
+| train | 0.185214235 | 0.164102191 | 0.178179901 | 0.185570062 |
+| validation | 0.208128987 | 0.205812287 | 0.203820874 | 0.209789715 |
+| train 변화 | — | −11.3987% | −3.7979% | +0.1921% |
+| validation 변화 | — | −1.1131% | −2.0699% | +0.7979% |
+
+| step1 진단 | lr1e-3 | lr1e-4 | lr1e-5 |
+|---|---:|---:|---:|
+| Gradient L2 norm | 4.749501 | 4.749501 | 4.749501 |
+| 투영 전 update Frobenius norm | 0.12799998 | 0.01280009 | 0.00127989 |
+| 투영 후 update Frobenius norm | 0.05958603 | 0.00596688 | 0.00059673 |
+| 투영 자체의 보정 norm | 0.11326154 | 0.01132396 | 0.00113226 |
+| FP16 행렬 update norm | 0.05968629 | 0.00685745 | 0.00184179 |
+| FP16 행렬 원소 변경률 | 96.1304% | 67.1204% | 18.0664% |
+| train K index 변경률 | 1.72199% | 0.19318% | 0.04351% |
+| validation K index 변경률 | 1.73516% | 0.19466% | 0.04371% |
+| 투영 후 FP32 직교성 spectral error | 6.98e−8 | 7.28e−8 | 6.90e−8 |
+| FP16 직교성 spectral error | 5.89e−4 | 5.91e−4 | 5.82e−4 |
+
+Index 변경률은 같은 고정 window/layer의 **전체 1024-token K 좌표**를 분모로
+계산했다. FP16 변화량은 FP16 값을 FP32로 읽어 측정했으며 실제 반올림을
+포함한다. 작은 update에서 FP16 norm이 FP32 norm보다 큰 것은 반올림 경계를
+넘은 원소의 이산 변화 때문이며, 그 자체를 업데이트 증폭의 품질 이득으로
+해석하지 않는다. 투영 전/후 직교성·전체 sample별 loss·index 비율은 각
+`diagnostics/lr*_step*.json`에 저장했다.
+
+Train loss가 감소한 두 학습률 중 validation loss가 더 작은 **1e-4**를
+사전 규칙대로 선택하여 같은 optimizer와 같은 표본으로 총 20 step만
+진행했다. 매 step hard loss를 평가했고 B(step0)를 후보로 유지했다.
+선택된 step16은 train **0.182029820**, validation **0.192594093**이었다.
+하지만 다음 일반화 검증에서는 실패했다.
+
+| 전체 validation Attention MSE | B | D(step16) | D/B 변화 |
+|---|---:|---:|---:|
+| 원본 2문서 × 모든 28개 레이어 | 0.145978511 | 0.147540843 | **+1.0702%** |
+| 추가 4문서 × 모든 28개 레이어 | 0.152565078 | 0.155857939 | **+2.1583%** |
+
+**판정: 업데이트는 실제로 적용되지만 고정 subset의 개선이 일반화되지 않았다.**
+Gradient는 0이 아니고 FP16 행렬과 hard index가 바뀌며 큰 두 학습률은
+train hard loss를 낮췄다. 단순히 “FP16 반올림으로 학습이 사라짐”이나
+“직교 투영이 모든 업데이트를 제거함”으로 설명할 수 없다. 반면 고정
+train loss의 layer27 비중은 **61.16%**, layer20/24/27 합은 **97.27%**다.
+고정 validation에서도 각각 57.46%, 97.20%다. 이는 절대 MSE의 후기
+레이어 편중과 제한된 표본의 일반화 문제를 점검할 근거이며, gradient
+기여도를 직접 분해한 결과는 아니다. STE가 최적이라고 증명하지도 않는다.
+
+D를 HTP/전체 모델 평가로 넘기지 않고 **B를 유지**했다. 학습률·STE·loss·공유
+범위를 동시에 바꾸거나 대규모 재학습을 시작하지 않았다. 모든 첫 step,
+20-step 경로, 선택 행렬과 실패한 승격 판정은 덮어쓰지 않고 보존했다.
+
+### 26.4 CPU/HTP 수치 검증
+
+추가 validation의 CPU FP16 참조와 실제 W4A16 HTP 캡처의 상대 L2는
+**0.8665%**로 사전 2% 기준을 통과했다. P의 실제 Q/K에서 양자화를 끈
+FP64 QK 최대 절대 차이는 **2.81e−6**, FP16 QK 상대 L2 최댓값은 **0.19365%**다.
+FP32 직교성 spectral error 최댓값은 **7.36e−8**, FP16은 **6.0161e−4**다.
+FP16 행렬의 직교성이 실수 행렬과 bit-exact로 같다는 주장은 하지 않는다.
+
+A/B는 새 validation 문서의 layer0, P는 8개 고유 seed 각각의 첫 해당
+레이어를 사용해 AR1/128 HTP probe를 실행했다. 이는 입력이 서로 다른
+일부 probe의 **산술 검증**이지 그 probe 간 품질 우열 비교가 아니다.
+
+| HTP probe | 실행 수 | 조건부 Attention 상대 L2 범위 | FP32 전체 oracle 3% 기준 실패 수 |
+|---|---:|---:|---:|
+| A | 2 | 0.06344–0.10708% | 1 |
+| B | 2 | 0.10476–0.32073% | 1 |
+| P | 16 | 0.06344–0.13986% | 5 |
+
+조건부 oracle은 HTP가 실제 만든 current packed code/scale을 받아 Attention
+산술을 분리 검사한다. **20개 모두 통과했지만 encoder 검증을 대신하지 않는다.**
+기존 effective-scale relative error 기준 0.002를 넘은 K/V 검사도 40개 중
+18개(A2/B2/P14) 있었으며 완화하지 않고 기록했다. 기존 encoder 수치 실패와
+FP32 전체 oracle 실패는 유지된다. CPU는 offline 검증용이며 추론 CPU fallback은
+사용하지 않았다. 전체 모델 평가는 이 조건부 probe 통과와 별도 graph audit를
+전제로 한다.
+
+기존 경로와 새 레이어별 정책의 CPU 회귀 테스트는 **553개 통과**했다.
+잘못된 K/Query 연결이나 V 행렬 변경을 감사 코드가 놓치지 않는 음성 테스트,
+변조된 행렬/정책 hash·누락 레이어·캐시 혼용 거부, packing/reset을 포함한다.
+결과는 `reports/cpu_tests.xml`에 보존했다. Ruff 검사·format과 `git diff --check`도
+통과했다. 기존 Swig deprecation warning 두 개는 남아 있다.
+
+### 26.5 전체 모델 평가
+
+P 전체 모델 빌드와 **전체 graph audit가 통과**했다. A/B의 기존 바이너리를
+해시 검증 후 재사용했으며 P만 새로 빌드했다. 원본 가중치·calibration 해시,
+K 상수를 제외한 ONNX 구조, quantized DLC 연산/연결/순서/shape/dtype,
+최종 HTP context I/O/cache 형식을 대조했다. 비교 시 K 회전 상수 이름과
+converter의 무작위 RMSNorm 표시 이름 숫자만 정규화했다. V 상수나 tensor
+연결은 숨기지 않았다. 최종 HTP 내부 scheduling/physical layout은 context
+utility가 공개하지 않으므로 동일하다고 검증한 범위에 포함하지 않는다.
+
+| 구조·상수/파일 저장량 | A | B | P |
+|---|---:|---:|---:|
+| ONNX MatMul 수 (6 attention graphs 합) | 10,530 | 10,530 | 10,530 |
+| quantized DLC MatMul 수 | 7,168 | 7,168 | 7,168 |
+| 모델 전체 고유 K 행렬 수 | 1 | 1 | 8 |
+| 파트별 고유 K 행렬 수 (part2/3/4) | 1/1/1 | 1/1/1 | 6/6/5 |
+| FP16 K 행렬 논리 payload, 6 graphs 단순 합 | 192 KiB | 192 KiB | 1,088 KiB |
+| 실제 context binary 총합 | 1,702,166,528 B | 1,702,166,528 B | 1,702,703,104 B |
+
+그래프별 FP16 행렬 payload 합은 P가 **896 KiB 증가**하지만, 이는 AR128/AR1
+및 파트 간 공유를 고려하지 않은 논리 합이다. 최종 context binary의 실제
+증가는 **536,576 B = 524 KiB**다. 모델 전체에서 중복 없이 행렬 8개만
+세면 256 KiB(A/B 32 KiB)이나, 이 값 역시 실제 HTP allocation은 아니다.
+원본 ONNX FP32 K 상수 합은 A/B 393,216 B, P 2,228,224 B다.
+MatMul 일부가 FC 등으로 변환되므로 ONNX와 DLC 개수 차이는 기존과 같다.
+
+실제 빌드는 완료된 part1/2를 보존하고, 남은 part3/4를 별도 디렉터리에서
+병렬 컴파일해 조립했다. 순차 converter의 SIGTERM은 part2 완료 후의
+**의도적인 빌드 인계**이며 컴파일/수치 실패가 아니다. 완료 파일과 로그는
+`P_completed12/`, `P_build_part3/`, `P_build_part4/`에 그대로 있고 최종 `P/`는
+검증된 조립 번들이다. `reports/parallel_build_{plan,handoff}.json`과 조립 로그를
+보존했다. README의 순차 재현 명령도 같은 frozen 설정을 빌드한다.
+
+A/B/P를 `ABP`, `BPA`, `PAB` 순서로 교차 측정했다. CL1024, 35+128 및
+897+128 토큰 조건 각각 3회, 총 **비계측 성능 18회**다. Capture/profiler를
+켜지 않았고 TTFT에서 모델 loading은 제외했다. 두 session reset도 세 구성
+모두 통과했다. 아래는 **중앙값 [최솟값, 최댓값]**이며 표본을 제외하거나
+성능 측정을 추가 반복하지 않았다.
+
+긴 입력: **897 prompt + 128 generated tokens**, 마지막 캐시 길이 1024.
+
+| 지표 | A | B | P |
+|---|---:|---:|---:|
+| TTFT (ms) | 561.573 [560.216, 561.793] | 557.931 [484.963, 564.414] | 563.967 [560.369, 566.219] |
+| prefill (tok/s) | 1599.627 [1599.218, 1603.738] | 1609.768 [1592.076, 1850.540] | 1593.034 [1586.936, 1603.560] |
+| decode (tok/s) | 37.661 [37.584, 37.707] | 37.684 [37.511, 37.723] | 37.722 [37.697, 37.857] |
+| host KV (MiB) | 28.875 | 28.875 | 28.875 |
+| I/O buffer (MiB) | 96.929 | 96.929 | 96.929 |
+| 종료 VmRSS (MiB) | 150.520 [150.305, 150.559] | 150.547 [150.293, 150.613] | 150.578 [150.480, 150.586] |
+| process VmHWM (MiB) | 605.105 [605.078, 605.305] | 605.246 [605.102, 605.262] | 605.242 [605.070, 605.305] |
+
+짧은 입력: **35 prompt + 128 generated tokens**, CL1024 고정.
+
+| 지표 | A | B | P |
+|---|---:|---:|---:|
+| TTFT (ms) | 67.467 [61.802, 68.424] | 67.227 [62.766, 68.719] | 68.300 [67.035, 68.525] |
+| prefill (tok/s) | 523.150 [515.501, 569.095] | 524.636 [513.388, 559.877] | 516.965 [515.707, 526.066] |
+| decode (tok/s) | 38.449 [38.443, 39.161] | 38.439 [38.404, 38.988] | 38.721 [38.683, 38.786] |
+| 종료 VmRSS (MiB) | 150.258 [150.207, 150.625] | 150.625 [150.145, 150.711] | 150.445 [150.344, 150.523] |
+| process VmHWM (MiB) | 605.063 [604.887, 605.238] | 605.063 [604.887, 605.266] | 605.043 [604.930, 605.199] |
+
+짧은 입력도 host KV/I/O 크기는 동일하다. KV는 모든 실행에서 정확히
+**30,277,632 bytes**였다. VmRSS/HWM은 runner 프로세스 지표이며 NPU/기기
+전체 메모리 점유를 나타내지 않는다. 긴 입력 P/B decode 중앙값 차이는
+**+0.10%**, TTFT는 **+1.08%**다. 짧은 입력은 각각 +0.73%, +1.60%다.
+큰 decode 저하는 관찰되지 않았지만 **속도 우세나 통계적 동등성을 주장하지
+않는다**. 특히 B의 긴 입력 TTFT 484.963 ms 표본과 짧은 입력의 빠른 표본도
+제외하지 않았다. 배터리 온도 snapshot은 27.1–30.2°C, thermal status는
+모두 0이었으며, 이것이 클록/온도의 완전한 통제를 증명하지는 않는다.
+Busy-cycle 계측은 사용하지 않았으므로 그 비중을 지연 감소율로 환산하지 않는다.
+
+최종 품질은 후보 선택에 쓰지 않은 새 test 문서 4개를 **구성별 문서당 1회**
+평가했다. 전체 PPL은 4개 PPL의 산술평균이 아니라 `exp(전체 NLL / 4092)`다.
+
+| Heldout 문서 | A PPL | B PPL | P PPL |
+|---|---:|---:|---:|
+| Head VI | 55.090176 | 50.364664 | 59.834948 |
+| Brad Stevens | 22.889762 | 21.595108 | 22.599032 |
+| Chad at the 2008 Summer Olympics | 14.611285 | 15.305995 | 17.531973 |
+| Typhoon Krosa (2013) | 21.377048 | 25.611362 | 21.177303 |
+| 전체 NLL 기반 PPL (4092 tokens) | **25.051740** | **25.553117** | **26.618682** |
+
+**최종 판정은 음성이다. P는 B보다 PPL이 4.17%, A보다 6.25% 악화됐다.**
+B 대비 4문서 중 3개가 악화됐고, Typhoon Krosa만 개선됐다. 추가 validation의
+Attention MSE가 2.11% 감소한 결과를 PPL 개선으로 해석할 수 없음을 실제
+전체 모델 평가로 확인했다. 이 새 문서 집합에서는 B도 A보다 PPL이 높다.
+§25의 다른 문서 집합에서는 B가 좋았으므로, 공유 random seed 선택의 이득도
+데이터 집합에 의존한다. 과거와 이번 PPL의 절댓값을 직접 비교하지 않는다.
+
+가능한 해석은 **국소 목적함수/고정 캡처와 전체 모델 목적함수의 차이**다.
+여기서 최소화한 값은 FP16-KV 참조에서 고정한 각 레이어 입력의 Attention
+출력 MSE다. 전체 TQ 모델에서는 앞 레이어의 오차가 뒤 레이어 입력을 바꾸며,
+레이어별 절대 MSE 감소가 다음-token NLL 감소를 보장하지 않는다. 후기
+레이어의 손실 편중, 작은 선택 데이터, validation→test 분포 차이도 관측된
+일반화 실패와 양립한다. 각각의 인과 기여를 추가 실험으로 분리한 결과는
+아니므로 확정 원인으로 단정하지 않는다.
+
+따라서 **P는 선택형 실험으로만 보존하고 기본으로 승격하지 않았다.** D도
+전체 validation에서 실패했으므로 공유 학습 비교 기준 B를 유지했다. 제품
+기본 profile은 원래대로 **A(seed42)**이며 B나 P로 변경하지 않았다. 실패한
+PPL을 만회하려는 추가 seed 선택·loss 변경·장시간 학습·test 재선택·재측정은
+진행하지 않았다.
+
+### 26.6 재현·산출물
+
+루트: `/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_followup_20261009/`.
+재현 명령은 README의 “Per-layer K selection and shared-update diagnosis”에 있다.
+
+- `protocol.json`, `source_identity.json`, `data_manifest.json`: 사전 범위·원본·데이터 해시.
+- `layer_selection.json`, `reports/layer_seed_table.csv`, `reports/layer_seed_heatmap.{png,svg}`: 28×8 seed 분석.
+- `reports/extra_validation_layers.csv`, `reports/diagnostic_loss_shares.json`: 새 문서의 레이어별 기여도와 고정 subset 손실 편중.
+- `rotations/P.json`, `rotations/D.json`, `rotation_validation.json`: 레이어 정책/후보 행렬/캐시 hash와 QK 검사.
+- `diagnostics/`, `diagnostics.json`: 세 독립 첫 step 및 20-step 전체 hard loss/변화량.
+- `captures/validation_*`, `samples/`, `cpu_quality.json`: 실제 추가 문서의 참조와 CPU 승격 판정.
+- `probes/{A,B,P}/`: 실제 HTP 입력/출력과 성공·실패 수치 검증 원본.
+- `reports/`: 빌드·그래프 감사·비계측 성능·최종 PPL·reset 결과.
+- `reports/comparison.json`, `reports/final_decision.json`: 전체 표본/중앙값/min/max/PPL과 음성 최종 판정.
+- `reports/implementation_identity.json`, `reports/experiment.json`: 코드/설정/바이너리/기기/입력 provenance.
+
+Heatmap 첫 생성은 환경의 matplotlib 누락으로 중단됐다. 이미 생성된 선택표와
+행렬을 보존하고 matplotlib를 설치한 뒤 **저장된 결과의 시각화만** 실행했다.
+선택·학습·품질 평가를 유리한 결과를 얻기 위해 다시 실행한 것이 아니다.
+
+## 27. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

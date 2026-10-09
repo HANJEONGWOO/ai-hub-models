@@ -125,7 +125,7 @@ def prepare(root: Path, source_assets: Path) -> None:
     )
 
 
-def capture(root: Path) -> None:
+def capture(root: Path, splits: list[str] | None = None) -> None:
     manifest = json.loads((root / "data_manifest.json").read_text())
     split = Path("/mnt/d/ai-hub-models/binaries/turboquant/qwen3_1_7b_w4a16_split")
     sources = {}
@@ -163,7 +163,9 @@ def capture(root: Path) -> None:
         ],
         root / "reports/capture_push.log",
     )
-    for windows in manifest["windows"].values():
+    for split_name, windows in manifest["windows"].items():
+        if splits is not None and split_name not in splits:
+            continue
         for window in windows:
             tag = Path(window["file"]).stem
             run_logged(
@@ -192,7 +194,7 @@ def capture(root: Path) -> None:
             )
 
 
-def pack(root: Path) -> None:
+def pack(root: Path, splits: list[str] | None = None) -> None:
     manifest = json.loads((root / "data_manifest.json").read_text())
     out = root / "samples"
     out.mkdir(exist_ok=False)
@@ -229,7 +231,9 @@ def pack(root: Path) -> None:
                     "prob": acts[prob],
                 }
             )
-    for windows in manifest["windows"].values():
+    for split_name, windows in manifest["windows"].items():
+        if splits is not None and split_name not in splits:
+            continue
         for window in windows:
             tag = Path(window["file"]).stem
             captured = root / "captures" / tag
@@ -284,6 +288,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("prepare", "capture", "pack"))
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--splits", nargs="+", choices=("train", "validation", "test"))
     parser.add_argument(
         "--source-assets",
         type=Path,
@@ -293,7 +298,7 @@ def main() -> None:
     if args.stage == "prepare":
         prepare(args.root, args.source_assets)
     else:
-        globals()[args.stage](args.root)
+        globals()[args.stage](args.root, args.splits)
 
 
 if __name__ == "__main__":

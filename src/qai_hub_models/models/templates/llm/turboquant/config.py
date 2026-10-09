@@ -123,8 +123,34 @@ class TurboQuantConfig:
     precomputed_norm: bool = False
     qjl: bool = False
     reference_commit: str = field(default=REFERENCE_COMMIT)
+    # Optional per-layer K specs; every KV head in one layer shares its matrix.
+    # Empty preserves the original shared configuration and hash byte-for-byte.
+    key_layers: tuple[KVCodecSpec, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.key_layers:
+            if (
+                not isinstance(self.key_layers, tuple)
+                or self.key.dense_matrix is not None
+            ):
+                raise ValueError(
+                    "Layer rotations must be immutable and not combined with a shared override."
+                )
+            seen: dict[int, tuple[float, ...] | None] = {}
+            for spec in self.key_layers:
+                if spec.seed == self.value.seed:
+                    raise ValueError(
+                        "K layer rotation constant name collides with fixed V rotation."
+                    )
+                if spec.dense_matrix is None:
+                    raise ValueError("Layer rotations require explicit fixed matrices.")
+                # Reuse the shared override's complete invariant validation.
+                replace(self, key=spec, key_layers=())
+                if spec.seed in seen and seen[spec.seed] != spec.dense_matrix:
+                    raise ValueError(
+                        "Different layer matrices cannot share a constant name/seed."
+                    )
+                seen[spec.seed] = spec.dense_matrix
         if self.value.dense_matrix is not None:
             raise ValueError("This experiment permits a K-only rotation override.")
         if self.key.dense_matrix is not None:
@@ -133,7 +159,9 @@ class TurboQuantConfig:
             )
 
             if not isinstance(self.key.dense_matrix, tuple):
-                raise ValueError("Explicit rotation constants must be immutable tuples.")
+                raise ValueError(
+                    "Explicit rotation constants must be immutable tuples."
+                )
             if (
                 self.profile != "k4_v4_scaled"
                 or self.rotation != Rotation.DENSE_QR
@@ -196,6 +224,16 @@ class TurboQuantConfig:
     def codecs(self) -> tuple[KVCodecSpec, KVCodecSpec]:
         return (self.key, self.value)
 
+    def key_for_layer(self, layer: int) -> KVCodecSpec:
+        if layer < 0 or (self.key_layers and layer >= len(self.key_layers)):
+            raise ValueError(f"Missing K rotation for layer {layer}.")
+        return self.key_layers[layer] if self.key_layers else self.key
+
+    def codec_for_layer(self, kind: str, layer: int) -> KVCodecSpec:
+        if kind not in ("key", "value"):
+            raise ValueError(f"Unknown KV kind {kind}.")
+        return self.key_for_layer(layer) if kind == "key" else self.value
+
     @property
     def enabled(self) -> bool:
         """True when at least one KV tensor is stored with a PolarQuant codec."""
@@ -216,6 +254,8 @@ class TurboQuantConfig:
         """Reject model shapes this format version cannot store without truncation."""
         if num_layers <= 0 or num_kv_heads <= 0:
             raise ValueError("num_layers and num_kv_heads must be positive.")
+        if self.key_layers and len(self.key_layers) != num_layers:
+            raise ValueError("Layer rotation count differs from model layer count.")
         if not self.enabled:
             return
         if head_dim & (head_dim - 1) or head_dim <= 0:
@@ -300,6 +340,12 @@ class TurboQuantConfig:
                     data[name]["rotation_f32_sha256"] = hashlib.sha256(
                         matrix.astype("<f4").tobytes()
                     ).hexdigest()
+        if self.key_layers:
+            data["key_layers"] = [
+                replace(self, key=spec, key_layers=()).to_dict()["key"]
+                for spec in self.key_layers
+            ]
+            data["key_rotation_sharing"] = "per_layer_all_kv_heads"
         return data
 
     def config_hash(self) -> str:

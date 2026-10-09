@@ -357,7 +357,7 @@ def main() -> None:
     parser.add_argument(
         "--key-rotation-file",
         type=Path,
-        help="Opt-in K-only shared Dense rotation artifact; defaults unchanged.",
+        help="Opt-in K-only shared or per-layer Dense rotation artifact; defaults unchanged.",
     )
     parser.add_argument(
         "--capture-attention",
@@ -503,6 +503,17 @@ def main() -> None:
         args.key_rotation_file,
     )
     current_kv = bool(config.enabled and args.quantize_current_kv)
+    if config.key_layers:
+        model_layers = {
+            int(m.group(1))
+            for info in manifest["parts"].values()
+            for value in info["inputs"]
+            if (m := re.fullmatch(r"past_key_(\d+)_in", value["name"]))
+        }
+        if model_layers != set(range(len(config.key_layers))):
+            raise ValueError(
+                "Layer rotation policy does not cover exactly the model's K layers"
+            )
     if report or args.context_only:
         native_manifest = (
             json.loads((args.native_decoder_package / "manifest.json").read_text())
