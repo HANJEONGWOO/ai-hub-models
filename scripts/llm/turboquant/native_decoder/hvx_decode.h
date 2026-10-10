@@ -39,3 +39,62 @@ inline void tq_decode_hvx(const uint8_t* packed, const uint16_t* scales,
       tq_store_row(Q6_V_hi_W(indices), lut, scales[row + 1], output + (row + 1) * 128);
   }
 }
+
+// Tight MSB-first 2/3/5/6-bit streams. Byte gathers, variable halfword shifts,
+// multi-bank centroid lookup and FP16 products all execute on HVX. Only the
+// small per-invocation constant tables are prepared by the scalar DSP.
+template<unsigned Bits>
+inline void tq_decode_bits_hvx(const uint8_t* packed, const uint16_t* scales,
+                              const uint16_t* centroids, uint16_t* output,
+                              uint32_t rows) {
+  static_assert(Bits >= 2 && Bits <= 6);
+  alignas(128) uint8_t offsets[128], next[128];
+  alignas(128) uint16_t shifts[128], table[64];
+  for (unsigned j = 0; j < 128; ++j) {
+    offsets[j] = j * Bits / 8;
+    next[j] = offsets[j] + 1;
+    shifts[j] = 16 - Bits - (j * Bits % 8);
+  }
+  for (unsigned j = 0; j < 64; ++j) {
+    const unsigned index = j / 2 + (j % 2) * 32;
+    table[j] = index < (1u << Bits) ? centroids[index] : 0;
+  }
+  HVX_Vector off, nxt, shift0, shift1, lut;
+  memcpy(&off, offsets, 128); memcpy(&nxt, next, 128);
+  memcpy(&shift0, shifts, 128); memcpy(&shift1, shifts + 64, 128);
+  memcpy(&lut, table, 128);
+  const auto mask = Q6_Vh_vsplat_R((1u << Bits) - 1);
+  for (uint32_t row = 0; row < rows; ++row) {
+    auto bytes = Q6_V_vzero();
+    memcpy(&bytes, packed + row * (16 * Bits), 16 * Bits);
+    // vlut32 tables interleave entries 0..63 with entries 64..127.
+    const auto byte_lut = Q6_Vb_vshuff_Vb(bytes);
+    auto first = Q6_Vb_vlut32_VbVbI(off, byte_lut, 0);
+    auto second = Q6_Vb_vlut32_VbVbI(nxt, byte_lut, 0);
+    first = Q6_Vb_vlut32or_VbVbVbI(first, off, byte_lut, 1);
+    second = Q6_Vb_vlut32or_VbVbVbI(second, nxt, byte_lut, 1);
+    if constexpr (Bits >= 5) {
+      first = Q6_Vb_vlut32or_VbVbVbI(first, off, byte_lut, 2);
+      second = Q6_Vb_vlut32or_VbVbVbI(second, nxt, byte_lut, 2);
+      first = Q6_Vb_vlut32or_VbVbVbI(first, off, byte_lut, 3);
+      second = Q6_Vb_vlut32or_VbVbVbI(second, nxt, byte_lut, 3);
+    }
+    const auto words = Q6_W_vshuff_VVR(first, second, -1);
+    const auto lo = Q6_V_vand_VV(Q6_Vh_vlsr_VhVh(Q6_V_lo_W(words), shift0), mask);
+    const auto hi = Q6_V_vand_VV(Q6_Vh_vlsr_VhVh(Q6_V_hi_W(words), shift1), mask);
+    const auto indices = Q6_Vb_vpacke_VhVh(hi, lo);
+    auto selected = Q6_Wh_vlut16_VbVhI(indices, lut, 0);
+    if constexpr (Bits >= 5)
+      selected = Q6_Wh_vlut16or_WhVbVhI(selected, indices, lut, 1);
+    if constexpr (Bits == 6) {
+      selected = Q6_Wh_vlut16or_WhVbVhI(selected, indices, lut, 2);
+      selected = Q6_Wh_vlut16or_WhVbVhI(selected, indices, lut, 3);
+    }
+    const auto ordered = Q6_W_vshuff_VVR(Q6_V_hi_W(selected), Q6_V_lo_W(selected), -2);
+    const auto factor = Q6_Vh_vsplat_R(scales[row]);
+    const auto out0 = Q6_Vhf_vmpy_VhfVhf(Q6_V_lo_W(ordered), factor);
+    const auto out1 = Q6_Vhf_vmpy_VhfVhf(Q6_V_hi_W(ordered), factor);
+    memcpy(output + row * 128, &out0, 128);
+    memcpy(output + row * 128 + 64, &out1, 128);
+  }
+}

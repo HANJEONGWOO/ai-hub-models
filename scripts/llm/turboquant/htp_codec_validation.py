@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -422,6 +423,7 @@ def adb_shell_rc(args: argparse.Namespace, script: str) -> tuple[int, str]:
 
 def cmd_run(args: argparse.Namespace) -> None:
     work: Path = args.work_dir
+    remote = args.device_dir or DEVICE_DIR
     device_out = work / "device"
     device_out.mkdir(parents=True, exist_ok=True)
     soc = adb(args, "shell", "getprop", "ro.soc.model").strip()
@@ -433,17 +435,22 @@ def cmd_run(args: argparse.Namespace) -> None:
         "fingerprint": adb(args, "shell", "getprop", "ro.build.fingerprint").strip(),
     }
 
-    adb(args, "shell", "rm", "-rf", DEVICE_DIR)
-    adb(args, "shell", "mkdir", "-p", f"{DEVICE_DIR}/inputs")
+    if args.device_dir:
+        rc, _ = adb_shell_rc(args, f"test -e {shlex.quote(remote)}")
+        if rc == 0:
+            raise FileExistsError(f"Use a fresh device probe directory: {remote}")
+    else:
+        adb(args, "shell", "rm", "-rf", remote)
+    adb(args, "shell", "mkdir", "-p", f"{remote}/inputs")
     for rel in DEVICE_LIBS:
-        adb(args, "push", windows_path(args.sdk / rel), f"{DEVICE_DIR}/")
-    adb(args, "push", windows_path(args.ndk / NDK_LIBCXX), f"{DEVICE_DIR}/")
-    adb(args, "shell", "chmod", "+x", f"{DEVICE_DIR}/qnn-net-run")
+        adb(args, "push", windows_path(args.sdk / rel), f"{remote}/")
+    adb(args, "push", windows_path(args.ndk / NDK_LIBCXX), f"{remote}/")
+    adb(args, "shell", "chmod", "+x", f"{remote}/qnn-net-run")
     for path in sorted((work / "ctx").glob("*.bin")):
-        adb(args, "push", windows_path(path), f"{DEVICE_DIR}/")
+        adb(args, "push", windows_path(path), f"{remote}/")
     for path in sorted((work / "inputs").glob("*")):
         if path.suffix in (".raw", ".txt"):
-            adb(args, "push", windows_path(path), f"{DEVICE_DIR}/inputs/")
+            adb(args, "push", windows_path(path), f"{remote}/inputs/")
 
     htp_dev = work / "device_htp.json"
     htp_dev.write_text(
@@ -466,13 +473,13 @@ def cmd_run(args: argparse.Namespace) -> None:
             }
         )
     )
-    adb(args, "push", windows_path(htp_dev), f"{DEVICE_DIR}/")
-    adb(args, "push", windows_path(be_dev), f"{DEVICE_DIR}/")
+    adb(args, "push", windows_path(htp_dev), f"{remote}/")
+    adb(args, "push", windows_path(be_dev), f"{remote}/")
 
     env_prefix = (
-        f"cd {DEVICE_DIR} && export LD_LIBRARY_PATH={DEVICE_DIR}:/vendor/dsp/cdsp:/vendor/lib64 "
+        f"cd {remote} && export LD_LIBRARY_PATH={remote}:/vendor/dsp/cdsp:/vendor/lib64 "
         # The QAIRT 2.48 android-qnn-net-run.sh V81 branch uses ':' separators.
-        f"&& export ADSP_LIBRARY_PATH='{DEVICE_DIR}:/vendor/dsp/cdsp:/vendor/lib/rfsa/adsp:"
+        f"&& export ADSP_LIBRARY_PATH='{remote}:/vendor/dsp/cdsp:/vendor/lib/rfsa/adsp:"
         "/system/lib/rfsa/adsp:/dsp'"
     )
     runs: dict[str, Any] = {"device": device_info, "runs": {}}
@@ -498,7 +505,7 @@ def cmd_run(args: argparse.Namespace) -> None:
             if rc != 0:
                 print(f"{name} [{level}] failed with exit code {rc}", flush=True)
                 continue
-            adb(args, "pull", f"{DEVICE_DIR}/{out_dir}", windows_path(device_out))
+            adb(args, "pull", f"{remote}/{out_dir}", windows_path(device_out))
             profile_log = local / "qnn-profiling-data_0.log"
             if profile_log.exists():
                 run_logged(
@@ -595,7 +602,9 @@ def cmd_compare(args: argparse.Namespace) -> None:
             result = out_dir / f"Result_{i}"
             if info["op"] == "encode":
                 x = np.load(work / "inputs" / f"{name}_{case}_x.npy")
-                packed = read_native(result, "packed", "uint8", (*lead, tokens, D // 2))
+                packed = read_native(
+                    result, "packed", "uint8", (*lead, tokens, D * spec.bits // 8)
+                )
                 norm = read_native(result, "norm", "float16", (*lead, tokens, 1))
                 cmp = compare_encode(codec, x, packed, norm, HTP_FP16)
                 decoded = codec.decode(
@@ -609,7 +618,7 @@ def cmd_compare(args: argparse.Namespace) -> None:
             else:
                 packed = np.fromfile(
                     work / "inputs" / f"{name}_{case}_packed.raw", dtype=np.uint8
-                ).reshape(*lead, tokens, D // 2)
+                ).reshape(*lead, tokens, D * spec.bits // 8)
                 norm = np.fromfile(
                     work / "inputs" / f"{name}_{case}_norm.raw", dtype=np.float16
                 ).reshape(*lead, tokens, 1)
@@ -639,7 +648,11 @@ def main() -> None:
     parser.add_argument("stage", choices=["build", "run", "compare", "all"])
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--snapshot", type=Path, required=True)
-    parser.add_argument("--profile", choices=["k4_v4", "k4_v4_scaled"], default=PROFILE)
+    parser.add_argument(
+        "--profile",
+        choices=["k4_v4", "k4_v4_scaled", "k5_v3_scaled", "k6_v2_scaled"],
+        default=PROFILE,
+    )
     parser.add_argument("--rotation", choices=[r.value for r in Rotation])
     parser.add_argument(
         "--range-scale",
@@ -663,6 +676,10 @@ def main() -> None:
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     parser.add_argument("--ndk", type=Path, default=DEFAULT_NDK)
     parser.add_argument("--adb", type=Path, default=DEFAULT_ADB)
+    parser.add_argument(
+        "--device-dir",
+        help="Fresh device directory; existing paths are refused, not deleted",
+    )
     args = parser.parse_args()
     if any(tokens < 1 for tokens in args.tokens):
         parser.error("--tokens must be positive")

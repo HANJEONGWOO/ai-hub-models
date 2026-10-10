@@ -212,7 +212,7 @@ def run_scalar_tree(bits: int, values: np.ndarray) -> np.ndarray:
     return run(model, {"y": values})[0]
 
 
-@pytest.mark.parametrize("bits", [3, 4])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
 def test_scalar_tree_exact_boundaries_and_neighbors(bits: int) -> None:
     boundaries = load_boundaries(bits, D).astype(np.float32)
     x = np.r_[
@@ -231,7 +231,7 @@ def test_scalar_tree_exact_boundaries_and_neighbors(bits: int) -> None:
     )
 
 
-@pytest.mark.parametrize("bits", [3, 4])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
 def test_scalar_tree_all_finite_fp16_inputs(bits: int) -> None:
     x = np.arange(65536, dtype=np.uint16).view(np.float16)
     x = np.sort(x[np.isfinite(x)])

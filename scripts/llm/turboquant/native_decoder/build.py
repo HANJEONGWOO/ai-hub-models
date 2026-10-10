@@ -59,6 +59,7 @@ def main() -> None:
     }
     manifest = {
         "package": "TurboQuantNative",
+        "operations": [f"Decode{bits}" for bits in (2, 3, 4, 5, 6)],
         "interface": "TurboQuantInterfaceProvider",
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "source_files": {

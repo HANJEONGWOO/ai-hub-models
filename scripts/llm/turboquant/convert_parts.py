@@ -395,11 +395,16 @@ def main() -> None:
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     args = parser.parse_args()
-    scaled = args.profile in ("k4_v4_scaled", "k3qjl_v4_scaled")
+    scaled = args.profile in (
+        "k4_v4_scaled",
+        "k3qjl_v4_scaled",
+        "k5_v3_scaled",
+        "k6_v2_scaled",
+    )
     if args.native_decoder is None:
         args.native_decoder = scaled
     if args.native_decoder and not scaled:
-        parser.error("Native Decode4 requires k4_v4_scaled or k3qjl_v4_scaled")
+        parser.error("Native decoder requires a supported scaled profile")
     if args.attention_tile is None:
         args.attention_tile = 256 if scaled else 0
     if args.rotated_attention is None:
@@ -421,8 +426,10 @@ def main() -> None:
         "k4_v4",
         "k4_v4_scaled",
         "k3qjl_v4_scaled",
+        "k5_v3_scaled",
+        "k6_v2_scaled",
     ):
-        parser.error("--attention-tile requires a k4_v4 or k3qjl_v4_scaled profile")
+        parser.error("--attention-tile requires k4_v4 or a supported scaled profile")
     if args.rotated_attention and (not scaled or not args.attention_tile):
         parser.error(
             "--rotated-attention requires a supported scaled profile and --attention-tile"
@@ -447,6 +454,17 @@ def main() -> None:
         if not (args.native_decoder_package / "manifest.json").is_file():
             parser.error(
                 f"Missing native decoder manifest in {args.native_decoder_package}"
+            )
+        package_manifest = json.loads(
+            (args.native_decoder_package / "manifest.json").read_text()
+        )
+        required = {
+            "k5_v3_scaled": {"Decode5", "Decode3"},
+            "k6_v2_scaled": {"Decode6", "Decode2"},
+        }.get(args.profile, {"Decode4"})
+        if not required.issubset(package_manifest.get("operations", ["Decode4"])):
+            parser.error(
+                "Native package lacks the selected bit widths; build the updated package and pass --native-decoder-package"
             )
     buckets = sorted({*args.context_buckets, args.context_length})
     if any(c <= 1 or c > args.context_length for c in buckets):

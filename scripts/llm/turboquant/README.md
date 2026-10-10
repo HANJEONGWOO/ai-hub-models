@@ -52,6 +52,148 @@ This change is covered by CPU graph/oracle, boundary/FP16-domain, packing,
 QJL/Native and metadata regression tests. No model rebuild or device performance
 measurement is performed as part of this code-only switch.
 
+## Asymmetric K5/V3 and K6/V2 (opt-in, Qwen3-1.7B)
+
+`k5_v3_scaled` and `k6_v2_scaled` retain Dense QR K seed42/V seed542,
+exact LM tree indexing, QJL-off, compressed current/past KV, norm correction
+and one FP16 effective scale per vector. The default remains `k4_v4_scaled`.
+The frozen 2/5/6-bit LM tables are generated from the same pinned reference as
+the unchanged 3/4-bit tables; no calibration or rotation selection is performed.
+
+| Profile | K bytes / 128 coordinates | V bytes / 128 coordinates | FP16 scales | CL1024 host KV (28 layers, 8 KV heads) |
+|---|---:|---:|---:|---:|
+| K4/V4 | 64 | 64 | 4 bytes per K/V pair | 28.875 MiB |
+| K5/V3 | 80 | 48 | 4 bytes per K/V pair | 28.875 MiB |
+| K6/V2 | 96 | 32 | 4 bytes per K/V pair | 28.875 MiB |
+
+Non-nibble widths use continuous MSB-first bit streams without padding to
+4/8 bits per coordinate. The encoder uses exact power-of-two fragments and
+INT32 byte sums. `Decode2/3/5/6` use HVX byte gathers, shifts, banked LUT lookup
+and FP16 scale multiplication. The legacy `Decode4` HVX kernel is unchanged;
+QJL's K3+sign remains a **four-bit nibble**, not the new tight three-bit stream.
+QK/AV remain FP16-input matrix products; this is not bit-plane attention or a
+CPU decoder fallback. New profiles require an updated Native package, supplied
+explicitly; the existing default package location is not overwritten.
+
+Reproduction (choose a fresh artifact directory; commands do not create commits):
+
+```bash
+TQ_ASYM_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/asymmetric_kv_NEW
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/native_decoder/build.py \
+  --out "$TQ_ASYM_ROOT/native" --test-hvx
+bash scripts/llm/turboquant/qnn_runner/build_android.sh "$TQ_ASYM_ROOT/runner"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_asymmetric_once.py prepare \
+  --work-dir "$TQ_ASYM_ROOT" --runner "$TQ_ASYM_ROOT/runner/qnn-llm-runner"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_asymmetric_once.py build --work-dir "$TQ_ASYM_ROOT"
+for stage in audit push functional performance quality summarize; do
+  PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_asymmetric_once.py "$stage" --work-dir "$TQ_ASYM_ROOT" || break
+done
+```
+
+The driver fixes CL1024 for all groups and reuses the LM-tree seed42 baseline
+binary after configuration/hash checks. The quality input is the **legacy four
+WikiText windows** (`device_assets_cl1024`, historical K4/V4 PPL approximately
+25.66), not the rotation-selection experiment's heldout documents. Performance
+is unprofiled, one session for short35+128 and one for long897+128 per group.
+Each quality window is scored once (1023 targets); aggregate PPL is
+`exp(sum(NLL_sum) / 4092)`. Reset checks and standalone codec probes are diagnostics,
+not repeated performance samples. Existing attempt logs are never overwritten.
+
+Use `validate_native_decoder.py --bits {2,3,4,5,6} --tokens 3 256` with a fresh
+`--work-dir`, `--device-dir` and `--package` for standalone Native correctness.
+`htp_codec_validation.py` also accepts the asymmetric profiles; keep each probe
+in a fresh `--device-dir` to preserve earlier device outputs. FP16 encoder
+numeric-tolerance failures are reported independently of successful HTP execution
+and exact Native LUT correctness; do not silently relax the existing tolerances.
+
+Experiment artifacts: `/mnt/d/ai-hub-models/binaries/turboquant/asymmetric_kv_20261010/`.
+`protocol.json`, `runner_amendment.json`, probe reports, build/audit logs and the
+single-run measurement JSONs preserve provenance; `comparison.json` and
+`comparison.csv` contain the final comparison. The amendment records replacement
+of a stale pre-Native runner **before any successful benchmark or quality run**.
+
+### Single-run result: 2026-10-10, S26 Ultra / SM8850 V81
+
+All groups use Qwen3-1.7B W4A16, fixed CL1024 (no context bucketing),
+AR128 prefill, AR1 decode, tile256 and compressed current/past KV. Each
+performance condition has **one** unprofiled session and each WikiText window
+is scored **once**, using the existing AR128 teacher-forced scoring path.
+Model loading is excluded from TTFT. Baseline binaries were reused unchanged,
+but all three groups were freshly measured with the same current-main runner.
+
+Long condition: **897 prompt tokens + 128 generated tokens**.
+
+| Metric | K4/V4 | K5/V3 | K6/V2 |
+|---|---:|---:|---:|
+| TTFT (ms) | 556.62 | 2304.20 | 2458.90 |
+| Prefill (tok/s) | 1614.11 | 389.46 | 364.94 |
+| Decode (tok/s) | 37.68 | 4.23 | 3.98 |
+| Decode total (ms/token) | 26.539 | 236.210 | 251.266 |
+| Decode KV prepare (ms/token) | 1.166 | 3.063 | 3.097 |
+| Decode QNN calls (ms/token) | 24.774 | 230.582 | 245.508 |
+| Four-window mean NLL | 3.244966 | 3.112172 | 2.987942 |
+| Four-window PPL | 25.660831 | 22.469806 | 19.844793 |
+| Host KV (MiB) | 28.875 | 28.875 | 28.875 |
+| I/O buffers (MiB) | 96.929 | 96.929 | 96.929 |
+| End VmRSS (MiB) | 149.941 | 151.527 | 153.129 |
+| Context binaries, total (MiB) | 1623.3125 | 1625.2617 | 1627.5000 |
+
+Short condition: **35 prompt tokens + 128 generated tokens**, also fixed CL1024.
+
+| Metric | K4/V4 | K5/V3 | K6/V2 |
+|---|---:|---:|---:|
+| TTFT (ms) | 66.53 | 293.34 | 308.22 |
+| Prefill (tok/s) | 530.07 | 119.67 | 113.84 |
+| Decode (tok/s) | 38.64 | 4.27 | 4.01 |
+
+Quality windows each contain 1023 scored targets. Window PPLs below are
+descriptive; aggregate PPL above is computed from the **sum of NLL**, not their
+arithmetic mean.
+
+| Legacy WikiText window | K4/V4 PPL | K5/V3 PPL | K6/V2 PPL |
+|---|---:|---:|---:|
+| w0 | 13.876348 | 12.410554 | 11.628604 |
+| w1 | 33.952901 | 26.303588 | 25.016727 |
+| w2 | 25.053085 | 27.910367 | 19.536115 |
+| w3 | 36.734116 | 27.978578 | 27.289152 |
+
+**Interpretation:** K5/V3 and K6/V2 reduce aggregate PPL by 12.44% and 22.67%
+on these four windows at identical cache storage. K5/V3 improves three windows
+but worsens w2; K6/V2 improves all four. This supports further investigation of
+allocating more bits to K on this model/data, not a general accuracy guarantee.
+Neither implementation is a speed win: observed long-context per-token latency
+increases 8.90x and 9.47x. Single samples do not establish timing variance.
+
+**Known implementation bottleneck:** the non-nibble native kernel is not at
+the legacy Decode4 optimization level. Disassembly of the measured DSP library
+shows its partial-row `memcpy` lowered to **32/48/80/96 scalar byte loads** for
+2/3/5/6-bit input rows, followed by vector assembly, instead of efficient bulk
+HVX loads. LUT lookup, bit extraction and FP16 products do execute on HVX;
+there is **no ARM/CPU inference fallback**. This scalar DSP loading overhead
+must not be described as an intrinsic penalty of asymmetric bit allocation.
+Existing isolated decoder correctness profiles (no extra device runs) recorded
+0.303 million Decode4 cycles versus 4.531/9.198/14.279/21.599 million cycles for
+Decode2/3/5/6 at 8 heads x 256 tokens. These are diagnostic op counters, **not**
+full-model wall-time fractions or end-to-end speedup estimates. Whole-model
+timings locate the major increase inside QNN, but do not separate every op.
+Native input-load/vectorization optimization is a follow-up, not silently
+applied after the single-run measurements.
+
+Validation: **573 CPU tests passed**; HVX simulator and isolated device LUT
+decoders were exact against the FP16 oracle for every tested width. All six
+attention graphs per group passed the compiled audit; non-codec source nodes,
+constants, weights and activation calibration were unchanged. Device reset
+checks passed, and long generation reached 1024 cached tokens. The strict
+AR128 encoder scale gate remains **failed**, with maximum relative errors
+0.2199% (K5/V3) and 0.2720% (K6/V2), against the unchanged 0.2% tolerance;
+no unexplained scalar-index mismatches were found. This limitation is separate
+from successful HTP execution/decoder correctness and is not waived by PPL.
+
+All artifacts remain under the experiment directory above, including full
+configuration/data/binary hashes, original failed diagnostics, partitioned
+build provenance and disassembly/probe evidence in `comparison.json`.
+The branch remains `main`, no commit was created, and K4/V4 stays the default.
+
 ## FP16 KV + FP16-input attention control (opt-in)
 
 `baseline_fp16_kv_fp16_attn` is a separate, uncompressed control. It does **not**

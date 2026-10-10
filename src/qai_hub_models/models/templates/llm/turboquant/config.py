@@ -65,9 +65,9 @@ class KVCodecSpec:
     def __post_init__(self) -> None:
         if self.kind != CodecKind.POLAR and (self.bits != 0 or self.seed != 0):
             raise ValueError(f"{self.kind.name} codec takes no bits or seed.")
-        if self.kind == CodecKind.POLAR and self.bits not in (3, 4):
+        if self.kind == CodecKind.POLAR and self.bits not in (2, 3, 4, 5, 6):
             raise ValueError(
-                f"PolarQuant bit width must be 3 or 4, got {self.bits}. "
+                f"PolarQuant bit width must be 2 through 6, got {self.bits}. "
                 "Other widths have no frozen codebook."
             )
 
@@ -278,7 +278,7 @@ def _polar(bits: int, seed: int) -> KVCodecSpec:
 
 
 # "k8" names the repo's affine int8 K path, not an 8-bit TurboQuant codec.
-# 3-bit profiles have a host oracle only (no HTP graph).
+# Unscaled legacy 3-bit profiles have a host oracle only (no HTP graph).
 PROFILES: dict[str, TurboQuantConfig] = {
     # Baselines do not rotate; retain their historical metadata/hash.
     "baseline_int8": TurboQuantConfig(
@@ -295,6 +295,20 @@ PROFILES: dict[str, TurboQuantConfig] = {
         "k4_v4_scaled",
         _polar(4, KEY_SEED),
         _polar(4, VALUE_SEED),
+        format_version=2,
+        precomputed_norm=True,
+    ),
+    "k5_v3_scaled": TurboQuantConfig(
+        "k5_v3_scaled",
+        _polar(5, KEY_SEED),
+        _polar(3, VALUE_SEED),
+        format_version=2,
+        precomputed_norm=True,
+    ),
+    "k6_v2_scaled": TurboQuantConfig(
+        "k6_v2_scaled",
+        _polar(6, KEY_SEED),
+        _polar(2, VALUE_SEED),
         format_version=2,
         precomputed_norm=True,
     ),

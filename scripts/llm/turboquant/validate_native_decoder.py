@@ -29,6 +29,7 @@ from htp_codec_validation import (
 from onnx import TensorProto, helper, numpy_helper
 
 from qai_hub_models.models.templates.llm.turboquant.constants import CODEBOOK_HEX
+from qai_hub_models.models.templates.llm.turboquant.packing import unpack_indices
 
 
 def build(args: argparse.Namespace) -> None:
@@ -37,7 +38,10 @@ def build(args: argparse.Namespace) -> None:
     sdkbin = args.sdk / "bin/x86_64-linux-clang"
     env = qairt_env(args.sdk, args.qnn_python)
     centroids = np.array(
-        [float.fromhex(x) for x in CODEBOOK_HEX[3 if args.lut == "mse3" else 4, 128]],
+        [
+            float.fromhex(x)
+            for x in CODEBOOK_HEX[3 if args.lut == "mse3" else args.bits, 128]
+        ],
         dtype=np.float16,
     )
     if args.lut == "mse3":
@@ -45,19 +49,20 @@ def build(args: argparse.Namespace) -> None:
     elif args.lut == "qjl_sign":
         centroids = np.repeat(np.array([-1, 1], dtype=np.float16), 8)
     (work / "lut.json").write_text(
-        json.dumps({"kind": args.lut, "values": centroids.tolist()}) + "\n"
+        json.dumps({"kind": args.lut, "bits": args.bits, "values": centroids.tolist()})
+        + "\n"
     )
     for tokens in args.tokens:
         name = f"native_t{tokens}"
-        packed_shape, scale_shape = [8, 1, tokens, 64], [8, 1, tokens, 1]
+        packed_shape, scale_shape = [8, 1, tokens, 16 * args.bits], [8, 1, tokens, 1]
         graph = helper.make_graph(
             [
                 helper.make_node(
-                    "Decode4",
+                    f"Decode{args.bits}",
                     ["packed", "scale", "centroids"],
                     ["decoded"],
                     domain="turboquant",
-                    name="decode4",
+                    name=f"decode{args.bits}",
                 )
             ],
             name,
@@ -74,7 +79,7 @@ def build(args: argparse.Namespace) -> None:
                     "decoded", TensorProto.FLOAT16, [8, 1, tokens, 128]
                 )
             ],
-            [numpy_helper.from_array(centroids.reshape(1, 1, 1, 16), "centroids")],
+            [numpy_helper.from_array(centroids.reshape(1, 1, 1, -1), "centroids")],
         )
         model = helper.make_model(
             graph,
@@ -94,9 +99,7 @@ def build(args: argparse.Namespace) -> None:
         )
         scale = np.exp(rng.uniform(-5, 8, scale_shape)).astype(np.float16)
         scale.flat[:6] = [0, 1, 2**-14, 2**-10, 32, 65504]
-        indices = np.stack((packed >> 4, packed & 15), axis=-1).reshape(
-            8, 1, tokens, 128
-        )
+        indices = unpack_indices(packed, args.bits, 128)
         expected = (
             centroids[indices].astype(np.float32) * scale.astype(np.float32)
         ).astype(np.float16)
@@ -249,6 +252,7 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[3])
+    parser.add_argument("--bits", type=int, choices=[2, 3, 4, 5, 6], default=4)
     parser.add_argument("--lut", choices=["mse4", "mse3", "qjl_sign"], default="mse4")
     parser.add_argument(
         "--device-dir", default="/data/local/tmp/qaihm_turboquant/native_smoke_20260918"
@@ -258,6 +262,8 @@ def main() -> None:
     parser.add_argument("--ndk", type=Path, default=DEFAULT_NDK)
     parser.add_argument("--adb", type=Path, default=DEFAULT_ADB)
     args = parser.parse_args()
+    if args.bits != 4 and args.lut != "mse4":
+        parser.error("QJL nibble LUT variants require --bits 4")
     for stage in ("build", "run", "compare"):
         if args.stage in (stage, "all"):
             globals()[stage](args)

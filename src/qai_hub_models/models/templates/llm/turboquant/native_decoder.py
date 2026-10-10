@@ -21,6 +21,20 @@ NATIVE_DOMAIN = "turboquant"
 NATIVE_OP = "Decode4"
 
 
+def native_op(config: TurboQuantConfig, kind: str) -> str:
+    bits = 4 if config.qjl and kind == "key" else getattr(config, kind).bits
+    return f"Decode{bits}"
+
+
+def native_table(config: TurboQuantConfig, kind: str) -> str:
+    if config.qjl and kind == "key":
+        return "tq_native_key3_centroids_fp16"
+    bits = getattr(config, kind).bits
+    return (
+        "tq_native_centroids_fp16" if bits == 4 else f"tq_native_b{bits}_centroids_fp16"
+    )
+
+
 def use_native_decoder(
     result: SurgeryResult, config: TurboQuantConfig
 ) -> SurgeryResult:
@@ -34,8 +48,8 @@ def use_native_decoder(
         not config.precomputed_norm
         or config.norm_dtype != "float16"
         or config.block_size != 128
-        or (config.key.bits != 4 and not (config.qjl and config.key.bits == 3))
-        or config.value.bits != 4
+        or config.key.bits not in (2, 3, 4, 5, 6)
+        or config.value.bits not in (2, 3, 4, 5, 6)
         or not result.attention_tiles
         or any(
             t["strategy"] != "rotated_precomputed_scale" for t in result.attention_tiles
@@ -43,23 +57,23 @@ def use_native_decoder(
         or any(t.get("decoder") for t in result.attention_tiles)
     ):
         raise ValueError(
-            "Native Decode4 requires rotated tiled attention and 4-bit format-2 KV, D=128"
+            "Native decoder requires rotated tiled attention and scaled 2..6-bit KV, D=128"
         )
     result = copy.deepcopy(result)
     graph = result.model.graph
-    table_name = "tq_native_centroids_fp16"
-    graph.initializer.append(
-        numpy_helper.from_array(
-            load_codebook(4, 128).astype(np.float16).reshape(1, 1, 1, 16), table_name
-        )
-    )
-    if config.qjl:
+    tables = set()
+    for kind in ("value", "key"):
+        table_name = native_table(config, kind)
+        if table_name in tables:
+            continue
+        tables.add(table_name)
+        values = load_codebook(getattr(config, kind).bits, 128)
+        if config.qjl and kind == "key":
+            values = np.tile(values, 2)
         graph.initializer.append(
             numpy_helper.from_array(
-                np.tile(load_codebook(3, 128), 2)
-                .astype(np.float16)
-                .reshape(1, 1, 1, 16),
-                "tq_native_key3_centroids_fp16",
+                values.astype(np.float16).reshape(1, 1, 1, -1),
+                table_name,
             )
         )
     replacements = {}
@@ -80,13 +94,11 @@ def use_native_decoder(
                         to=TensorProto.FLOAT16,
                     ),
                     helper.make_node(
-                        NATIVE_OP,
+                        native_op(config, kind),
                         [
                             prefix + "packed",
                             scale16,
-                            "tq_native_key3_centroids_fp16"
-                            if config.qjl and kind == "key"
-                            else table_name,
+                            native_table(config, kind),
                         ],
                         [output16],
                         domain=NATIVE_DOMAIN,
@@ -175,4 +187,44 @@ def with_reference_decoder(model: onnx.ModelProto) -> onnx.ModelProto:
             [helper.make_opsetid("", 17)],
         )
     )
+    for bits in (2, 3, 5, 6):
+        op = f"Decode{bits}"
+        if not any(
+            n.domain == NATIVE_DOMAIN and n.op_type == op for n in result.graph.node
+        ):
+            continue
+        nodes = []
+        # Per-coordinate byte/shift constants express the stream independently
+        # of the deployed HVX and encoder regrouping implementations.
+        position = np.arange(128, dtype=np.int64) * bits
+        const("offset", position // 8)
+        const("next_offset", np.minimum(position // 8 + 1, 16 * bits - 1))
+        const("shift", (2 ** (16 - bits - position % 8)).astype(np.int32))
+        const("mask_modulus", np.array(1 << bits, np.int32))
+        const("byte_base", np.array(256, np.int32))
+        const("flat_shape", np.array([-1], np.int64))
+        nodes.extend(
+            [
+                helper.make_node("Cast", ["packed"], ["bytes"], to=TensorProto.INT32),
+                helper.make_node("Gather", ["bytes", "offset"], ["first"], axis=3),
+                helper.make_node("Gather", ["bytes", "next_offset"], ["next"], axis=3),
+                helper.make_node("Mul", ["first", "byte_base"], ["upper"]),
+                helper.make_node("Add", ["upper", "next"], ["word"]),
+                helper.make_node("Div", ["word", "shift"], ["shifted"]),
+                helper.make_node("Mod", ["shifted", "mask_modulus"], ["indices"]),
+                helper.make_node("Reshape", ["centroids", "flat_shape"], ["lut"]),
+                helper.make_node("Gather", ["lut", "indices"], ["selected"], axis=0),
+                helper.make_node("Mul", ["selected", "scale"], ["decoded"]),
+            ]
+        )
+        result.functions.append(
+            helper.make_function(
+                NATIVE_DOMAIN,
+                op,
+                ["packed", "scale", "centroids"],
+                ["decoded"],
+                nodes,
+                [helper.make_opsetid("", 17)],
+            )
+        )
     return result

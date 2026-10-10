@@ -30,6 +30,8 @@ from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
 from qai_hub_models.models.templates.llm.turboquant.native_decoder import (
     NATIVE_DOMAIN,
     NATIVE_OP,
+    native_op,
+    native_table,
 )
 from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
     _head_concat,
@@ -95,11 +97,17 @@ def quantize_current_attention(
     acts = {e["name"]: e for e in result.encodings["activation_encodings"]}
 
     def native(
-        packed: str, scale: str, table: str, prefix: str, heads: int, seq: int
+        packed: str,
+        scale: str,
+        table: str,
+        prefix: str,
+        heads: int,
+        seq: int,
+        op: str = NATIVE_OP,
     ) -> str:
         sg.node("Cast", [scale], [prefix + "scale16"], to=TensorProto.FLOAT16)
         sg.node(
-            NATIVE_OP,
+            op,
             [packed, prefix + "scale16", table],
             [prefix + "native_fp16"],
             domain=NATIVE_DOMAIN,
@@ -129,12 +137,11 @@ def quantize_current_attention(
             restored = native(
                 io.packed_out,
                 io.norm_out,
-                "tq_native_key3_centroids_fp16"
-                if config.qjl and kind == "key"
-                else "tq_native_centroids_fp16",
+                native_table(config, kind),
                 prefix,
                 heads,
                 seq,
+                native_op(config, kind),
             )
         else:
             scale = io.norm_out

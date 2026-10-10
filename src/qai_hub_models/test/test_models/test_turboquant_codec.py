@@ -354,8 +354,8 @@ def test_dense_accepts_seed_without_frozen_fwht_signs() -> None:
 
 
 def test_config_rejects_unsupported_settings() -> None:
-    with pytest.raises(ValueError, match="3 or 4"):
-        KVCodecSpec(CodecKind.POLAR, bits=2, seed=42)
+    with pytest.raises(ValueError, match="2 through 6"):
+        KVCodecSpec(CodecKind.POLAR, bits=7, seed=42)
     with pytest.raises(ValueError, match="no bits"):
         KVCodecSpec(CodecKind.BASELINE, bits=4)
     with pytest.raises(ValueError, match="no bits"):

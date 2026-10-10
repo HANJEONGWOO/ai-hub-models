@@ -318,8 +318,12 @@ def cmd_run(args: argparse.Namespace) -> None:
         if trace_out.exists():
             raise FileExistsError(f"Refusing to reuse trace output: {trace_out}")
         remote_trace = f"{DEVICE_ROOT}/reports/{tag}_optrace"
-        if adb(args, "shell", f"test -e {remote_trace} && echo exists", check=False).strip():
-            raise FileExistsError(f"Refusing to reuse remote trace output: {remote_trace}")
+        if adb(
+            args, "shell", f"test -e {remote_trace} && echo exists", check=False
+        ).strip():
+            raise FileExistsError(
+                f"Refusing to reuse remote trace output: {remote_trace}"
+            )
         adb(args, "shell", "mkdir", "-p", remote_trace)
         runner_args.append(f"--optrace-dir {remote_trace}")
     if getattr(args, "profile_prefill_all", False):
@@ -332,7 +336,9 @@ def cmd_run(args: argparse.Namespace) -> None:
         runner_args.append(f"--sessions {args.sessions}")
     script = (
         f"cd {DEVICE_ROOT}/bin && export LD_LIBRARY_PATH={DEVICE_ROOT}/bin:/vendor/lib64 "
-        f"&& export ADSP_LIBRARY_PATH='{remote_bundle}:{DEVICE_ROOT}/bin:/vendor/dsp/cdsp:/vendor/lib/rfsa/adsp:/system/lib/rfsa/adsp:/dsp' "
+        # FastRPC uses semicolons, unlike the host LD_LIBRARY_PATH. Colons
+        # turn the entire list into one nonexistent directory on this device.
+        f"&& export ADSP_LIBRARY_PATH='{remote_bundle};{DEVICE_ROOT}/bin;/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp' "
         f"&& {' '.join(runner_args)} 2>&1; echo __RC__$?"
     )
     out = adb(args, "shell", script, check=False)
