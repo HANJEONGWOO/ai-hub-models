@@ -288,6 +288,180 @@ same 8-head x 256-token probe. These diagnostic counters are not end-to-end
 latency fractions. `comparison.json` and `comparison.csv` contain full results,
 including QNN/host timing, process memory and the preserved historical controls.
 
+### Asymmetric KV stage profiling (diagnostic only)
+
+`profile_asymmetric_optrace.py` compares K4/V4 with the **optimized** K5/V3 and
+K6/V2 execution packages. It preserves the original quantized DLCs, graphs,
+calibration, context binaries and prior performance reports. Only separate
+optrace-enabled contexts and a uniquely named diagnostic runner are deployed.
+Runtime package overrides use the same registration/prepare-library/hash checks
+as the validated HVX follow-up; original compilation provenance is retained.
+
+Each configuration runs **one** 897+128-token CL1024 generation session. The
+eight prefill chunks and decode steps 0/63/126 are captured within that session;
+they are different cache positions, not repeated benchmark trials. Greedy
+continuations can differ across configurations. No new uninstrumented timing or
+PPL run is part of this diagnostic. Generated IDs are checked against each
+configuration's historical uninstrumented result.
+
+```bash
+TQ_PROFILE_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/asymmetric_optrace_NEW
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/profile_asymmetric_optrace.py freeze \
+  --root "$TQ_PROFILE_ROOT" \
+  --original /mnt/d/ai-hub-models/binaries/turboquant/asymmetric_kv_20261010 \
+  --optimized /mnt/d/ai-hub-models/binaries/turboquant/asymmetric_hvx_20261010 \
+  --assets /mnt/d/ai-hub-models/binaries/turboquant/device_assets_cl1024
+for stage in build measure render summarize; do
+  PYTHONPATH=src venv/bin/python scripts/llm/turboquant/profile_asymmetric_optrace.py "$stage" \
+    --root "$TQ_PROFILE_ROOT" || break
+done
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/summarize_asymmetric_optrace.py \
+  --root "$TQ_PROFILE_ROOT"
+```
+
+Stage attribution uses physical HVX/HMX tracks, excludes duplicate views, and
+recovers verified HMX arithmetic hidden behind fused post-reshape names.
+Non-nibble `enc_pack_*` operations are packing, **not normalization**. All
+stages, K/V splits, hardware resources, host timings and source node counts are
+saved as JSON/CSV. Parallel busy cycles are work counters, not microseconds or
+TTFT/decode latency fractions. Source node counts are not executed kernel counts.
+Existing strict encoder numerical-validation limitations remain open.
+
+#### Measured results: asymmetric_optrace_20261010
+
+Artifacts: `/mnt/d/ai-hub-models/binaries/turboquant/asymmetric_optrace_20261010/`.
+All three configurations completed exactly one session and 44 graph traces;
+all 128 generated IDs match their respective historical uninstrumented run.
+The source DLCs were hash-checked before/after context generation and before
+deployment. The runtime library hashes match the historical results. K4/V4
+uses its unchanged nibble package; K5/V3 and K6/V2 use the optimized HVX package
+(`dab7bb8c...e19`), not the original scalar-byte-load implementation.
+
+The table below reports **million physical HVX/HMX busy cycles**, summed over
+parallel lanes. Prefill sums all eight chunks; decode is the final sampled
+step, with 1023 cached tokens. These are **not milliseconds, exclusive stage
+latencies, or TTFT fractions**. Different-stage intervals can overlap. Fused
+work is attributed to its surviving QNN owner (with the documented HMX reshape
+recovery), so these are execution-stage attributions, not isolated microbenchmarks.
+
+| Stage | Prefill K4/V4 | K5/V3 | K6/V2 | Decode K4/V4 | K5/V3 | K6/V2 |
+|---|---:|---:|---:|---:|---:|---:|
+| KV normalize | 224.721 | 235.893 | 229.491 | 1.450 | 1.362 | 1.350 |
+| KV Dense rotation | 1.633 | 1.530 | 1.550 | 0.018 | 0.021 | 0.018 |
+| Scalar index tree | 660.874 | 720.176 | 1028.252 | 2.969 | 4.029 | 6.114 |
+| Norm/effective-scale correction | 578.312 | 569.031 | 842.750 | 2.551 | 3.041 | 4.322 |
+| Packing | 136.077 | 1060.654 | 1108.444 | 1.720 | 6.162 | 5.338 |
+| Native past KV restore | 374.142 | 407.674 | 442.079 | 51.164 | 56.139 | 60.028 |
+| Native current KV restore | 57.820 | 63.919 | 65.873 | 2.383 | 2.471 | 3.188 |
+| Query rotation | 2.088 | 2.157 | 2.211 | 0.170 | 0.170 | 0.161 |
+| QK | 105.443 | 102.482 | 105.032 | 6.527 | 6.532 | 6.421 |
+| Score/mask/softmax | 390.987 | 384.557 | 395.069 | 3.928 | 3.815 | 3.773 |
+| AV | 70.748 | 69.145 | 70.124 | 8.007 | 8.205 | 7.957 |
+| Attention output rotation | 19.227 | 19.386 | 19.579 | 0.129 | 0.135 | 0.128 |
+| Layout/precision conversion | 894.710 | 902.815 | 905.716 | 60.869 | 58.798 | 56.006 |
+| Model linear | 171.684 | 172.120 | 172.480 | 6.807 | 7.141 | 6.747 |
+| Model other | 715.320 | 717.768 | 719.525 | 10.845 | 10.576 | 10.103 |
+| Unattributed named (mostly graph I/O) | 113.486 | 112.739 | 116.119 | 0.080 | 0.105 | 0.083 |
+| Total compute busy cycles | 4517.271 | 5542.049 | 6224.293 | 159.616 | 168.701 | 171.736 |
+
+Findings and implementation evidence:
+
+1. **Packing is the dominant additional prefill cost.** Its work increases
+   **7.795x / 8.146x**. K5/V3's packing delta is 924.578 million cycles out of
+   a net 1024.778-million-cycle increase (about 90% of *additional work*, not
+   90% of TTFT). K6/V2 adds 972.367 million packing cycles. The K-side
+   `enc_pack_columns` INT32 `q::Concat` alone takes **444.625 / 562.385 million
+   cycles** across prefill. The compiled inputs are `[8,128,16,1]` columns,
+   concatenated into widths 5/6. `_repack()` in `export.py` also emits slices,
+   shifts via Mul/Floor, masking arithmetic and float/INT32 conversions.
+   K4's dedicated nibble path avoids this generic stream-regrouping graph.
+   This is an implementation penalty, not an inevitable property of asymmetric
+   bit allocation. V3/V2 packing is also more expensive than V4 here.
+
+2. **K6 adds substantial scalar-tree and norm-lookup work.** Total prefill
+   index work is **1.556x**, and correction work is **1.457x** K4/V4. K5/V3's
+   corresponding ratios are **1.090x / 0.984x**: its lower V correction cost
+   offsets the higher K correction cost in prefill, so norm correction is
+   **not** a measured net K5/V3 prefill bottleneck. In `_scalar_index_tree()`,
+   comparisons are one per bit, but selecting their thresholds builds additional
+   Mul/Add/Where tensors. In `_select_centroid()`, the K-side affine-pair count
+   grows 4 -> 8 -> 16. Layer-0 source node counts (K / V, not executed kernels):
+
+   | Stage | K4/V4 | K5/V3 | K6/V2 |
+   |---|---:|---:|---:|
+   | Scalar index | 47 / 47 | 84 / 26 | 153 / 13 |
+   | Scale correction | 29 / 29 | 45 / 21 | 77 / 18 |
+   | Packing | 6 / 6 | 68 / 52 | 67 / 35 |
+
+3. **Decode retains a non-nibble restoration penalty despite using HVX.**
+   Past restoration costs **1.097x / 1.173x** at the final sample. The K-only
+   component is **25.098 -> 29.090 -> 33.311 million cycles**, whereas V is
+   **26.066 -> 27.049 -> 26.717**: fewer V bits do not recover the K overhead
+   in this implementation. `tq_decode_bits_hvx()` performs byte-LUT gathers,
+   variable shifts, shuffles and multi-bank centroid selection; 5-bit needs
+   two centroid banks and 6-bit four, versus one in the dedicated 4-bit path.
+   K4 also unpacks two rows per input vector. The old catastrophic partial-load
+   scalarization is already removed; these are the *remaining* costs.
+
+4. **Encoding still matters during decode.** Packing is **3.583x / 3.103x**,
+   scalar indexing **1.357x / 2.060x**, correction **1.192x / 1.694x**. At AR1,
+   the packing delta is distributed across slicing/layout/casts/arithmetic;
+   the prefill INT32 Concat is not its sole explanation. All three decode
+   positions show the same direction of extra codec work. K6's packing is
+   actually cheaper than K5's at AR1; its larger K tree/norm/LUT costs explain
+   why packing alone cannot rank the two configurations.
+
+5. **Missing HMX/HVX execution, larger cache capacity and Dense rotation are
+   not supported as primary explanations.** Rotation executes on HMX; Native
+   restoration on HVX. QK/AV and model-linear work are essentially unchanged.
+   Layout/precision remains a large *shared* decode cost but does not increase
+   with asymmetric packing in these samples. Stored KV is **28.875 MiB** and
+   I/O buffers **96.929 MiB** for all three. Equal storage does not imply equal
+   load instructions, intermediate traffic or vector utilization.
+
+SDK-reported accelerator execute times from the instrumented sessions, summed
+over four graph parts (ms; not full QNN calls and not benchmark replacements):
+
+| Sample | K4/V4 | K5/V3 | K6/V2 |
+|---|---:|---:|---:|
+| Prefill, all chunks | 448.277 | 531.317 | 548.667 |
+| Decode 0, 897 cached tokens | 23.468 | 26.582 | 26.434 |
+| Decode 63, 960 cached tokens | 26.049 | 27.138 | 29.199 |
+| Decode 126, 1023 cached tokens | 26.902 | 28.006 | 26.519 |
+
+In particular, **K6/V2 is not slower at every sampled wall-time point** despite
+its extra codec work. These three cache positions are not repeat trials. There
+is no variance estimate or proven frequency/scheduling cause for that reversal.
+Do not turn stage work ratios into end-to-end speedup predictions. Instrumented
+prefill QNN calls total **8.025 / 8.447 / 9.087 seconds** because profiling adds
+large serialization/transport overhead; they are not production TTFT.
+Battery temperatures before/after were 27.0/27.9, 27.2/28.3 and 27.5/28.5 C;
+these are not direct DSP temperature or frequency measurements.
+
+The existing **uninstrumented** results remain 1614.11 / 1398.19 / 1336.47
+prefill tok/s and 37.68 / 35.81 / 34.57 decode tok/s. Their mean decode QNN time
+is 24.774 / 26.065 / 27.149 ms and host KV preparation 1.166 / 1.252 / 1.186 ms.
+Thus the historical gap is primarily inside QNN, not host KV preparation.
+Those runs are historical single observations, not contemporaneous reruns.
+
+Recommended follow-up order, **not implemented in this diagnostic**: native
+bit-width-specific packing avoiding narrow INT32 Concat; K6 threshold/centroid
+selection without materializing the expanded graph; specialized non-nibble
+HVX unpack/LUT kernels. Preserve exact indexing, FP16 rounding, cache format
+and quality checks when evaluating any of these changes. Optimizing Dense
+rotation is not the evidence-backed first target for this particular gap.
+
+Outputs include `comparison.json`, `stage_comparison.csv`,
+`instrumented_host_timings.csv`, `source_inventory.json`, each group's full
+optrace summary JSON/CSV, raw traces, schematics and hash-guarded manifests.
+`protocol_clarification.json` corrects only an initial descriptive error:
+the runner pads the **first** one-valid-token AR128 chunk, followed by seven
+full chunks; inputs/execution never changed. One host SDK viewer stalled after
+writing `Complete!`; its output was preserved, and rerendering the same log
+exited normally with a byte-identical trace gzip. `viewer_retry.json` records
+this; **no device session was repeated**. Profiling/runtime regression tests:
+**55 passed**. No model algorithm/default/branch/commit change was made.
+
 ## FP16 KV + FP16-input attention control (opt-in)
 
 `baseline_fp16_kv_fp16_attn` is a separate, uncompressed control. It does **not**
