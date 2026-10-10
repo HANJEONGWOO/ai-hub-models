@@ -3003,6 +3003,287 @@ A/B/P config hash는 각각 `d7ac74594b85…`, `c4ccc9eec29a…`, `d1880b99ec22�
 이전과 동일하다. 전체 hash와 12개 context binary의 hash는
 `reports/experiment.json`, 기기의 실제 hash는 `device_before/after.json`에 있다.
 
-## 28. 출처
+## 28. NLL 기반 공유 K 회전 선택·독립 일반화 검증 (2026-10-09)
+
+### 28.1 사전 고정 조건
+
+브랜치 `exp/k-rotation-nll-selection-generalization`은 깨끗한
+`exp/k-rotation-mse-nll-validation`의 `dfb032145`에서 분기했다. 기존 산출물은
+보존하고, 기본 seed42는 유지한다. 이번 범위는 **8개 공유 회전 중 validation
+NLL로 선택하는 방법의 검증**이다. 재학습·레이어별 선택·새 codebook·재보정은
+없으며, LM tree/Dense MatMul/Native LUT, K4/V4, QJL-off, current-KV 압축,
+norm correction/FP16 effective scale, V와 가중치·calibration을 고정한다.
+
+실험 루트:
+`/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_nll_selection_20261009/`.
+
+- 후보: seed42–49, 128×128 FP32 공유 K 행렬, 대응 Query도 같은 회전.
+- 행렬 생성: 기존 `DenseQRRotation` 그대로. `default_rng(seed)` Gaussian FP64
+  행렬 → QR → R 대각 부호 보정 → det<0이면 Q 첫 열 부호 반전 → FP32 저장.
+  좌표 규약은 `row_vector @ R.T`이며 모든 레이어·KV head에 공유한다.
+- A=42, B=48, S=전체 validation 평균 NLL 최소 후보. **MSE는 선택에 사용하지 않는다.**
+- NLL 합/target 수가 정확히 동률이면 작은 seed를 선택한다.
+- 데이터 seed `2026100917`, fold seed `2026100918`, bootstrap seed `2026100920`.
+- 품질: 문서·후보당 **단회**. 성능: unique A/B/S를 교차 **3회**.
+- Bootstrap: 문서 쌍을 함께 복원 추출하는 20,000회 percentile 95% CI.
+  2.5/97.5% 선형 quantile을 사용하며, S를 고정하고 bootstrap 안에서 재선택하지 않는다.
+- 주 판정 S−A heldout NLL, 보조 판정 S−B/문서 일관성. CI가 0을 포함하면
+  점추정 이득이 있더라도 불확실함을 명시한다.
+
+### 28.2 문서 제외 이력·분할
+
+WikiText-2-raw revision `b08601e04326c79dfdd32d625aee71d232d685c3`의 공식
+validation/test split에서 각각 선택용/heldout을 만든다. 로컬에 남은 61개
+data/asset/기타 manifest를 검사했다. 최신 rotation 실험뿐 아니라 과거
+`task_rotation_20260929`의 train128/validation16/test16도 포함한다.
+기존 문서 제목은 `=`·중복 공백·대소문자를 정규화해 **174개 제목**을 제외했다.
+저장된 과거 token payload 65개(중복 hash 제거, `tokens.npz` 포함)와 연속
+**16-token 조각이 하나라도 겹치는 문서는 전체를 추가 제외**했다. 이 보수적
+검사는 같은 문서의 다른 offset을 재사용하지 않기 위한 것이며, 공유 문구가
+있는 미사용 문서도 제외할 수 있다. 로컬 실험에 대한 독립성이고, 기초 모델의
+사전학습 데이터 오염 여부를 보장하는 검사는 아니다.
+
+| 원본 split | 전체 문서 | 과거 제목 제외 | 1024 미만 제외 | 과거 token overlap 추가 제외 | 남은 후보 | 선택 |
+|---|---:|---:|---:|---:|---:|---:|
+| validation | 60 | 21 | 1 | 5 | 33 | 16 |
+| test → heldout | 62 | 22 | 4 | 5 | 31 | 16 |
+
+표본 수 조정 없이 **16+16문서**를 고정했다. 문서당 하나의 1024-token window를
+사용하며 title/text hash/offset/token hash를 기록한다. 구성별 split당 target 수는
+16×1023=**16,368개**다. Validation과 heldout은 별도 asset 디렉터리에 두어,
+validation 실행 중 heldout을 기기로 전송하거나 scoring하지 않는다.
+성능 측정용 기존 35/897-token prompt도 별도 디렉터리로 분리했다.
+
+4-fold는 validation 16문서를 고정 seed로 섞고 4개씩 나눈다. 문서0–15의
+fold는 `[1,2,1,2,0,3,2,3,1,0,2,1,0,3,0,3]`이다. 각 fold에서 나머지 12문서로
+seed를 고르고 제외한 4문서에서 NLL을 평가한다. 이는 **저장된 8×16 NLL 표의
+분석**이며 추가 기기 실행이나 후보 변경이 아니다. Fold별 선택 결과와 전체
+validation에서 고른 S의 최종 heldout 결과는 구분한다.
+
+### 28.3 빌드·감사·평가 절차
+
+A/B는 기존 설정·행렬·바이너리 hash가 일치할 때만 재사용한다. 나머지 6개 후보의
+KV part2/3/4만 최대 3개 작업으로 병렬 빌드하며, KV/회전이 없는 embedding
+part1은 동일 바이너리를 재사용한다. 새 wrapper의 config metadata만 각 후보에
+맞춰 기록하고 원본 metadata는 수정하지 않는다.
+기존 conversion report **94개**를 검색한 결과 이 설정의 완성 모델은
+seed42/48에만 존재했다. 검색 결과와 원본 report hash는
+`reports/existing_bundle_inventory.json`에 남겼다.
+
+감사는 K 회전 상수를 제외한 ONNX 구조/상수 및 원본 외부 weight 파일,
+quantized DLC op·dtype·shape·연결·parameter·calibration, 최종 context I/O와
+KV 형식을 비교한다. 기존 K와 대응 Query의 행렬 hash도 검증한다. Converter의
+임의 RMSNorm 표시 ID만 기존 규칙으로 정규화한다. 최종 HTP 내부 schedule/
+물리 layout은 공개되지 않아 직접 동일성을 주장하지 않는다. **이전 encoder
+수치 검증 실패는 그대로 추적하며 이 감사를 새 수치 통과로 해석하지 않는다.**
+
+조기 DLC 검사에서 seed43의 14,173개 op 중 RMSNorm 표시 이름 하나가
+`rms_norm_node___158339__707022`처럼 숫자 suffix를 두 번 가진 차이가 발견됐다.
+기준선·seed44·seed45의 동일 op와 연결/입출력/shape/dtype/parameter는 같았다.
+기존 단일 숫자 ID 정규화를 **op 표시 이름의 반복 숫자 suffix**까지 확장했고,
+tensor 이름이나 edge는 정규화하지 않았다. 수정 전 실제 차이는
+`reports/early_compiled_differences.json`, 제한적 조기 비교 결과는
+`early_compiled_signatures_normalized.json`에 보존했다. 이는 원본 모델 변경이나
+수치 실패를 무시한 것이 아니라 converter 표시 ID의 비결정성을 구분한 것이다.
+정식 전체 감사는 part 완료 후 작성되는 metadata를 포함해 별도로 수행한다.
+
+CPU 회귀 테스트는 기존 TurboQuant 경로를 포함해 **597개 통과**했다.
+새 검사는 문서 제외 규칙, NLL 집계/동률 처리, 고정 4-fold의 선택·평가 분리,
+paired bootstrap과 alias의 정확한 0 차이, 제한적 RMSNorm 표시 ID 정규화를
+포함한다. 결과는 `reports/cpu_tests_complete.xml`에 보존했다. 이 테스트 역시
+기존 encoder의 실기기 수치 검증 실패를 해소했다는 의미는 아니다.
+
+Validation은 문서 index에 따라 seed42–49의 실행 시작점을 순환시킨다.
+128건 완료 후 NLL 기반 S와 `selection_identity.json`을 고정한다. 그 전에
+heldout attempt가 있으면 선택 단계를 거부한다. Heldout은 unique A/B/S만
+실행하며 S=A 또는 S=B면 중복 평가하지 않는다. 새로운 프로세스·빈 KV cache로
+기존 HTP teacher-forced score 경로를 사용하고 CPU fallback/profiling은 없다.
+
+성능 조건은 CL1024, 35+128 및 897+128이며 각 조건에서 unique A/B/S 순서를
+반복마다 순환한다. 각 구성 3회 중앙값/min/max와 KV 저장량·I/O buffer·실제
+context binary bytes를 기록한다. S가 A/B의 alias라면 같은 표본을 참조하며
+독립적인 세 번째 모델의 측정인 것처럼 표시하지 않는다.
+
+재현 명령은 README의 “NLL-selected shared K rotation”에 있다. 원본과 다른
+새 루트에서 `freeze → build → audit → push → validation → selection → heldout
+→ performance → summarize` 순서로 실행한다. 실패한 attempt도 보존하고
+자동 재측정하거나 유리한 결과로 교체하지 않는다.
+
+동일 문서·offset을 정확히 재현하려면 새 `freeze` 대신 README의 `replay`
+명령을 사용한다. 새 freeze는 완료된 이번 문서도 과거 이력으로 제외하므로
+다른 cohort를 생성한다. Replay는 저장된 데이터와 후보 8개를 재사용하며,
+**이미 관측된 데이터의 재현이지 새 독립 검증이 아님**을 기록한다. 이번 실험에서
+replay를 실행하거나 측정을 추가한 것은 아니다.
+
+### 28.4 Validation NLL 선택·4-fold 안정성
+
+8개 후보의 48개 Attention 그래프 최종 감사가 모두 통과했다. 회전 상수를
+제외한 구조/dtype/encoding과 최종 context I/O가 같았으며, part2/3/4의
+source MatMul 수는 각각 1,880/1,880/1,505개, compiled DLC MatMul 수는
+1,280/1,280/1,024개로 AR128/AR1에서 모든 후보가 동일했다. 공유 embedding
+part1 바이너리도 동일하다. 각 후보의 context binary 합계는 정확히
+**1,702,166,528 bytes (1,623.3125 MiB)**다. 감사 원본은
+`reports/graph_audit.json`, 기기 파일·실행 코드 hash는
+`reports/execution_identity.json`에 기록했다.
+
+Validation 16문서 × 8후보의 **128회 단회 scoring**을 완료했다. 후보마다
+16,368개 target이며, 아래 PPL은 `exp(NLL_sum / 16368)`이다.
+
+| 공유 K seed | 평균 NLL | PPL | 역할 |
+|---|---:|---:|---|
+| 42 | 3.532722 | 34.216968 | A, 기본값 유지 |
+| 43 | 3.480258 | 32.468087 | 후보 |
+| 44 | 3.644171 | 38.251049 | 후보 |
+| 45 | 3.472554 | 32.218933 | 후보 |
+| 46 | 3.634974 | 37.900858 | 후보 |
+| 47 | 3.561639 | 35.220865 | 후보 |
+| **48** | **3.351261** | **28.538687** | **B = S** |
+| 49 | 3.535594 | 34.315388 | 후보 |
+
+전체 validation의 NLL 최소 후보 **S는 seed48**이다. 과거 MSE로 선택한 B와
+같은 행렬·바이너리이며 독립적인 세 번째 모델이 아니다. `selection.json`과
+`selection_identity.json`을 고정한 뒤 heldout은 unique seed42/48만 실행한다.
+S−B는 같은 후보의 차이이므로 정확히 0이며 중복 측정하지 않는다.
+
+저장된 validation NLL 표만으로 계산한 4-fold 결과는 다음과 같다. 각 fold의
+나머지 12문서에서 선택하고 제외한 4문서에서 평가했다. 추가 기기 실행은 없다.
+
+| 제외 fold | 선택 seed | 제외 문서 평균 NLL | A 대비 NLL 차이 | B 대비 차이 |
+|---|---:|---:|---:|---:|
+| 0 | 48 | 3.240714 | −0.159044 | 0 |
+| 1 | 48 | 3.325045 | −0.332297 | 0 |
+| 2 | 48 | 3.375253 | −0.089889 | 0 |
+| 3 | 48 | 3.464030 | −0.144614 | 0 |
+
+**4/4 fold에서 seed48을 선택**했고, 제외 fold의 NLL도 모두 A보다 낮았다.
+Out-of-fold 평균 NLL은 3.351261, PPL은 28.538687, A 대비 NLL 차이는
+−0.181461이다. 이번에는 모든 fold가 같은 seed를 골라 full-validation S의
+validation 집계와 수치가 같지만, 이것을 독립 heldout 검증으로 해석하지 않는다.
+문서별 값과 fold 구성은 `validation_nll.csv`, `validation_summary.csv`,
+`folds.json`에 보존했다. 데이터 집합이 달라 이전 4문서 실험의 절대 PPL과
+직접 비교하지 않는다.
+
+### 28.5 독립 heldout 결과·문서별 편중
+
+선택을 잠근 뒤 heldout 16문서에서 A와 B/S를 각각 한 번씩 평가했다
+(32회, 구성당 16,368 targets). S=B이므로 세 번째 모델을 중복 실행하지 않았다.
+
+| 지표 | A: seed42 | B = S: seed48 |
+|---|---:|---:|
+| NLL 합 | 52,762.44274 | 52,123.36107 |
+| 평균 NLL | 3.223512 | 3.184467 |
+| 전체 PPL | 25.116171 | 24.154418 |
+| S−A 평균 NLL | 기준 | −0.039045 |
+| S−A PPL 상대 변화 | 기준 | −3.8292% |
+
+문서 단위 paired bootstrap 20,000회(seed 2026100920)의 S−A 평균 NLL
+**95% 신뢰구간은 [−0.108068, +0.023215]**다. 점추정은 개선이지만 구간이
+0을 포함하므로 **독립 문서에서의 개선을 확정하지 못한다.** 이는 효과가
+정확히 0임을 증명한 것도 아니다. 신뢰구간은 고정된 S와 이번 문서 표본에
+조건부이며 실행시간 변동이나 모든 도메인으로의 일반화를 포괄하지 않는다.
+
+S−B는 동일 후보이므로 평균 NLL 차이 0, PPL 차이 0, 구간 [0, 0]이다.
+이는 독립 실행에서 차이가 우연히 0으로 나온 결과가 아니라 **같은 결과를
+alias로 참조한 것**이며, B 대비 새 품질 이득은 없다.
+
+| Heldout 문서 | A 평균 NLL | B/S 평균 NLL | S−A |
+|---|---:|---:|---:|
+| 1933 Treasure Coast hurricane | 3.225403 | 3.069340 | −0.156063 |
+| German Type UB I submarine | 2.921484 | 2.983406 | +0.061921 |
+| Olmec colossal heads | 2.774587 | 2.694794 | −0.079793 |
+| The Portage to San Cristobal of A.H. | 3.999685 | 3.858653 | −0.141032 |
+| Ise-class battleship | 2.919012 | 2.942188 | +0.023177 |
+| Ben Amos | 2.486336 | 2.492962 | +0.006626 |
+| Manila | 2.884114 | 2.805662 | −0.078453 |
+| Ironclad warship | 3.515205 | 3.373948 | −0.141257 |
+| 2010 Claxton Shield | 2.946119 | 2.891956 | −0.054163 |
+| No. 20 Squadron RAAF | 2.895112 | 2.977239 | +0.082127 |
+| Imagism | 3.766754 | 3.839572 | +0.072819 |
+| Osbert de Bayeux | 2.959784 | 3.096099 | +0.136316 |
+| Nero | 3.379764 | 3.329227 | −0.050536 |
+| QuackShot | 3.752966 | 3.923956 | +0.170990 |
+| Little Gidding (poem) | 4.128590 | 3.727998 | −0.400592 |
+| Kiss You (One Direction song) | 3.021276 | 2.944476 | −0.076800 |
+
+개선 **9문서**, 악화 **7문서**, 동일 0문서다. 최대 개선은 Little Gidding,
+최대 악화는 QuackShot이다. 개선량 상위 3문서(Little Gidding, 1933 Treasure
+Coast hurricane, Ironclad warship)가 **양의 NLL 감소량 합의 59.21%**를
+차지한다. 이 분모는 개선 문서의 감소량만 합한 것으로, 악화까지 상쇄한
+순이득을 뜻하지 않는다. 문서·후보를 제외하거나 변경하지 않았다.
+문서별 NLL 합/평균/PPL은 `heldout_nll.csv`, A/B/S 차이는
+`heldout_deltas.csv`, 모든 원시 값과 구간은 `comparison.json`에 있다.
+
+### 28.6 교차 3회 성능·저장량
+
+CL1024, greedy 생성 128토큰, 실제 decode step 127회. Short는 prompt35,
+long은 prompt897이다. 각 조건의 실행 순서는 A→B/S, B/S→A, A→B/S로
+순환했다. 품질 scoring과 분리한 비계측 측정이며 총 **12회**다.
+표의 값은 **중앙값 [최솟값, 최댓값]**이다.
+
+| 조건·지표 | A: seed42 | B = S: seed48 |
+|---|---:|---:|
+| Short TTFT (ms) | 70.531 [67.937, 71.165] | 68.411 [66.913, 71.209] |
+| Short prefill (tok/s) | 503.202 [498.655, 522.592] | 517.493 [498.425, 527.149] |
+| Short decode (tok/s) | 38.381 [38.372, 38.575] | 38.547 [38.318, 38.551] |
+| Long TTFT (ms) | 565.388 [562.952, 569.711] | 566.394 [553.449, 569.666] |
+| Long prefill (tok/s) | 1,589.412 [1,577.234, 1,596.301] | 1,586.525 [1,577.274, 1,623.638] |
+| Long decode (tok/s) | 37.351 [37.129, 37.731] | 37.579 [37.190, 37.620] |
+| Host KV (MiB, 모든 실행 동일) | 28.875 | 28.875 |
+| I/O buffer (MiB, 모든 실행 동일) | 96.929203 | 96.929203 |
+| Context binaries 합계 (MiB) | 1,623.3125 | 1,623.3125 |
+
+Long decode 중앙값 차이는 +0.61%, TTFT 차이는 +0.18%로, 3회 범위가
+겹친다. **뚜렷한 속도 우위나 엄밀한 시간 동등성을 입증하지 않는다.** 저장량과
+I/O buffer bytes는 정확히 동일하다(각각 30,277,632 / 101,637,636 bytes).
+Long 종료 VmRSS 중앙값은 A 149.730 / B/S 149.902 MiB, VmHWM은
+604.352 / 604.516 MiB다. 이는 host 프로세스 지표이며 NPU 내부 전체 메모리
+사용량을 뜻하지 않는다. 각 3회 원시 값은 `comparison.json`에 보존했다.
+
+성능 실행 전후 배터리 온도 범위는 A 35.3–36.9℃, B/S 35.7–37.0℃,
+Android thermal status는 모두 0이었다. 배터리 온도는 칩 온도가 아니며,
+이 기록만으로 HTP clock이 완전히 같았다고 주장하지 않는다. 모든 실행의
+before/after snapshot을 보존했다. Busy-cycle 계측은 하지 않았다.
+
+### 28.7 판정·보존·재현
+
+이번 결과는 **validation NLL 선택과 fold 안정성은 확인됐으나, 독립 heldout
+개선의 확실성은 확보하지 못한 결과**다. Heldout 점추정 PPL은 3.83% 낮지만
+NLL 차이의 신뢰구간이 0을 포함하고 7/16문서에서는 악화했다. Validation의
+−0.181461 NLL 차이를 heldout의 효과로 해석하면 안 된다.
+
+NLL 최소 후보가 기존 B와 같아 B 대비 추가 이득은 없다. B는 다른 과거
+데이터의 MSE로 선택됐으므로, 이를 NLL 선택법이 MSE 선택법보다 일반적으로
+우수하거나 동등하다는 실험으로 해석할 수도 없다. 공유 회전 후보 8개와
+이번 WikiText 문서 표본에 한정한 선택·검증 결과로 보존한다. 새로운 학습,
+레이어별 선택, calibration 변경, 4B 확장이나 기본값 승격은 수행하지 않았다.
+**기본 seed42와 이전 encoder 수치 검증 실패 상태를 유지했다.**
+
+최종 별도 검산에서 validation 128회 + heldout 32회 + 성능 12회 =
+**172개 attempt/결과가 계획과 일치**했다. 원시 NLL에서 선택/fold/평균/PPL을
+재계산하고, 별도 문서 평균 배열로 bootstrap 구간을 계산해 일치를 확인했다.
+성능 median/min/max도 원본 3회로 재계산했다. 실행 코드 hash 및 기존 산출물
+보존 검증도 통과했다. 검산은 저장된 결과의 분석이며 기기를 추가 실행하지
+않았다. `reports/independent_verification.json`, `reports/preservation.json`에
+검증 결과를 기록했다.
+
+실험 브랜치: `exp/k-rotation-nll-selection-generalization`.
+산출물 루트:
+`/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_nll_selection_20261009`.
+
+- 사전 고정: `protocol.json`, `prior_data_inventory.json`, `data_manifest.json`,
+  `freeze_identity.json`, `source_identity.json`.
+- 회전·설정: `rotations/seed42.json`–`seed49.json`, `candidates.json`.
+- 빌드·실행 검증: `reports/graph_audit.json`, `reports/execution_identity.json`,
+  seed별 build/push 로그와 원시 실행 JSON.
+- 선택: `selection.json`, `selection_identity.json`,
+  `reports/validation_nll.csv`, `validation_summary.csv`, `folds.json`.
+- 독립 평가·성능: `reports/heldout_nll.csv`, `heldout_deltas.csv`,
+  `comparison.json`, `cpu_tests_complete.xml`, `independent_verification.json`.
+
+재현 명령은 README의 동일 cohort `replay` 절차를 사용한다. 이번 heldout은
+평가를 완료했으므로 이후 이 문서로 방법을 선택한다면 **다시 독립 test라고
+부르지 않는다.** 새로운 표본을 뽑는 `freeze`와 기존 결과 재현을 구분해야 한다.
+
+## 29. 출처
 
 turboquant_plus(Copyright 2026 Tom Turney, Apache-2.0, https://github.com/TheTom/turboquant_plus, commit `ba52ad1`). 이 구현은 참조 코드를 복사하지 않고 알고리즘을 재구현했다. 참조를 실행해 얻은 codebook·sign 상수와 golden fixture에는 출처와 commit을 기록했다.

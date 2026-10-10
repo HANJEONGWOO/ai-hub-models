@@ -249,6 +249,89 @@ not proof of no statistical correlation or a particular causal mechanism.
 Use whole-model validation NLL as an adoption gate; new objective/training work
 was not performed. See design §27 and `k_rotation_mse_nll_20261009/reports/`.
 
+## NLL-selected shared K rotation: independent generalization (evaluation only)
+
+`rotation_nll_selection.py` freezes shared Dense QR seeds42..49, 16 unused
+validation articles and 16 unused heldout articles before any new scoring.
+The prior-data inventory includes the older task-rotation experiment, not just
+the latest A/B/P runs: canonical article titles and any contiguous 16-token
+overlap with saved old inputs exclude the entire article. Each selected article
+has exactly one frozen 1024-token window and 1023 next-token targets.
+
+`benchmark_rotation_nll_selection.py` reuses matching seed42/48 binaries and the
+rotation-free embedding part; only six missing candidates' KV parts are built
+(three concurrent build workers). A source/DLC/context-I/O audit allows only the
+shared K/Query matrix change. V, codebook, weights/calibration, packed KV format
+and execution defaults remain unchanged. Old encoder numerical failures are
+retained; the audit is not a new numerical-fidelity pass.
+
+```bash
+export PYTHONPATH=src
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+TQ_SELECT=/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_nll_selection_new
+venv/bin/python scripts/llm/turboquant/rotation_nll_selection.py freeze --root "$TQ_SELECT"
+for stage in build audit push validation selection heldout performance summarize; do
+  venv/bin/python scripts/llm/turboquant/benchmark_rotation_nll_selection.py "$stage" \
+    --root "$TQ_SELECT" || break
+done
+```
+
+All paths must be fresh; failed attempts/results are not automatically retried or
+overwritten. The first script records immutable protocol/data/candidate hashes.
+The second freezes the execution-code and device-file identity before scoring.
+Validation runs every seed once per document in a cyclic crossed order (128 runs).
+Selection minimizes total NLL / total target count; exact ties choose the smaller
+seed. MSE is never a selection input. Four fixed document folds reuse the saved
+NLL table (12 select / 4 evaluate) without extra device runs.
+
+The full-validation winner S is locked before heldout. Only unique A/B/S seeds
+are evaluated on heldout, once per document: if S equals A or B, it is an alias,
+not an independently evaluated third model. The paired bootstrap uses 20,000
+fixed-seed document resamples, percentile 95% intervals for mean NLL differences,
+with S fixed (no reselection on heldout or inside bootstrap). Performance uses
+three cyclic repeats of unique A/B/S on both 35+128 and 897+128, CL1024. Report
+median/min/max; do not interpret three samples as proof of timing equivalence.
+
+Artifacts include `prior_data_inventory.json`, `data_manifest.json`,
+`rotations/seed*.json`, `candidates.json`, `selection.json`, validation NLL CSV,
+fold results, heldout NLL/delta CSV and paired intervals, all raw runs, performance,
+binary sizes and graph/device hashes. Primary judgment is heldout S−A; an interval
+including zero makes any point-estimate improvement uncertain. The old MSE-selected
+B used different data, so this does not establish NLL selection's general
+superiority. No default promotion, new training, layerwise selection or 4B work
+is performed. After evaluation these heldout documents are no longer a fresh
+independent test set for future tuning. See design §28.
+
+Completed 2026-10-09: **S = seed48 = B**, also selected in all four validation
+folds. Heldout mean NLL was A 3.223512 vs B/S 3.184467; PPL was
+25.116171 vs 24.154418 (−3.83%). However, paired 95% NLL-difference CI
+**[−0.108068, +0.023215] includes zero**, with 9 improved / 7 worse documents:
+generalization improvement remains uncertain. There is no additional gain over B.
+Long decode medians were 37.351 vs 37.579 tok/s with overlapping three-run ranges;
+KV (28.875 MiB), I/O (96.929203 MiB) and binary sizes were identical. Defaults
+remain unchanged. All 48 graph audits and 597 CPU tests passed; 160 quality runs
+plus 12 performance runs matched the frozen protocol, with no measurement retries.
+Full tables, per-document results, uncertainty and artifact paths are in design §28.
+
+To reproduce the **same saved cohort**, do not call `freeze` again: its inventory
+would correctly exclude documents from the completed experiment. Instead use a
+new root and the explicit replay stage, which also reuses all eight audited
+binaries. Replay is labelled as reproduction of already-observed data, not a new
+independent test. This command is provided for future reproduction; it is not an
+extra measurement in the reported experiment.
+
+```bash
+TQ_SELECT=/mnt/d/ai-hub-models/binaries/turboquant/k_rotation_nll_selection_replay
+venv/bin/python scripts/llm/turboquant/rotation_nll_selection.py replay \
+  --root "$TQ_SELECT" \
+  --replay-source /mnt/d/ai-hub-models/binaries/turboquant/k_rotation_nll_selection_20261009
+for stage in audit push validation selection heldout performance summarize; do
+  venv/bin/python scripts/llm/turboquant/benchmark_rotation_nll_selection.py "$stage" \
+    --root "$TQ_SELECT" || break
+done
+```
+
 ## FP16 KV + FP16-input attention control (opt-in)
 
 `baseline_fp16_kv_fp16_attn` is a separate, uncompressed control. It does **not**
