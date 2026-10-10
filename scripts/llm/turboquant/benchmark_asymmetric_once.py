@@ -368,7 +368,11 @@ def existing_decoder_diagnostics(root: Path, package: dict[str, Any]) -> dict[st
             "binary_sha256": digest(binary),
             "command": [str(objdump), "-d", str(binary)],
             "static_instruction_counts": instructions,
-            "interpretation": "Non-nibble partial-row memcpy is lowered to scalar DSP byte loads and vector insertions. LUT and bit extraction still use HVX; this is not an ARM/CPU fallback. Static counts do not quantify full-model latency attribution.",
+            "interpretation": (
+                "Non-nibble partial-row memcpy is lowered to scalar DSP byte loads and vector insertions. LUT and bit extraction still use HVX; this is not an ARM/CPU fallback. Static counts do not quantify full-model latency attribution."
+                if any(v["memub("] for v in instructions.values())
+                else "No scalar byte loads or vector insertions in the inspected decoder functions; full-width HVX input loads replace the historical partial-row scalarization. Small slices still use one bounded scratch copy. Static counts do not quantify full-model latency attribution."
+            ),
         },
     }
 

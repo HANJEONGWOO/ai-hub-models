@@ -203,7 +203,10 @@ def run(args: argparse.Namespace) -> None:
     for path in work.iterdir():
         if path.suffix in (".bin", ".raw", ".txt"):
             adb(args, "push", windows_path(path), remote + "/")
-    prefix = f"cd {shlex.quote(remote)} && export LD_LIBRARY_PATH={shlex.quote(remote)}:/vendor/lib64 && export ADSP_LIBRARY_PATH={shlex.quote(remote)}:/vendor/dsp/cdsp:/vendor/lib/rfsa/adsp:/system/lib/rfsa/adsp:/dsp"
+    adsp_paths = (
+        f"{remote};/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp"
+    )
+    prefix = f"cd {shlex.quote(remote)} && export LD_LIBRARY_PATH={shlex.quote(remote)}:/vendor/lib64 && export ADSP_LIBRARY_PATH={shlex.quote(adsp_paths)}"
     (work / "device").mkdir(exist_ok=True)
     for tokens in args.tokens:
         name = f"native_t{tokens}"

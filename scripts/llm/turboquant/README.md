@@ -194,6 +194,100 @@ configuration/data/binary hashes, original failed diagnostics, partitioned
 build provenance and disassembly/probe evidence in `comparison.json`.
 The branch remains `main`, no commit was created, and K4/V4 stays the default.
 
+### Follow-up: bounded HVX input loads for asymmetric decoding
+
+The subsequent optimization replaces the **historical partial-row scalar
+loads** above without changing the cache format, codebooks, encoder graphs or
+FP16 decode results. K4/V4's existing nibble kernel and default profile remain
+unchanged. Work is on `exp/asymmetric-kv-quantization`, without a new commit.
+
+The 2/3/5/6-bit kernels now load 128 bytes at a time with HVX. Loads must fit
+inside the current QHPI slice; final rows use an end-anchored vector and lane
+rotation. Slices smaller than one vector use one zero-padded scratch copy.
+No allocator padding or neighbouring slice is assumed readable. LUT banks that
+cannot contribute to valid indices are skipped. Disassembly confirms **zero
+scalar byte-load instructions** in the inspected decoder functions, replacing
+the former 32/48/80/96 byte loads per row.
+
+The unchanged x86 prepare library, registration source/XML, operation order,
+function names, layouts and SDK are checked before an explicit runtime-only
+QHPI override. Original `convert_report.json`, context binaries and graph hashes
+are preserved; runtime reports separately identify both compiled and execution
+packages. This reuse is specific to the verified execute-only change, not a
+general promise that arbitrary Native packages can be swapped. Default push
+behavior is unchanged; runtime overrides are opt-in and additionally require
+valid original/replacement prepare libraries.
+
+Reproduction from the preserved first experiment:
+
+```bash
+TQ_HVX_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/asymmetric_hvx_NEW
+TQ_PREVIOUS=/mnt/d/ai-hub-models/binaries/turboquant/asymmetric_kv_20261010
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/native_decoder/build.py \
+  --out "$TQ_HVX_ROOT/native" --test-hvx
+for bits in 2 3 4 5 6; do
+  PYTHONPATH=src venv/bin/python scripts/llm/turboquant/validate_native_decoder.py all \
+    --bits "$bits" --tokens 1 3 256 --package "$TQ_HVX_ROOT/native" \
+    --work-dir "$TQ_HVX_ROOT/probe_b${bits}" \
+    --device-dir "/data/local/tmp/qaihm_turboquant/asymmetric_hvx_NEW_b${bits}" || break
+done
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_asymmetric_hvx_once.py prepare \
+  --work-dir "$TQ_HVX_ROOT" --previous "$TQ_PREVIOUS"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_asymmetric_hvx_once.py push \
+  --work-dir "$TQ_HVX_ROOT"
+for group in k5_v3 k6_v2; do
+  for stage in functional performance quality; do
+    PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_asymmetric_hvx_once.py "$stage" \
+      --groups "$group" --work-dir "$TQ_HVX_ROOT" || break 2
+  done
+done
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_asymmetric_hvx_once.py summarize \
+  --work-dir "$TQ_HVX_ROOT"
+```
+
+All probe cases must match the FP16 oracle bit-for-bit before full-model runs.
+The driver also requires a successful full-model load/reset check before its
+one short35+128 and one long897+128 performance session per profile. Each legacy
+WikiText window is scored once. Historical K4/V4 and asymmetric results are
+reused, not contemporaneously remeasured; no timing variance estimate is made.
+Artifacts are under `/mnt/d/ai-hub-models/binaries/turboquant/asymmetric_hvx_20261010/`.
+
+Long-condition results (897+128, fixed CL1024; old columns are preserved
+historical measurements, optimized columns are fresh single measurements):
+
+| Metric | K4/V4 reference | K5/V3 before | K5/V3 optimized | K6/V2 before | K6/V2 optimized |
+|---|---:|---:|---:|---:|---:|
+| TTFT (ms) | 556.62 | 2304.20 | 642.54 | 2458.90 | 672.17 |
+| Prefill (tok/s) | 1614.11 | 389.46 | 1398.19 | 364.94 | 1336.47 |
+| Decode (tok/s) | 37.68 | 4.23 | 35.81 | 3.98 | 34.57 |
+| PPL, four WikiText windows | 25.660831 | 22.469806 | 22.469806 | 19.844793 | 19.844793 |
+
+Decode throughput improves about **8.46x / 8.69x** over the initial asymmetric
+implementation. It is still approximately **5.0% / 8.3% below** the historical
+K4/V4 throughput; prefill is approximately **13.4% / 17.2% below**. Do not claim
+identical performance or statistical equivalence. The catastrophic decoder
+inefficiency is removed, while the higher-bit encoder's tree/norm/packing
+work remains unchanged. In particular, earlier encoder diagnostics identify
+K5/K6's small-column INT32 packing concat as a possible follow-up; this run does
+not individually attribute the remaining full-model latency to that operation.
+
+Short-condition (35+128) optimized TTFT is **75.70 / 81.50 ms**, prefill
+**464.43 / 433.22 tok/s**, and decode **36.80 / 35.34 tok/s** for K5/V3 and K6/V2.
+Host KV remains **28.875 MiB**, and I/O buffers remain **96.929 MiB** for both.
+All four reported window NLL sums and both generated token sequences are
+identical to each profile's prior result. This is not a bit-exact-logit claim.
+
+Validation: **601 Python regression tests**, **600 host HVX cases** (including
+210 protected-page cases), and all five bit widths on HTP at 1/3/256 tokens
+passed. Every isolated HTP output matches the FP16 LUT oracle bit-for-bit.
+Existing encoder strict scale-tolerance failures are unchanged and remain
+separate from decoder correctness. `decoder_diagnostics.json` records the
+measured library disassembly and isolated probe counters: Decode2/3/4/5/6 use
+**0.303 / 0.338 / 0.327 / 0.356 / 0.396 million cycles**, respectively, for the
+same 8-head x 256-token probe. These diagnostic counters are not end-to-end
+latency fractions. `comparison.json` and `comparison.csv` contain full results,
+including QNN/host timing, process memory and the preserved historical controls.
+
 ## FP16 KV + FP16-input attention control (opt-in)
 
 `baseline_fp16_kv_fp16_attn` is a separate, uncompressed control. It does **not**

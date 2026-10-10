@@ -97,6 +97,66 @@ def push_if_changed(args: argparse.Namespace, local: Path, remote: str) -> bool:
     return True
 
 
+def native_runtime_package(
+    compiled: dict | None, override_path: Path | None, sdk: Path
+) -> tuple[dict | None, dict]:
+    """Validate an explicit execute-only QHPI replacement without rewriting provenance.
+
+    Dynamic QHPI function names/signatures must remain stable. Requiring identical
+    registration source, XML and x86 prepare binary restricts this override to
+    execution-kernel changes. Device correctness/context-load probes are still
+    required; this is not a general package ABI compatibility guarantee.
+    """
+    if override_path is not None and not compiled:
+        raise ValueError("Native runtime override requires a compiled Native bundle")
+    if not compiled:
+        return None, {}
+    selected = compiled
+    provenance = {}
+    if override_path is not None:
+        manifest = override_path.expanduser().resolve() / "manifest.json"
+        selected = json.loads(manifest.read_text())
+        for key in ("package", "interface", "operations", "qairt_sdk"):
+            if key not in compiled or selected.get(key) != compiled[key]:
+                raise ValueError(f"Native runtime ABI mismatch: {key}")
+        for name in ("decoder.cpp", "Decode4.xml"):
+            expected = compiled.get("source_files", {}).get(name)
+            if not expected or selected.get("source_files", {}).get(name) != expected:
+                raise ValueError(f"Native runtime registration mismatch: {name}")
+        if (
+            selected["libraries"]["x86_64-linux-clang"]["sha256"]
+            != compiled["libraries"]["x86_64-linux-clang"]["sha256"]
+        ):
+            raise ValueError("Native runtime override changed the x86 prepare library")
+        if Path(selected["qairt_sdk"]).resolve() != sdk.expanduser().resolve():
+            raise ValueError("Native runtime override SDK differs from the active SDK")
+        provenance = {
+            "compiled_native_decoder": compiled,
+            "native_runtime_override": {
+                "manifest": str(manifest),
+                "manifest_sha256": sha256_file(manifest),
+                "abi_checks": [
+                    "identical package/interface/operation order/SDK",
+                    "identical decoder.cpp and Decode4.xml source hashes",
+                    "identical x86 prepare library",
+                    "verified compiled and runtime library file hashes",
+                ],
+                "scope": "Explicit execute-only QHPI override; compiled contexts and their original native dependency remain unchanged. Requires separate device correctness and context-load validation.",
+            },
+        }
+    # Ordinary deployment needs only the runtime DSP library, as before.
+    # An archived x86 prepare file is required only for an explicit ABI override.
+    libraries = (
+        [v for p in (compiled, selected) for v in p["libraries"].values()]
+        if override_path is not None
+        else [compiled["libraries"]["hexagon-v81"]]
+    )
+    for library in libraries:
+        if sha256_file(Path(library["path"])) != library["sha256"]:
+            raise ValueError("Native library changed since its manifest was recorded")
+    return selected, provenance
+
+
 def cmd_assets(args: argparse.Namespace) -> None:
     out: Path = args.out.expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -171,6 +231,13 @@ def cmd_push(args: argparse.Namespace) -> None:
     )
     if not bins:
         raise FileNotFoundError(f"No part*_of_*.bin in {bundle}")
+    conversion = bundle / "convert_report.json"
+    metadata = json.loads(conversion.read_text()) if conversion.exists() else {}
+    native, provenance = native_runtime_package(
+        metadata.get("native_decoder"),
+        getattr(args, "native_runtime_package", None),
+        args.sdk,
+    )
     remote_bundle = f"{DEVICE_ROOT}/bundles/{args.name}"
     adb(args, "shell", "mkdir", "-p", f"{DEVICE_ROOT}/bin", remote_bundle)
     for rel in DEVICE_LIBS:
@@ -184,8 +251,6 @@ def cmd_push(args: argparse.Namespace) -> None:
             {"name": local.name, "sha256": sha256_file(local), "pushed": changed}
         )
         print(f"{local.name}: {'pushed' if changed else 'up to date'}", flush=True)
-    conversion = bundle / "convert_report.json"
-    metadata = json.loads(conversion.read_text()) if conversion.exists() else {}
     runtime_metadata = {
         k: metadata[k]
         for k in (
@@ -200,7 +265,8 @@ def cmd_push(args: argparse.Namespace) -> None:
         )
         if k in metadata
     }
-    if native := metadata.get("native_decoder"):
+    runtime_metadata.update(provenance)
+    if native:
         lib = native["libraries"]["hexagon-v81"]
         local = Path(lib["path"])
         if sha256_file(local) != lib["sha256"]:
@@ -385,7 +451,13 @@ def cmd_run(args: argparse.Namespace) -> None:
     if runtime.get("config_hash"):
         report["config_hash"] = runtime["config_hash"]
     report["quantize_current_kv"] = runtime.get("quantize_current_kv", False)
-    for key in ("model", "split_manifest_sha256", "num_parts"):
+    for key in (
+        "model",
+        "split_manifest_sha256",
+        "num_parts",
+        "compiled_native_decoder",
+        "native_runtime_override",
+    ):
         if key in runtime:
             report[key] = runtime[key]
     report["assets"] = {
@@ -423,6 +495,12 @@ def main() -> None:
     push.add_argument("--bundle-dir", type=Path, required=True)
     push.add_argument("--name", required=True)
     push.add_argument("--runner", type=Path, default=DEFAULT_RUNNER)
+    push.add_argument(
+        "--native-runtime-package",
+        type=Path,
+        default=None,
+        help="Explicit execute-only QHPI override; requires identical registration/prepare ABI and preserves compiled provenance.",
+    )
     run = sub.add_parser("run")
     run.add_argument("--name", required=True)
     run.add_argument("--assets", type=Path, required=True)
