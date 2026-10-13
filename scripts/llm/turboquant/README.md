@@ -10,6 +10,197 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Structured K8 arithmetic decoder (opt-in, 2026-10-13)
+
+Branch `exp/structured-k8-decoder`, based on `exp/structured-k8-codebook`
+commit `246a53417be071ecfc97b7a8b4f23e4c3013ce28`. No automatic commit or
+default promotion. **The default remains the existing HVX LUT decoder.**
+
+`--structured-k8-decoder arithmetic` is an export-only option on
+`convert_parts.py`. It does not change the profile, quantizer, codebook, cache
+format or configuration hash. Both groups use
+`mixed_k6_v2_uniform_structured_k8`: K8 on odd layers 1,3,...,27, K4 on the
+other 14 layers, V2 throughout, Dense K42/V542, current/past compression,
+FP16 effective scales, unchanged W4A16 weights/calibration and tile256 attention.
+K4/V2 decoders and every encoder/attention node remain unchanged.
+
+### Decode8Structured
+
+The new QHPI op takes packed UINT8 indices, FP16 scales, and **four FP16
+constants** `[offset0, step0, offset1, step1]` from `structured_k8.py` (8 bytes,
+not a 256-entry centroid LUT). Existing `Decode8` remains available.
+
+```text
+positive = byte >= 128
+magnitude = positive ? byte - 128 : 127 - byte
+region = magnitude >> 6
+local = magnitude & 63
+centroid = FP16(FP16(local * step[region]) + offset[region])
+signed_centroid = positive ? centroid : -centroid
+output = FP16(signed_centroid * stored_effective_scale)
+```
+
+Negative region/local fields are complemented in the existing ascending-byte
+ABI; they must not be interpreted as unreflected magnitude bits. On HVX,
+unsigned halfword conversion represents local0..63 exactly, followed by
+separate FP16-result multiply/add intrinsics, sign-bit XOR and FP16 scale
+multiply. The generated V81 instructions use qfloat arithmetic with explicit
+FP16 conversion at each required rounding boundary; these are not fused FMA.
+No FMA, LUT lookup, 256-entry table staging or scalar coordinate loop. A row
+reads 128 index bytes and one scale, and writes two 128-byte FP16 vectors.
+Coefficient splats are outside the row loop. QHPI slices are multithreaded on
+HVX; no CPU inference fallback. The host library's scalar implementation is
+for SDK preparation/reference only.
+
+The export pass replaces only the current/past Structured K8 Native nodes,
+checks the old LUT identity, and swaps that initializer for the four constants.
+Arithmetic export rejects ordinary LM K8 and incompatible Native packages.
+Reusing an output bundle with a different decoder selection is rejected even
+though bit-exact cache compatibility allows both to retain the same config hash.
+
+### Numerical verification
+
+- CPU regression: **660 passed**, two existing SWIG warnings.
+- Hexagon libnative: old 2..8-bit tests pass; arithmetic and LUT agree for
+  all byte codes, region/sign endpoints, signed zero, subnormal/normal scale
+  edges, negative finite scales, maximum finite scales, unaligned I/O,
+  zero/odd slice lengths, and guard pages.
+- S26 Ultra HTP: both decoders pass **1/3/256/1023-token** probes, eight KV
+  heads x 128 coordinates. All eight outputs match the independent NumPy
+  FP16 oracle bit-for-bit, and the paired device output files are identical.
+  Input/scale hashes also match. No numeric tolerance was relaxed.
+- Current/past KV, GQA and attention oracle tests cover the arithmetic path.
+  Strict ONNX arithmetic reference tests use `ReferenceEvaluator`: the
+  initial ORT CPU test showed one-ULP differences, whereas literal ONNX
+  evaluation and the actual HTP kernel match the required rounding contract.
+  This CPU test-backend issue did not change the deployed kernel or encoder.
+- All six KV graphs pass the decoder-only audit: unchanged ONNX nodes and
+  constants except the K8 decoder/LUT replacement, identical encodings and I/O.
+  Converted DLC op counts, non-decoder op signatures, tensor dtypes/dimensions
+  and parameters also match. Only row IDs and SDK-generated random RMS node
+  labels are ignored. Non-KV part1 is shared byte-for-byte.
+
+The encoder is unchanged. This work does not resolve or waive the historical
+LM K8/companion V4 AR128 scale-gate failures recorded in the preceding experiment.
+
+### Isolated HTP decoder diagnostic
+
+One optrace execution per decoder/shape, identical synthetic indices and edge
+scales, same Native package. Arithmetic ran first, then LUT.
+HVX counts below are actual physical worker busy cycles for the decoder op,
+not wall-clock microseconds. SDK execute times include graph/runtime overhead;
+both total and excluding-wait values are retained. Probe power policy is
+qnn-net-run's default, unlike the full-model burst policy.
+
+| Tokens | LUT HVX cycles | Arithmetic HVX cycles | LUT execute (us) | Arithmetic execute (us) | LUT excluding wait (us) | Arithmetic excluding wait (us) |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 365,470 | 108,968 | 4,340 | 4,823 | 608 | 514 |
+| 3 | 378,288 | 97,616 | 4,299 | 4,258 | 586 | 479 |
+| 256 | 588,263 | 330,065 | 4,482 | 4,374 | 748 | 662 |
+| 1023 | 1,199,805 | 1,077,009 | 4,913 | 4,945 | 1,244 | 1,190 |
+
+Physical work falls **43.9% at tile256**, but only **10.2% at 1023 tokens**.
+The old LUT's table preparation/symmetry checks are per invocation; arithmetic
+removes that setup while retaining the same input/output traffic. The smaller
+large-shape gain is consistent with amortized setup and remaining arithmetic/
+memory work, not proof of a uniquely identified memory bottleneck. Total SDK
+execute time is worse at 1 and 1023 tokens despite lower HVX work, illustrating
+why busy-cycle savings must not be equated with end-to-end latency savings.
+The disassembly also shows that converting integer local indices to FP16
+requires multiple vector instructions. Arithmetic removes table preparation
+and lookup, not all decoder work. These are single observations without
+variance or statistical claims.
+
+### Full-model results
+
+Qwen3-1.7B W4A16, S26 Ultra / SM8850 V81, QAIRT 2.48.0.260626, CL1024,
+HTP burst. **One unprofiled 897-token prompt + 128-token generation per group**,
+LUT first then arithmetic. The 127 decode steps use CL1024. Both measurements
+are fresh and use the same new Native library, SHA256
+`3e69cc4df58568307cee841f13c78092c6a490dc2ab57fc0111805550cd271a0`.
+PPL uses the unchanged four WikiText windows, 4092 scored targets in total:
+`exp(sum(window_nll_sum) / 4092)`, not the average of window PPLs.
+
+| Metric | Structured K8 + LUT | Structured K8 + arithmetic | Observed change |
+|---|---:|---:|---:|
+| TTFT (ms) | 549.783 | 498.262 | -9.37% |
+| Prefill (tok/s) | 1,634.550 | 1,801.763 | +10.23% |
+| Decode (tok/s) | 35.533 | 37.284 | +4.93% |
+| Decode (ms/token) | 28.143 | 26.821 | -4.70% |
+| Mean decode QNN execute (ms) | 26.390 | 25.085 | -4.94% |
+| Mean decode host KV prepare (ms) | 1.151 | 1.138 | -1.14% |
+| PPL | 23.61218745 | 23.61218745 | identical |
+| Host KV cache (MiB) | 28.875 | 28.875 | unchanged |
+| I/O buffers (MiB) | 96.929 | 96.929 | unchanged |
+| End VmRSS (MiB) | 151.309 | 150.191 | single observation |
+| Process VmHWM (MiB) | 606.020 | 605.066 | single observation |
+| Four context binaries (bytes) | 1,700,085,760 | 1,700,085,760 | unchanged |
+
+All 128 generated IDs and all four reported NLL sums are identical between
+groups. Each group passes the separate two-session reset check. Cache storage
+is exactly **30,277,632 bytes = 28 MiB indices + 0.875 MiB FP16 scales**;
+the decoder introduces no token metadata or new I/O buffers. Replacing the
+512-byte centroid initializer with eight coefficient bytes does not change
+the final context file sizes at the SDK's allocation granularity.
+
+The observations support a decoder work reduction and a promising end-to-end
+gain without measured quality loss, **not statistical superiority**. The
+1.305 ms reduction in mean QNN time accounts for most of the observed 1.322 ms
+decode-step reduction; it is not a claim that all of that difference is
+causally attributable to this kernel. Device state and fixed execution order
+are uncontrolled single-run limitations. Tile256 busy cycles fall 43.9%, but
+only the K8 decoder in 14 layers changes: encoder, K4/V2 decode and attention
+remain. That percentage is neither the TTFT reduction nor a full-model speedup.
+The default remains LUT; arithmetic is preserved as an explicit opt-in.
+
+### Reproduction and artifacts
+
+Use a **fresh** artifact directory. Both full-model contexts use the exact same
+new Native package: LUT reuses immutable old DLCs, while arithmetic rebuilds
+parts2/3/4 and shares the non-KV part1 with LUT. This controls the package version
+without replacing libraries in old bundles. The arithmetic parts use up to
+three concurrent converters; device runs are sequential.
+
+```bash
+export PYTHONPATH=src
+TQ_AD_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_decoder_NEW
+venv/bin/python scripts/llm/turboquant/native_decoder/build.py --out "$TQ_AD_ROOT/native" --test-hvx
+for decoder in lut arithmetic; do
+  TQ_DECODER_ARGS=()
+  if [ "$decoder" = arithmetic ]; then TQ_DECODER_ARGS+=(--structured-arithmetic); fi
+  venv/bin/python scripts/llm/turboquant/validate_native_decoder.py all \
+    --work-dir "$TQ_AD_ROOT/probe_$decoder" --package "$TQ_AD_ROOT/native" \
+    --bits 8 --lut structured_k8 --tokens 1 3 256 1023 \
+    --scale-edges --strict-bit-exact --optrace "${TQ_DECODER_ARGS[@]}" \
+    --device-dir "/data/local/tmp/qaihm_turboquant/${TQ_AD_ROOT##*/}_$decoder" || break
+done
+venv/bin/python scripts/llm/turboquant/benchmark_structured_decoder_once.py prepare --root "$TQ_AD_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_decoder_once.py build-lut --root "$TQ_AD_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_decoder_once.py build-arithmetic --root "$TQ_AD_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_decoder_once.py assemble --root "$TQ_AD_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_decoder_once.py evaluate --root "$TQ_AD_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_decoder_once.py summarize --root "$TQ_AD_ROOT"
+venv/bin/python scripts/llm/turboquant/profile_structured_decoder_probes.py --root "$TQ_AD_ROOT"
+venv/bin/python -m pytest -q src/qai_hub_models/test/test_models/test_turboquant*.py
+```
+
+Actual root: `/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_decoder_20261013`.
+`protocol.json` freezes inputs/configuration/package/conditions;
+`decoder_comparison.json`/`.csv` and `probe_profiles/` retain paired numerical
+and physical probe results. `comparison.json`/`.csv`, `reports/`, and
+`tests/cpu_regression.xml` retain full-model and regression results.
+`reports/decoder_only_audit.json` checks the source and converted graphs;
+`native/structured8_disassembly.txt` records the SIMD instructions.
+`final_verification.json` records final source/artifact hashes and preservation
+checks, including unchanged codebook/configuration and bit-exact paired output.
+
+`schematic_recovery.json` records an SDK output-directory issue: initial
+schematics landed in the caller's working directory. Arithmetic schematics
+were regenerated on the host from unchanged inputs; all four regenerated
+context binaries have **identical SHA256 to the preserved measured binaries**.
+No additional device execution was used. Probe compilation now sets its working
+directory explicitly so schematics cannot collide across decoder variants.
+
 ## Structured K8 versus frozen Lloyd-Max K8 (opt-in, 2026-10-13)
 
 Branch `exp/structured-k8-codebook` starts at `exp/hardware-aligned-mixed-kv`

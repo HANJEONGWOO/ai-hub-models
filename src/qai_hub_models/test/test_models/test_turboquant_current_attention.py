@@ -25,6 +25,7 @@ from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
 )
 from qai_hub_models.models.templates.llm.turboquant.native_decoder import (
     use_native_decoder,
+    use_structured_arithmetic_decoder,
     with_reference_decoder,
 )
 from qai_hub_models.models.templates.llm.turboquant.packing import (
@@ -55,6 +56,7 @@ from qai_hub_models.test.test_models import test_turboquant_tiled_attention as f
         "k6_v2_scaled",
         "k8_v4_scaled",
         "structured_k8_v4_scaled",
+        "structured_k8_arithmetic",
     ],
 )
 @pytest.mark.parametrize(("seq", "valid"), [(1, 0), (3, 13), (128, 0)])
@@ -73,6 +75,8 @@ def test_current_cache_values_feed_attention(
         if mode in ("full", "tiled")
         else "k3qjl_v4_scaled"
         if mode == "qjl"
+        else "structured_k8_v4_scaled"
+        if mode == "structured_k8_arithmetic"
         else mode
         if mode.startswith(("k", "structured_"))
         else "k4_v4_scaled",
@@ -88,6 +92,7 @@ def test_current_cache_values_feed_attention(
         "k6_v2_scaled",
         "k8_v4_scaled",
         "structured_k8_v4_scaled",
+        "structured_k8_arithmetic",
     )
     if mode != "full":
         before = tile_kv_attention(before, config, 7, rotated=mode != "tiled")
@@ -97,6 +102,8 @@ def test_current_cache_values_feed_attention(
         before = add_qjl_attention(before, config)
     serialized = before.model.SerializeToString()
     result = quantize_current_attention(before, config)
+    if mode == "structured_k8_arithmetic":
+        result = use_structured_arithmetic_decoder(result, config)
     assert before.model.SerializeToString() == serialized
     assert before.encodings["param_encodings"] == result.encodings["param_encodings"]
     for side in ("input", "output"):

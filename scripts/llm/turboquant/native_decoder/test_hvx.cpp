@@ -121,8 +121,61 @@ template<unsigned Bits> int test_bits() {
   return 0;
 }
 
-int main() {
+int test_structured(const uint16_t* coeff, const uint16_t* table) {
+  const uint16_t special[] = {0, 0x8000, 1, 2, 0x03ff, 0x0400, 0x0401,
+      0x1400, 0x3800, 0x3bff, 0x3c00, 0x3c01, 0x4000, 0x5000, 0x7bff,
+      0x8001, 0x83ff, 0x8400, 0xbc00, 0xfbff};
+  for (unsigned rows : {0, 1, 2, 3, 8, 24, 256, 1023, 2048, 8184}) {
+    for (unsigned offset : {0, 1, 15, 127}) {
+      std::vector<uint8_t> packed(rows * 128 + offset + 1);
+      std::vector<uint16_t> scales(rows + 1);
+      std::vector<uint16_t> lut(rows * 128 + 2, 0x1234), arithmetic(lut);
+      for (unsigned row = 0; row < rows; ++row) {
+        scales[row + 1] = special[(row / 2) % (sizeof(special) / sizeof(*special))];
+        // Adjacent rows cover every code under the same scale. Include random
+        // lane permutations without dropping sign/region endpoints.
+        for (unsigned j = 0; j < 128; ++j)
+          packed[offset + row * 128 + j] = ((row % 2) * 128 + j) * 73 + (row / 40);
+      }
+      tq_decode_bits_hvx<8>(packed.data() + offset, scales.data() + 1,
+                            table, lut.data() + 1, rows);
+      tq_decode_structured8_hvx(packed.data() + offset, scales.data() + 1,
+                                coeff, arithmetic.data() + 1, rows);
+      for (unsigned i = 0; i < lut.size(); ++i) {
+        if (lut[i] != arithmetic[i]) {
+          printf("structured/LUT mismatch rows=%u offset=%u element=%u arithmetic=%04x LUT=%04x\n",
+                 rows, offset, i, arithmetic[i], lut[i]);
+          return 1;
+        }
+      }
+      if (arithmetic.front() != 0x1234 || arithmetic.back() != 0x1234) return 2;
+    }
+  }
+#ifdef TQ_TEST_GUARD_PAGES
+  for (bool after : {false, true}) {
+    for (unsigned rows : {1, 3, 256, 1023}) {
+      GuardedBytes packed(rows * 128, after);
+      if (!packed.data()) return 3;
+      std::vector<uint16_t> scales(rows, 0x3c00), lut(rows * 128), arithmetic(rows * 128);
+      for (unsigned i = 0; i < rows * 128; ++i) packed.data()[i] = i;
+      tq_decode_bits_hvx<8>(packed.data(), scales.data(), table, lut.data(), rows);
+      tq_decode_structured8_hvx(packed.data(), scales.data(), coeff, arithmetic.data(), rows);
+      if (lut != arithmetic) return 4;
+    }
+  }
+#endif
+  puts("Structured K8 arithmetic/LUT bit-exact: all codes, scale edges, signed zero, subnormals, unaligned I/O and guard pages");
+  return 0;
+}
+
+int main(int argc, char** argv) {
   if (test_bits<2>() || test_bits<3>() || test_bits<4>() || test_bits<5>() || test_bits<6>() || test_bits<7>() || test_bits<8>())
     return 1;
   puts("HVX packing, LUT lane order, exact FP16 products, unaligned I/O, slice tails and guard pages passed");
+  if (argc != 2) return 5;
+  uint16_t reference[260];
+  FILE* file = fopen(argv[1], "rb");
+  if (!file || fread(reference, sizeof(*reference), 260, file) != 260) return 6;
+  fclose(file);
+  return test_structured(reference, reference + 4);
 }

@@ -177,5 +177,30 @@
       </Output>
       <SupportedBackend>HTP</SupportedBackend>
     </OpDef>
+    <OpDef>
+      <Name>Decode8Structured</Name>
+      <Description><Content>Reflected sign/region/local UINT8 codes. Separate FP16 multiply, add, sign and scale operations on HVX; no centroid LUT.</Content></Description>
+      <Input>
+        <Name>packed</Name><Description><Content>Unchanged Structured K8 cache bytes</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_UINT_8</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,128</Text></Shape>
+      </Input>
+      <Input>
+        <Name>scale</Name><Description><Content>Existing FP16 effective scales</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,1</Text></Shape>
+      </Input>
+      <Input>
+        <Name>coefficients</Name><Description><Content>Frozen offset0,step0,offset1,step1 from structured_k8.py</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>1,1,1,4</Text></Shape>
+      </Input>
+      <Output>
+        <Name>decoded</Name><Description><Content>Rotated-domain FP16 K tile</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,128</Text></Shape>
+      </Output>
+      <SupportedBackend>HTP</SupportedBackend>
+    </OpDef>
   </OpDefList>
 </OpDefCollection>

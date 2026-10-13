@@ -12,10 +12,10 @@
 
 namespace {
 constexpr const char* kPackage = "TurboQuantNative";
-const char* kOps[] = {"Decode4", "Decode2", "Decode3", "Decode5", "Decode6", "Decode7", "Decode8"};
+const char* kOps[] = {"Decode4", "Decode2", "Decode3", "Decode5", "Decode6", "Decode7", "Decode8", "Decode8Structured"};
 Qnn_ApiVersion_t apiVersion = QNN_HTP_API_VERSION_INIT;
 Qnn_Version_t opVersion = {1, 0, 0};
-QnnOpPackage_Info_t packageInfo = {kPackage, kOps, nullptr, 7, nullptr, 0,
+QnnOpPackage_Info_t packageInfo = {kPackage, kOps, nullptr, 8, nullptr, 0,
     QNN_SDK_BUILD_ID, &apiVersion, nullptr, &opVersion, {0}};
 bool initialized = false;
 
@@ -117,14 +117,60 @@ uint32_t decode(QHPI_RuntimeHandle* handle, uint32_t nout, QHPI_Tensor** outputs
 float cost(uint32_t, const QHPI_Tensor* const* inputs) {
   return 100.0f + 20.0f * elements(qhpi_tensor_shape(inputs[1]));
 }
+
+uint32_t decodeStructured(QHPI_RuntimeHandle* handle, uint32_t nout, QHPI_Tensor** outputs,
+                          uint32_t nin, const QHPI_Tensor* const* inputs) {
+  if (nin != 3 || nout != 1) return QHPI_ERROR_FATAL;
+  const auto packedShape = qhpi_tensor_shape(inputs[0]);
+  const auto scaleShape = qhpi_tensor_shape(inputs[1]);
+  const auto outShape = qhpi_tensor_shape(outputs[0]);
+  if (packedShape.rank != 4 || scaleShape.rank != 4 || outShape.rank != 4 ||
+      packedShape.dims[3] != 128 || scaleShape.dims[3] != 1 || outShape.dims[3] != 128 ||
+      elements(qhpi_tensor_shape(inputs[2])) != 4 ||
+      qhpi_element_type_size(qhpi_tensor_type(inputs[0])) != 1)
+    return QHPI_ERROR_FATAL;
+  for (unsigned i = 0; i < 3; ++i)
+    if (packedShape.dims[i] != scaleShape.dims[i] || packedShape.dims[i] != outShape.dims[i])
+      return QHPI_ERROR_FATAL;
+  const auto* packed = static_cast<const uint8_t*>(qhpi_tensor_raw_data(inputs[0]));
+  const auto* scale = static_cast<const __fp16*>(qhpi_tensor_raw_data(inputs[1]));
+  const auto* coeff = static_cast<const __fp16*>(qhpi_tensor_raw_data(inputs[2]));
+  auto* output = static_cast<__fp16*>(qhpi_tensor_raw_data(outputs[0]));
+  if (!packed || !scale || !coeff || !output) return QHPI_ERROR_FATAL;
+  const uint32_t rows = elements(scaleShape);
+  const uint32_t slices = qhpi_num_slices(handle);
+  const uint32_t slice = qhpi_slice_number(handle);
+  const uint32_t begin = uint64_t(rows) * slice / slices;
+  const uint32_t end = uint64_t(rows) * (slice + 1) / slices;
+#ifdef __hexagon__
+  tq_decode_structured8_hvx(packed + begin * 128,
+      reinterpret_cast<const uint16_t*>(scale) + begin,
+      reinterpret_cast<const uint16_t*>(coeff),
+      reinterpret_cast<uint16_t*>(output) + begin * 128, end - begin);
+#else
+  // Host prepare/reference implementation only, never a deployed CPU fallback.
+  for (uint32_t row = begin; row < end; ++row) {
+    for (unsigned j = 0; j < 128; ++j) {
+      const unsigned code = packed[row * 128 + j];
+      const unsigned magnitude = code >= 128 ? code - 128 : 127 - code;
+      const unsigned region = magnitude >> 6;
+      const __fp16 product = float(magnitude & 63) * float(coeff[2 * region + 1]);
+      const __fp16 centroid = float(product) + float(coeff[2 * region]);
+      const float signed_centroid = code >= 128 ? float(centroid) : -float(centroid);
+      output[row * 128 + j] = signed_centroid * float(scale[row]);
+    }
+  }
+#endif
+  return QHPI_SUCCESS;
+}
 QHPI_Tensor_Signature_v1 inputSignatures[] = {
     {QHPI_ELEMENT_TYPE_ANY, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM},
     {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM},
     {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM}};
 QHPI_Tensor_Signature_v1 outputSignatures[] = {
     {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM}};
-QHPI_Kernel_v1 kernels[7] = {};
-QHPI_OpInfo_v1 ops[7] = {};
+QHPI_Kernel_v1 kernels[8] = {};
+QHPI_OpInfo_v1 ops[8] = {};
 }  // namespace
 
 extern "C" Qnn_ErrorHandle_t TurboQuantInterfaceProvider(QnnOpPackage_Interface_t* out) {
@@ -144,9 +190,9 @@ extern "C" Qnn_ErrorHandle_t TurboQuantInterfaceProvider(QnnOpPackage_Interface_
 }
 
 extern "C" const char* qhpi_init() {
-  const char* functions[] = {"tq_decode4", "tq_decode2", "tq_decode3", "tq_decode5", "tq_decode6", "tq_decode7", "tq_decode8"};
+  const char* functions[] = {"tq_decode4", "tq_decode2", "tq_decode3", "tq_decode5", "tq_decode6", "tq_decode7", "tq_decode8", "tq_decode8_structured"};
   const char* names[] = {"TurboQuantNative::Decode4", "TurboQuantNative::Decode2",
-      "TurboQuantNative::Decode3", "TurboQuantNative::Decode5", "TurboQuantNative::Decode6", "TurboQuantNative::Decode7", "TurboQuantNative::Decode8"};
+      "TurboQuantNative::Decode3", "TurboQuantNative::Decode5", "TurboQuantNative::Decode6", "TurboQuantNative::Decode7", "TurboQuantNative::Decode8", "TurboQuantNative::Decode8Structured"};
   kernels[0].function = decode<4>;
   kernels[1].function = decode<2>;
   kernels[2].function = decode<3>;
@@ -154,7 +200,8 @@ extern "C" const char* qhpi_init() {
   kernels[4].function = decode<6>;
   kernels[5].function = decode<7>;
   kernels[6].function = decode<8>;
-  for (unsigned i = 0; i < 7; ++i) {
+  kernels[7].function = decodeStructured;
+  for (unsigned i = 0; i < 8; ++i) {
     auto& kernel = kernels[i];
     kernel.function_name = functions[i];
     kernel.resources = QHPI_RESOURCE_HVX;
@@ -168,6 +215,6 @@ extern "C" const char* qhpi_init() {
     ops[i].num_kernels = 1;
     ops[i].kernels = &kernel;
   }
-  qhpi_register_ops_v1(7, ops, kPackage);
+  qhpi_register_ops_v1(8, ops, kPackage);
   return kPackage;
 }

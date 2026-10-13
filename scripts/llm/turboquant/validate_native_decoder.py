@@ -56,6 +56,16 @@ def build(args: argparse.Namespace) -> None:
         centroids = codebook().astype(np.float16)
     elif args.lut == "qjl_sign":
         centroids = np.repeat(np.array([-1, 1], dtype=np.float16), 8)
+    arithmetic = getattr(args, "structured_arithmetic", False)
+    params = centroids
+    if arithmetic:
+        from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+            coefficients,
+        )
+
+        params = coefficients().astype(np.float16)
+    op = "Decode8Structured" if arithmetic else f"Decode{args.bits}"
+    parameter_name = "coefficients" if arithmetic else "centroids"
     (work / "lut.json").write_text(
         json.dumps({"kind": args.lut, "bits": args.bits, "values": centroids.tolist()})
         + "\n"
@@ -66,11 +76,11 @@ def build(args: argparse.Namespace) -> None:
         graph = helper.make_graph(
             [
                 helper.make_node(
-                    f"Decode{args.bits}",
-                    ["packed", "scale", "centroids"],
+                    op,
+                    ["packed", "scale", parameter_name],
                     ["decoded"],
                     domain="turboquant",
-                    name=f"decode{args.bits}",
+                    name=op.lower(),
                 )
             ],
             name,
@@ -87,7 +97,7 @@ def build(args: argparse.Namespace) -> None:
                     "decoded", TensorProto.FLOAT16, [8, 1, tokens, 128]
                 )
             ],
-            [numpy_helper.from_array(centroids.reshape(1, 1, 1, -1), "centroids")],
+            [numpy_helper.from_array(params.reshape(1, 1, 1, -1), parameter_name)],
         )
         model = helper.make_model(
             graph,
@@ -107,6 +117,35 @@ def build(args: argparse.Namespace) -> None:
         )
         scale = np.exp(rng.uniform(-5, 8, scale_shape)).astype(np.float16)
         scale.flat[:6] = [0, 1, 2**-14, 2**-10, 32, 65504]
+        if getattr(args, "scale_edges", False):
+            # Pair rows so every byte code is checked under every edge scale.
+            special = np.array(
+                [
+                    0,
+                    0x8000,
+                    1,
+                    0x03FF,
+                    0x0400,
+                    0x0401,
+                    0x3BFF,
+                    0x3C00,
+                    0x3C01,
+                    0x4000,
+                    0x5000,
+                    0x7BFF,
+                    0x8001,
+                    0x83FF,
+                    0x8400,
+                    0xBC00,
+                    0xFBFF,
+                ],
+                np.uint16,
+            ).view(np.float16)
+            for row in range(min(scale.size, 2 * special.size)):
+                scale.flat[row] = special[row // 2]
+                packed.reshape(-1, 128)[row] = (
+                    np.arange(128) + 128 * (row % 2)
+                ).astype(np.uint8)
         indices = unpack_indices(packed, args.bits, 128)
         expected = (
             centroids[indices].astype(np.float32) * scale.astype(np.float32)
@@ -188,9 +227,15 @@ def build(args: argparse.Namespace) -> None:
                 str(backend),
                 "--log_level",
                 "verbose",
+                *(
+                    ["--profiling_level", "detailed", "--profiling_option", "optrace"]
+                    if getattr(args, "optrace", False)
+                    else []
+                ),
             ],
             work / f"{name}.ctxgen.log",
             env,
+            cwd=work,
         )
         print(f"Built {name}", flush=True)
 
@@ -220,7 +265,10 @@ def run(args: argparse.Namespace) -> None:
         name = f"native_t{tokens}"
         rc, log = adb_shell_rc(
             args,
-            f"{prefix} && ./qnn-net-run --backend libQnnHtp.so --retrieve_context {name}.bin --op_packages libTurboQuantNative.so:TurboQuantInterfaceProvider --input_list {name}_inputs.txt --use_native_input_files --use_native_output_files --output_dir out_{name} --profiling_level detailed --log_level verbose",
+            f"{prefix} && ./qnn-net-run --backend libQnnHtp.so --retrieve_context {name}.bin --op_packages libTurboQuantNative.so:TurboQuantInterfaceProvider --input_list {name}_inputs.txt --use_native_input_files --use_native_output_files --output_dir out_{name} --profiling_level detailed --log_level verbose"
+            + (
+                " --profiling_option optrace" if getattr(args, "optrace", False) else ""
+            ),
         )
         (work / f"{name}.device.log").write_text(log)
         if rc:
@@ -241,6 +289,10 @@ def compare(args: argparse.Namespace) -> None:
         actual = np.fromfile(paths[0], dtype=np.float16).reshape(expected.shape)
         diff = np.abs(actual.astype(np.float64) - expected.astype(np.float64))
         passed = bool(np.allclose(actual, expected, rtol=0.001, atol=2**-24))
+        if getattr(args, "strict_bit_exact", False):
+            passed = bool(
+                np.array_equal(actual.view(np.uint16), expected.view(np.uint16))
+            )
         reports[name] = {
             "passed": passed,
             "max_abs_error": float(diff.max()),
@@ -264,6 +316,14 @@ def main() -> None:
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[3])
     parser.add_argument("--bits", type=int, choices=list(range(2, 9)), default=4)
+    parser.add_argument("--structured-arithmetic", action="store_true")
+    parser.add_argument("--scale-edges", action="store_true")
+    parser.add_argument("--strict-bit-exact", action="store_true")
+    parser.add_argument(
+        "--optrace",
+        action="store_true",
+        help="Separate diagnostic execution with physical HVX trace",
+    )
     parser.add_argument(
         "--lut", choices=["mse4", "mse3", "qjl_sign", "structured_k8"], default="mse4"
     )
@@ -275,8 +335,16 @@ def main() -> None:
     parser.add_argument("--ndk", type=Path, default=DEFAULT_NDK)
     parser.add_argument("--adb", type=Path, default=DEFAULT_ADB)
     args = parser.parse_args()
+    # Context generation runs inside the probe directory to contain schematics.
+    # Resolve CLI paths before changing cwd, including user-supplied relative ones.
+    for name in ("work_dir", "package", "sdk", "qnn_python"):
+        setattr(args, name, getattr(args, name).resolve())
     if args.bits != 4 and args.lut in ("mse3", "qjl_sign"):
         parser.error("QJL nibble LUT variants require --bits 4")
+    if args.structured_arithmetic and (args.bits != 8 or args.lut != "structured_k8"):
+        parser.error("Arithmetic decoder requires --bits 8 --lut structured_k8")
+    if args.scale_edges and args.bits != 8:
+        parser.error("Edge-scale probe requires byte indices")
     for stage in ("build", "run", "compare"):
         if args.stage in (stage, "all"):
             globals()[stage](args)

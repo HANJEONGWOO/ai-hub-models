@@ -90,6 +90,13 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
         bits = 4 if config.get("qjl") and kind == "key" else config[kind]["bits"]
         if plan := config.get("layer_plan"):
             bits = plan["bits"][layer][kind == "value"]
+        if (
+            conversion.get("structured_k8_decoder") == "arithmetic"
+            and kind == "key"
+            and bits == 8
+            and config.get("structured_k8")
+        ):
+            return "Decode8Structured"
         return f"Decode{bits}"
 
     errors: list[str] = []

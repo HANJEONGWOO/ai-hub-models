@@ -178,10 +178,16 @@ def qairt_env(sdk: Path, qnn_python: Path) -> dict[str, str]:
     return env
 
 
-def run_logged(cmd: list[str], log: Path, env: dict[str, str] | None = None) -> None:
+def run_logged(
+    cmd: list[str],
+    log: Path,
+    env: dict[str, str] | None = None,
+    *,
+    cwd: Path | None = None,
+) -> None:
     with log.open("w") as f:
         result = subprocess.run(
-            cmd, stdout=f, stderr=subprocess.STDOUT, env=env, check=False
+            cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd, check=False
         )
     if result.returncode != 0:
         raise RuntimeError(f"{cmd[0]} failed ({result.returncode}); see {log}")

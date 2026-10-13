@@ -5,6 +5,48 @@
 #include <stdint.h>
 #include <string.h>
 
+// Structured K8 uses the same reflected byte ABI as the symmetric Decode8
+// LUT. Constants are [offset0, step0, offset1, step1] from structured_k8.py.
+// Each intrinsic rounds to IEEE FP16 separately: never fuse product and add.
+// One 128-byte input load produces two 128-byte output vectors. No LUT loads,
+// centroid scratch table, variable gather or scalar coordinate loop.
+inline void tq_decode_structured8_hvx(const uint8_t* packed, const uint16_t* scales,
+                                     const uint16_t* coefficients, uint16_t* output,
+                                     uint32_t rows) {
+  if (!rows) return;
+  const auto offset0 = Q6_Vh_vsplat_R(coefficients[0]);
+  const auto step0 = Q6_Vh_vsplat_R(coefficients[1]);
+  const auto offset1 = Q6_Vh_vsplat_R(coefficients[2]);
+  const auto step1 = Q6_Vh_vsplat_R(coefficients[3]);
+  const auto mask = Q6_Vh_vsplat_R(63);
+  const auto sign_bit = Q6_Vh_vsplat_R(128);
+  const auto half = Q6_Vb_vsplat_R(127);
+  for (uint32_t row = 0; row < rows; ++row) {
+    HVX_Vector bytes;
+    memcpy(&bytes, packed + row * 128, 128);
+    const auto negative = Q6_Q_vcmp_gt_VubVub(Q6_Vb_vsplat_R(128), bytes);
+    const auto reflected = Q6_Vb_vsub_VbVb(half, bytes);
+    const auto magnitude = Q6_V_vand_VV(Q6_V_vmux_QVV(negative, reflected, bytes), half);
+    const auto wide = Q6_W_vshuff_VVR(Q6_V_vzero(), magnitude, -1);
+    const auto codes = Q6_W_vshuff_VVR(Q6_V_vzero(), bytes, -1);
+    const auto factor = Q6_Vh_vsplat_R(scales[row]);
+    const auto decode_half = [&](HVX_Vector mag, HVX_Vector code) {
+      const auto tail = Q6_Q_vcmp_gt_VuhVuh(mag, mask);
+      const auto step = Q6_V_vmux_QVV(tail, step1, step0);
+      const auto offset = Q6_V_vmux_QVV(tail, offset1, offset0);
+      const auto local = Q6_Vhf_vcvt_Vuh(Q6_V_vand_VV(mag, mask));
+      const auto product = Q6_Vhf_vmpy_VhfVhf(local, step);
+      const auto centroid = Q6_Vhf_vadd_VhfVhf(product, offset);
+      const auto sign = Q6_Vh_vasl_VhR(Q6_V_vxor_VV(Q6_V_vand_VV(code, sign_bit), sign_bit), 8);
+      return Q6_Vhf_vmpy_VhfVhf(Q6_V_vxor_VV(centroid, sign), factor);
+    };
+    const auto first = decode_half(Q6_V_lo_W(wide), Q6_V_lo_W(codes));
+    const auto second = decode_half(Q6_V_hi_W(wide), Q6_V_hi_W(codes));
+    memcpy(output + row * 128, &first, 128);
+    memcpy(output + row * 128 + 64, &second, 128);
+  }
+}
+
 // vlut16 selects halfwords from 16 word slots. Its two outputs contain
 // even/odd input lanes; interleave halfwords to restore contiguous KV order.
 inline void tq_store_row(HVX_Vector indices, HVX_Vector lut, uint16_t scale,
