@@ -61,8 +61,15 @@ class KVCodecSpec:
     kind: CodecKind
     bits: int = 0
     seed: int = 0
+    quantizer: str = "lloyd_max"
 
     def __post_init__(self) -> None:
+        if self.quantizer not in ("lloyd_max", "structured_k8_two_region_v1"):
+            raise ValueError("Unknown scalar quantizer")
+        if self.quantizer != "lloyd_max" and (
+            self.kind != CodecKind.POLAR or self.bits != 8
+        ):
+            raise ValueError("Structured quantizer requires Polar K8")
         if self.kind != CodecKind.POLAR and (self.bits != 0 or self.seed != 0):
             raise ValueError(f"{self.kind.name} codec takes no bits or seed.")
         if self.kind == CodecKind.POLAR and self.bits not in range(2, 9):
@@ -88,7 +95,10 @@ class KVCodecSpec:
         return self.kind != CodecKind.BASELINE
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
+        result = {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
+        if self.quantizer != "lloyd_max":
+            result["quantizer"] = self.quantizer
+        return result
 
 
 BASELINE = KVCodecSpec(CodecKind.BASELINE)
@@ -116,6 +126,7 @@ class TurboQuantConfig:
     # are absolute model layer IDs, not part-local IDs.
     layer_bits: tuple[tuple[int, int], ...] = ()
     layer_policy: str = ""
+    structured_k8: bool = False
 
     def codec_for(self, kind: str, layer: int) -> KVCodecSpec:
         if kind not in ("key", "value"):
@@ -125,7 +136,16 @@ class TurboQuantConfig:
             return spec
         if not 0 <= layer < len(self.layer_bits):
             raise ValueError(f"Layer {layer} is outside the mixed-bit plan.")
-        return replace(spec, bits=self.layer_bits[layer][kind == "value"])
+        bits = self.layer_bits[layer][kind == "value"]
+        return replace(
+            spec,
+            bits=bits,
+            quantizer=(
+                "structured_k8_two_region_v1"
+                if self.structured_k8 and kind == "key" and bits == 8
+                else "lloyd_max"
+            ),
+        )
 
     def for_layer(self, layer: int) -> TurboQuantConfig:
         if not self.layer_bits:
@@ -139,6 +159,21 @@ class TurboQuantConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.structured_k8 and (
+            self.block_size != 128
+            or self.qjl
+            or not self.precomputed_norm
+            or not self.norm_correction
+            or self.norm_dtype != "float16"
+            or self.rotation != Rotation.DENSE_QR
+        ):
+            raise ValueError(
+                "Structured K8 requires Dense D128, norm-corrected FP16 scales, no QJL"
+            )
+        if self.value.quantizer != "lloyd_max" or (
+            self.key.quantizer != "lloyd_max" and not self.structured_k8
+        ):
+            raise ValueError("Structured quantizer is opt-in K-only")
         if self.layer_bits:
             if not isinstance(self.layer_bits, tuple) or any(
                 not isinstance(pair, tuple) or any(type(bit) is not int for bit in pair)
@@ -287,6 +322,17 @@ class TurboQuantConfig:
             # Fixed implementation, not a selectable strategy. Invalidate old
             # broadcast bundles even though the codebook/cache ABI is unchanged.
             data["scalar_indexing"] = "lloyd_tree"
+        if self.structured_k8:
+            from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+                metadata,
+            )
+
+            data["structured_k8"] = metadata()
+            data["scalar_indexing"] = "lloyd_tree_except_structured_k8_arithmetic"
+            if self.layer_bits:
+                data["layer_plan"]["codebook_sha256"]["8"] = metadata()[
+                    "codebook_sha256"
+                ]
         if self.fp16_attention:
             data["attention"] = {
                 "kv_storage": "float16",
@@ -319,6 +365,12 @@ class TurboQuantConfig:
                 data[name]["codebook_sha256"] = CODEBOOK_SHA256[
                     (spec.bits, self.block_size)
                 ]
+                if spec.quantizer != "lloyd_max":
+                    from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+                        CODEBOOK_SHA256 as structured_hash,
+                    )
+
+                    data[name]["codebook_sha256"] = structured_hash
                 if self.rotation == Rotation.FWHT:
                     # Preserve the FWHT sign hashes; indexing identity is separate.
                     data[name]["signs_sha256"] = FWHT_SIGNS_SHA256[
@@ -419,6 +471,17 @@ PROFILES["k8_v4_scaled"] = TurboQuantConfig(
     _polar(4, VALUE_SEED),
     format_version=2,
     precomputed_norm=True,
+)
+PROFILES["mixed_k6_v2_uniform_structured_k8"] = replace(
+    PROFILES["mixed_k6_v2_uniform"],
+    profile="mixed_k6_v2_uniform_structured_k8",
+    structured_k8=True,
+)
+PROFILES["structured_k8_v4_scaled"] = replace(
+    PROFILES["k8_v4_scaled"],
+    profile="structured_k8_v4_scaled",
+    structured_k8=True,
+    key=KVCodecSpec(CodecKind.POLAR, 8, KEY_SEED, "structured_k8_two_region_v1"),
 )
 
 

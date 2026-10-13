@@ -16,10 +16,11 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", type=Path, required=True)
     p.add_argument("--experiment", type=Path, required=True)
+    p.add_argument("--groups", nargs="+", default=list(GROUPS))
     args = p.parse_args()
     stage_rows, bit_rows, latencies = [], [], []
     sources = {}
-    for group in GROUPS:
+    for group in args.groups:
         summary = args.root / "reports" / f"{group}_optrace_summary.json"
         sources[str(summary)] = digest(summary)
         data = read(summary)

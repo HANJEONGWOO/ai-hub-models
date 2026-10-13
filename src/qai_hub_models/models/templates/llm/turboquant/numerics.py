@@ -9,6 +9,8 @@ adjacent centroid and only when the oracle's rotated coordinate lies within
 ``boundary_distance`` of the boundary between them; norms and reconstructions
 are compared relative to the oracle norm. Tolerances are fixed per backend in
 ``tutorials/llm/turboquant_design.md``.
+Structured profiles use their arithmetic decision edges; legacy LM retains
+midpoint search and its existing tolerances.
 """
 
 from __future__ import annotations
@@ -50,6 +52,12 @@ def compare_encode(
     bits = codec.spec.bits
     y, ref_norms = codec.rotate_normalized(x)
     ref_idx = np.searchsorted(codec.boundaries, y, side="left")
+    if codec.spec.quantizer != "lloyd_max":
+        from qai_hub_models.models.templates.llm.turboquant.structured_k8 import indices
+
+        # Compare the requested arithmetic rule, not an LM nearest-LUT rule.
+        # The same boundary-distance and norm tolerances still apply.
+        ref_idx = indices(y).astype(np.int64)
     dev_idx = unpack_indices(
         np.asarray(packed, np.uint8), bits, codec.block_size
     ).astype(np.int64)

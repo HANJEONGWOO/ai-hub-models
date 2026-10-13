@@ -43,6 +43,7 @@ from qai_hub_models.models.templates.llm.turboquant.reference import (
     load_boundaries,
     load_codebook,
     make_rotation,
+    spec_codebook,
 )
 
 OPSET = 17
@@ -112,6 +113,69 @@ def byte_centroid_lut(bits: int, block_size: int) -> np.ndarray:
     centroids = load_codebook(bits, block_size)
     values = np.arange(256)
     return np.stack((centroids[values >> 4], centroids[values & 0xF]), axis=1)
+
+
+def _structured_arithmetic(
+    sg: Subgraph, src: str, prefix: str, *, centroid: bool = False
+) -> str:
+    """Two-region index/centroid without a boundary axis, tree or LUT search."""
+    from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+        coefficients,
+        region_boundary,
+    )
+
+    a, h, b, t = coefficients()
+
+    def c(name: str, value: float) -> str:
+        return sg.const("tq_structured_k8_" + name, np.array(value, np.float32))
+
+    def n(op: str, inputs: list[str], name: str, **attrs: Any) -> str:
+        out = prefix + name
+        sg.node(op, inputs, [out], **attrs)
+        return out
+
+    def fp16(x: str, name: str) -> str:
+        half = n("Cast", [x], name + "16", to=TensorProto.FLOAT16)
+        return n("Cast", [half], name, to=TensorProto.FLOAT)
+
+    zero, one = c("zero", 0), c("one", 1)
+    if centroid:
+        center = n("Sub", [src, c("center", 127.5)], "centered")
+        mag = n("Sub", [n("Abs", [center], "abs"), c("half", 0.5)], "magnitude")
+        region = n("Greater", [mag, c("last_central", 63)], "region")
+        positive = n("GreaterOrEqual", [src, c("sign_edge", 128)], "positive")
+    else:
+        mag = n("Abs", [src], "magnitude")
+        region = n("Greater", [mag, c("region_boundary", region_boundary())], "region")
+        positive = n("GreaterOrEqual", [src, zero], "positive")
+    r = n("Cast", [region], "region_f", to=TensorProto.FLOAT)
+    inverse = n("Sub", [one, r], "region_inverse")
+
+    def choice(label: str, central: float, tail: float) -> str:
+        lo = n("Mul", [inverse, c(label + "0", central)], label + "_lo")
+        hi = n("Mul", [r, c(label + "1", tail)], label + "_hi")
+        return n("Add", [lo, hi], label)
+
+    offset = choice("offset", a, b)
+    region_code = n("Mul", [r, c("region_stride", 64)], "region_code")
+    if centroid:
+        local = n("Sub", [mag, region_code], "local")
+        step = choice("step", h, t)
+        product = fp16(n("Mul", [local, step], "local_product"), "rounded_product")
+        value = fp16(n("Add", [product, offset], "unsigned"), "rounded_unsigned")
+        negative = n("Neg", [value], "negative")
+        return n("Where", [positive, value, negative], "centroid")
+    reciprocal = choice("reciprocal", 1 / h, 1 / t)
+    shifted = n("Sub", [mag, offset], "shifted")
+    position = n("Mul", [shifted, reciprocal], "position")
+    nearest = n("Add", [position, c("half", 0.5)], "nearest")
+    floored = n("Floor", [nearest], "floor")
+    local = n("Clip", [floored, zero, c("last_central", 63)], "local")
+    magnitude_code = n("Add", [local, region_code], "magnitude_code")
+    pos = n("Add", [c("sign_edge", 128), magnitude_code], "positive_code")
+    neg = n("Sub", [c("negative_edge", 127), magnitude_code], "negative_code")
+    index = n("Where", [positive, pos, neg], "index_f")
+    return n("Cast", [index], "index_i32", to=TensorProto.INT32)
 
 
 def _scalar_index_tree(
@@ -378,7 +442,11 @@ def encode_subgraph(
         "MatMul", [f"{p}unit", _rotation_name(sg, config, spec, True)], [f"{p}rotated"]
     )
     # Preserve head_dim as the vectorized innermost axis, without a boundary axis.
-    index = _scalar_index_tree(sg, f"{p}rotated", spec.bits, d, p + "scalar_")
+    index = (
+        _structured_arithmetic(sg, f"{p}rotated", p + "scalar_")
+        if spec.quantizer != "lloyd_max"
+        else _scalar_index_tree(sg, f"{p}rotated", spec.bits, d, p + "scalar_")
+    )
     sg.node(
         "Reshape",
         [index, sg.shape([heads, num_tokens, d])],
@@ -428,13 +496,19 @@ def encode_subgraph(
                 [f"{p}scale_index_f", sg.shape([*lead, num_tokens, d])],
                 [f"{p}scale_index"],
             )
-            y_hat = _select_centroid(
-                sg,
-                f"{p}scale_index",
-                load_codebook(spec.bits, d).astype(np.float32),
-                spec.bits,
-                d,
-                p + "scale_",
+            y_hat = (
+                _structured_arithmetic(
+                    sg, f"{p}scale_index", p + "scale_", centroid=True
+                )
+                if spec.quantizer != "lloyd_max"
+                else _select_centroid(
+                    sg,
+                    f"{p}scale_index",
+                    load_codebook(spec.bits, d).astype(np.float32),
+                    spec.bits,
+                    d,
+                    p + "scale_",
+                )
             )
             sg.node("Mul", [y_hat, y_hat], [f"{p}scale_sq"])
             sg.node("ReduceSum", [f"{p}scale_sq", axis3], [f"{p}scale_sum"], keepdims=1)
@@ -614,7 +688,7 @@ def decode_subgraph(
             sg, f"{p}byte_f", 8, spec.bits, heads, num_tokens, d, lead, p + "unpack_"
         )
         sg.node("Identity", [unpacked], [f"{p}index_f"])
-    centroids = load_codebook(spec.bits, d).astype(np.float32)
+    centroids = spec_codebook(spec, d).astype(np.float32)
     index_f = f"{p}index_f"
     if config.qjl and spec == config.key:
         eight = sg.const("tq_eight_f", np.array(8, dtype=np.float32))
@@ -626,7 +700,11 @@ def decode_subgraph(
             [f"{p}mse_index"],
         )
         index_f = f"{p}mse_index"
-    y_hat = _select_centroid(sg, index_f, centroids, spec.bits, d, p)
+    y_hat = (
+        _structured_arithmetic(sg, index_f, p, centroid=True)
+        if spec.quantizer != "lloyd_max"
+        else _select_centroid(sg, index_f, centroids, spec.bits, d, p)
+    )
     y_unit = y_hat
     if config.norm_correction and not config.precomputed_norm:
         sg.node("Mul", [y_hat, y_hat], [f"{p}sq"])

@@ -311,7 +311,11 @@ def test_scalar_indexing_identity_is_fixed_for_compressed_profiles(name: str) ->
     config = get_profile(name)
     data = config.to_dict()
     if config.enabled:
-        assert data["scalar_indexing"] == "lloyd_tree"
+        assert data["scalar_indexing"] == (
+            "lloyd_tree_except_structured_k8_arithmetic"
+            if config.structured_k8
+            else "lloyd_tree"
+        )
     else:
         assert "scalar_indexing" not in data
 

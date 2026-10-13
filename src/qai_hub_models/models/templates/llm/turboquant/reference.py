@@ -60,6 +60,18 @@ def load_boundaries(bits: int, block_size: int) -> np.ndarray:
     return boundaries
 
 
+def spec_codebook(spec: KVCodecSpec, block_size: int) -> np.ndarray:
+    if spec.quantizer != "lloyd_max":
+        from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+            codebook,
+        )
+
+        if block_size != 128:
+            raise ValueError("Structured K8 only supports D128")
+        return codebook()
+    return load_codebook(spec.bits, block_size)
+
+
 @cache
 def load_fwht_signs(seed: int, block_size: int) -> tuple[np.ndarray, np.ndarray]:
     """Frozen ``(signs1, signs2)`` as float64 +-1. Verified against the recorded digest."""
@@ -172,8 +184,14 @@ class PolarQuantReference:
         self.block_size = block_size
         self.norm_correction = norm_correction
         self.precomputed_norm = precomputed_norm
-        self.centroids = load_codebook(spec.bits, block_size)
-        self.boundaries = load_boundaries(spec.bits, block_size)
+        self.centroids = spec_codebook(spec, block_size)
+        self.boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2
+        if spec.quantizer != "lloyd_max":
+            from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+                boundaries,
+            )
+
+            self.boundaries = boundaries()
         self.rotation = make_rotation(rotation, spec.seed, block_size)
 
     def _check_input(self, x: np.ndarray) -> np.ndarray:
@@ -196,7 +214,14 @@ class PolarQuantReference:
     def encode(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """``(indices uint8 [..., d], norms float64 [..., 1])``."""
         y, norms = self.rotate_normalized(x)
-        indices = nearest_centroid_indices(y, self.boundaries)
+        if self.spec.quantizer != "lloyd_max":
+            from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+                indices as structured_indices,
+            )
+
+            indices = structured_indices(y)
+        else:
+            indices = nearest_centroid_indices(y, self.boundaries)
         if self.precomputed_norm and self.norm_correction:
             lengths = np.linalg.norm(self.centroids[indices], axis=-1, keepdims=True)
             norms = norms / np.where(lengths > NORM_CORRECTION_EPS, lengths, 1.0)

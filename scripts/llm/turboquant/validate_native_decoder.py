@@ -46,6 +46,14 @@ def build(args: argparse.Namespace) -> None:
     )
     if args.lut == "mse3":
         centroids = np.tile(centroids, 2)
+    elif args.lut == "structured_k8":
+        from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+            codebook,
+        )
+
+        if args.bits != 8:
+            raise ValueError("Structured K8 LUT requires 8 bits")
+        centroids = codebook().astype(np.float16)
     elif args.lut == "qjl_sign":
         centroids = np.repeat(np.array([-1, 1], dtype=np.float16), 8)
     (work / "lut.json").write_text(
@@ -256,7 +264,9 @@ def main() -> None:
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[3])
     parser.add_argument("--bits", type=int, choices=list(range(2, 9)), default=4)
-    parser.add_argument("--lut", choices=["mse4", "mse3", "qjl_sign"], default="mse4")
+    parser.add_argument(
+        "--lut", choices=["mse4", "mse3", "qjl_sign", "structured_k8"], default="mse4"
+    )
     parser.add_argument(
         "--device-dir", default="/data/local/tmp/qaihm_turboquant/native_smoke_20260918"
     )
@@ -265,7 +275,7 @@ def main() -> None:
     parser.add_argument("--ndk", type=Path, default=DEFAULT_NDK)
     parser.add_argument("--adb", type=Path, default=DEFAULT_ADB)
     args = parser.parse_args()
-    if args.bits != 4 and args.lut != "mse4":
+    if args.bits != 4 and args.lut in ("mse3", "qjl_sign"):
         parser.error("QJL nibble LUT variants require --bits 4")
     for stage in ("build", "run", "compare"):
         if args.stage in (stage, "all"):

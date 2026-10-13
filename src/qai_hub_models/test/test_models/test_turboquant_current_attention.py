@@ -54,6 +54,7 @@ from qai_hub_models.test.test_models import test_turboquant_tiled_attention as f
         "k5_v3_scaled",
         "k6_v2_scaled",
         "k8_v4_scaled",
+        "structured_k8_v4_scaled",
     ],
 )
 @pytest.mark.parametrize(("seq", "valid"), [(1, 0), (3, 13), (128, 0)])
@@ -73,7 +74,7 @@ def test_current_cache_values_feed_attention(
         else "k3qjl_v4_scaled"
         if mode == "qjl"
         else mode
-        if mode.startswith("k")
+        if mode.startswith(("k", "structured_"))
         else "k4_v4_scaled",
         Rotation.FWHT if mode == "fwht" else Rotation.DENSE_QR,
     )
@@ -86,6 +87,7 @@ def test_current_cache_values_feed_attention(
         "k5_v3_scaled",
         "k6_v2_scaled",
         "k8_v4_scaled",
+        "structured_k8_v4_scaled",
     )
     if mode != "full":
         before = tile_kv_attention(before, config, 7, rotated=mode != "tiled")

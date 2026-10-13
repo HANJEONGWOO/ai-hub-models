@@ -10,6 +10,272 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Structured K8 versus frozen Lloyd-Max K8 (opt-in, 2026-10-13)
+
+Branch `exp/structured-k8-codebook` starts at `exp/hardware-aligned-mixed-kv`
+(`c022fecee`). Existing profiles, hashes, binaries and earlier reports are
+preserved. No automatic commit or default promotion is performed.
+
+Compare `mixed_k6_v2_uniform` with `mixed_k6_v2_uniform_structured_k8`.
+Both use **K8 on odd zero-based layers 1,3,...,27**, K4 on the other 14 layers
+and **V2 on all 28 layers**. Average index payload is K6/V2 = eight bits;
+FP16 scales are additional. Each allocates 28 MiB of indices + 0.875 MiB of
+scales = **28.875 MiB** at CL1024. No placement search, retraining,
+recalibration or extra token metadata. Dense K42/V542, current/past compression,
+norm correction, W4A16 weights, tile256 FP16-input attention, GQA and V/AV
+remain unchanged.
+
+### Structured rule and offline fit
+
+For normalized/rotated K, the logical code has sign1 + region1 + local6 bits:
+
+```text
+m = abs(y)
+r = (m > region_boundary)
+k = clip(floor((m - offset[r]) * reciprocal_step[r] + 0.5), 0, 63)
+j = 64*r + k
+byte = (y >= 0) ? 128+j : 127-j
+centroid_magnitude = FP16(FP16(k * step[r]) + offset[r])
+```
+
+Negative magnitude fields are complemented to retain the existing ascending
+symmetric LUT ABI. Zero maps to code128. The index is monotone and saturates
+to [0,255]; arithmetic ties follow the floor rule, not LM's lower-index tie
+convention. FP16 execution may move decisions near edges and is validated
+separately. UINT8 stores the index directly, without regrouping.
+
+| Shared coefficient | Central region | Tail region |
+|---|---:|---:|
+| Offset | 0.00089263916015625 | 0.1268310546875 |
+| Spacing | 0.001956939697265625 | 0.00376129150390625 |
+
+Region boundary: **0.125518798828125** before HTP FP16 rounding.
+`optimize_structured_k8.py` fits four shared coefficients using analytic
+integrated scalar MSE under **N(0,1/128)**, nine fixed initial points, and
+positive-spacing/ordering constraints. The region edge is the midpoint of
+the last central and first tail centroid. No LM centroid fitting, actual-KV
+tuning, attention loss, PPL selection or global-optimum claim.
+`optimization.json` records all initializations, optimizer statuses and hashes.
+The deployed constants are frozen in `structured_k8.py`; experiment preparation
+rejects a mismatching offline fit.
+
+Encoder scalar-index and centroid selection use region/arithmetic operations
+instead of an expanded boundary tree. Norm correction uses the selected
+centroid vector and still stores one FP16 effective scale. The **same existing
+Native HVX LUT decoder binary** serves both groups; only the static K8 LUT
+contents differ. This isolates quantizer changes, not an arithmetic HVX
+decoder, bit-plane attention or CPU inference fallback.
+
+Standalone K8 encoder ONNX nodes fall from **837 to 76**: scalar indexing
+547 to 23 and centroid/norm-scale 268 to 31, while the single Dense MatMul
+and normalization path remain. Node counts are structural, not latency ratios.
+
+### Accuracy and numerical validation
+
+Offline errors use two frozen pre-existing validation documents from
+`k_rotation_quality_20261006`, all 28 layers, 32 fixed queries/window and
+causal scores only. Reference: the same W4A16 model's FP16-KV captures, not
+full-FP16 weights. Q includes attention scaling. The emulator uses FP16
+operation boundaries and FP32 reductions, **not HTP bit-exact execution**.
+These documents never influence coefficient selection.
+
+| Offline metric | Frozen LM K8 | Structured K8 |
+|---|---:|---:|
+| K reconstruction MSE, K8 layers only | 0.002105271 | 0.000921581 |
+| QK score MSE, K8 layers only | 0.006115046 | 0.002429114 |
+| K reconstruction MSE, all 28 layers | 0.125806955 | 0.125215109 |
+| QK score MSE, all 28 layers | 0.291169141 | 0.289326175 |
+| Analytic Gaussian nearest-centroid scalar MSE | 1.305468e-6 | 4.793545e-7 |
+
+K reconstruction includes inverse-rotation FP16 rounding. QK compares raw
+scaled scores before masking/softmax and existing affine score grids. JSON
+also retains relative MSE, rotated-coordinate/reference variants and each
+layer/document. All-layer metrics include unchanged K4 layers. The Gaussian
+row evaluates nearest frozen centroids, **not** the complete arithmetic,
+FP16, norm-corrected codec. Structured's ideal pre-rounding fit is 4.791253e-7.
+The existing LM table uses only **100 Lloyd iterations** and is not assumed
+converged: this comparison does **not** establish superiority over an optimal
+unrestricted LM codebook.
+
+CPU regression: **643 passed**, with two existing SWIG deprecation warnings.
+Tests include boundary neighbors, zero/sign symmetry, saturation, exact
+arithmetic/LUT centroid agreement, legacy hashes, memory budget, K4/V isolation,
+GQA/current/past attention, packing, reset and incompatible-cache rejection.
+Both Native K8 LUTs pass HTP probes at 1/3/256 tokens, bit-exact against the
+independent FP16 LUT-times-scale reference. All encoder index mismatches are
+explained by the unchanged boundary tolerance; all encoder ops execute on HTP.
+
+| HTP max scale-relative error | AR1 | AR128 |
+|---|---:|---:|
+| LM K8 | 0.1326% (pass) | 0.2570% (fail) |
+| Structured K8 | 0.1106% (pass) | 0.1726% (pass) |
+| Unchanged V4 probe | 0.1653% (pass) | 0.2477% (fail) |
+
+The **0.2% scale tolerance is unchanged**. V4 is the standalone probe's
+companion, not the mixed full model's V2 setting. Failures are retained, not
+waived by PPL/decoder correctness. Initial `encoder_structured/` preflight
+used an LM-only nearest-centroid comparator and stopped **before device
+execution**. It is preserved; the corrected comparator checks arithmetic
+decision edges with unchanged tolerances. `encoder_structured_checked/` is
+the sole executed structured encoder probe.
+
+### Isolated HTP work, not end-to-end speed
+
+Same captured layer27 K, eight heads x 128 tokens x 128 coordinates:
+
+| Diagnostic | LM K8 | Structured K8 |
+|---|---:|---:|
+| Scalar named-op cycles | 16,264,853 | 815,868 |
+| Centroid/norm-scale named-op cycles | 12,872,992 | 777,423 |
+| Packing/output-cast named-op cycles | 40,979 | 248,925 |
+| SDK encoder accelerator execute (us) | 2,408 | 611 |
+| Native Decode8 cycles, 256 tokens | 592,816 | 581,015 |
+
+Both store direct bytes. The packing row includes casts and compiler
+ownership/fusion attribution, not additional bit regrouping. Named-op counters
+are **not** additive wall latency or physical busy intervals. Native uses
+qnn-net-run's default power policy; encoder/full-model policies differ. The
+same decoder kernel means its small timing difference is not evidence of a
+new decoder speedup. Physical optrace is a separate diagnostic, not another
+performance sample.
+
+### Full-model results and reproduction
+
+Conditions: Qwen3-1.7B, S26 Ultra / SM8850 V81, QAIRT 2.48.0.260626, CL1024, HTP burst;
+one unprofiled short35+128 and one long897+128 session per group; four legacy
+WikiText windows scored once, aggregate `exp(total_NLL/4092)`. No timing
+dispersion estimate or independent-heldout generalization claim. LM was
+measured first and Structured after its build; no interleaved repeats or
+thermal-equivalence claim.
+
+| Full-model metric | Frozen LM K8 | Structured K8 |
+|---|---:|---:|
+| Mean NLL, 4092 scored tokens | 3.177364372 | 3.161762996 |
+| PPL, same four WikiText windows | 23.983459 | 23.612187 |
+| Short35 TTFT (ms) | 98.014635 | 64.918489 |
+| Short35 prefill (tok/s) | 360.649493 | 543.416300 |
+| Short35 decode (tok/s) | 33.524392 | 36.379635 |
+| Long897 TTFT (ms) | 809.351198 | 551.787239 |
+| Long897 prefill (tok/s) | 1109.644960 | 1628.566330 |
+| Long897 decode (tok/s) | 32.782912 | 35.569449 |
+| KV cache allocation (MiB) | 28.875000 | 28.875000 |
+| I/O buffers (MiB) | 96.929203 | 96.929203 |
+| Long897 ending VmRSS (MiB) | 154.664063 | 151.484375 |
+| Long897 process VmHWM (MiB) | 605.996094 | 606.226563 |
+| Four context binaries (MiB) | 1635.695313 | 1621.328125 |
+| Long897 mean decode KV prepare (ms/token) | 1.153872 | 1.153801 |
+| Long897 mean decode QNN execute (ms/token) | 28.744591 | 26.361148 |
+
+Cache size is actual runner allocation (30,277,632 bytes), not compressed
+model weight size or total NPU/OS memory. VmRSS/VmHWM are host-process
+observations; they do not include every device allocation. Graph audits pass
+for identical I/O, all non-K8-quantizer nodes and shared constants; K4, V,
+rotation, MatMul and attention paths remain fixed. Both cache-reset checks
+pass.
+
+| WikiText window | LM PPL | Structured PPL | Structured minus LM mean NLL |
+|---|---:|---:|---:|
+| w0 | 12.935116 | 12.735461 | -0.015556 |
+| w1 | 32.120600 | 30.832466 | -0.040929 |
+| w2 | 23.846844 | 24.072429 | +0.009415 |
+| w3 | 33.393533 | 32.885319 | -0.015336 |
+
+In this single-run comparison, Long897 TTFT falls **31.82%**, prefill rises
+**46.76%**, and decode rises **8.50%**, with identical KV/I/O storage. PPL
+falls **1.55%**, but one of four windows worsens; this is not a generalization
+or significance claim. Improvement is relative to the existing frozen,
+100-iteration LM implementation, not an optimally converged LM quantizer.
+The unchanged HVX decoder and KV preparation leave substantial decode work
+untouched. Do not extrapolate the encoder probe's speed ratio to the whole
+model, or interpret profile cycle percentages as TTFT reductions.
+
+### Full-model physical optrace
+
+One separate 897+128 diagnostic per group, **44 traces each**: eight AR128
+prefill calls across four parts, then decode steps 0/63/126 across four parts.
+The first prefill call has one valid token; the other seven have 128. Generated
+IDs match each group's unprofiled run. Units below are **million physical
+HVX/HMX busy cycles**, summed across workers, layers and calls, not ms or wall
+latency. DMA/waits and physical interval unions remain separate in raw reports.
+
+| Stage, all K/V layers | Prefill LM | Prefill Structured | Decode126 LM | Decode126 Structured |
+|---|---:|---:|---:|---:|
+| Normalize | 237.763 | 226.977 | 1.407 | 1.369 |
+| Dense rotation | 1.380 | 1.510 | 0.0175 | 0.0172 |
+| Scalar index | 1891.748 | 371.655 | 12.755 | 1.992 |
+| Centroid/norm-scale correction | 1624.942 | 363.636 | 8.277 | 1.805 |
+| Packing/output cast | 260.123 | 286.421 | 4.055 | 3.829 |
+| Native current-KV decode | 85.973 | 81.099 | 4.989 | 4.990 |
+| Native past-KV decode | 491.510 | 489.890 | 65.248 | 66.067 |
+
+K8-only attribution, sum over the fixed 14 odd layers, same cycle units:
+
+| K8 stage | Prefill LM | Prefill Structured | Decode126 LM | Decode126 Structured |
+|---|---:|---:|---:|---:|
+| Scalar index | 1615.501 | 96.051 | 11.378 | 0.629 |
+| Centroid/norm-scale correction | 1354.557 | 87.253 | 7.011 | 0.520 |
+| Packing/output cast | 2.585 | 33.145 | 0.0036 | 0.2038 |
+| Native past-K decode | 212.546 | 206.192 | 26.287 | 27.043 |
+
+The encoder saving is from **index and centroid selection**, not eliminating
+packing: both K8 variants already store direct UINT8. K8 prefill scalar work
+falls about 94.1% and correction work about 93.6%. Across all K/V layers these
+reductions are 80.4% and 77.6%. Packing/output-cast attribution increases
+(10.1% across all K/V prefill), reflecting real cast/format work and compiler
+fusion/ownership; it is retained rather than reported as zero or attributed
+to new bit packing. The arithmetic path's extra attributed cast work does
+not offset its much larger index/correction savings in this experiment.
+
+Dense rotation still executes on HMX; Native decoding executes on HVX.
+Physical stage counters include compiler-fused kernels, not just standalone
+named-op totals. Past-KV Native decoding is essentially unchanged across
+the full model and dominates the remaining codec work at decode126, which
+helps explain why decode improves less than prefill. Different downstream
+activation values and single-session variability can also affect counters;
+the isolated same-input probes above complement, not replace, this trace.
+No cycle-percentage reduction is used as a latency-percentage estimate.
+
+Artifacts: `/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_20261013`.
+Reproduce into a **fresh** root; repeated measurements are refused:
+
+```bash
+export PYTHONPATH=src
+TQ_SK8_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_NEW
+venv/bin/python scripts/llm/turboquant/optimize_structured_k8.py --out "$TQ_SK8_ROOT/codebook/optimization.json"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_k8_once.py prepare --root "$TQ_SK8_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_k8_once.py probe --root "$TQ_SK8_ROOT"
+venv/bin/python scripts/llm/turboquant/evaluate_structured_k8_quality.py --root "$TQ_SK8_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_k8_once.py build --root "$TQ_SK8_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_k8_once.py evaluate --root "$TQ_SK8_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_structured_k8_once.py summarize --root "$TQ_SK8_ROOT"
+TQ_SK8_TRACE="$TQ_SK8_ROOT/structured_k8_NEW_optrace"
+for stage in freeze build measure render summarize; do
+  venv/bin/python scripts/llm/turboquant/profile_structured_k8_once.py "$stage" \
+    --experiment "$TQ_SK8_ROOT" --root "$TQ_SK8_TRACE" || break
+done
+venv/bin/python scripts/llm/turboquant/summarize_mixed_profiles.py \
+  --experiment "$TQ_SK8_ROOT" --root "$TQ_SK8_TRACE" \
+  --groups mixed_k6_v2_uniform mixed_k6_v2_uniform_structured_k8
+```
+
+The harness reuses frozen LM model binaries and `native_symmetric8` from the
+previous mixed experiment, **not its performance measurements**. Source
+audits check weights/calibration, all V/K4/rotation/attention nodes; compiled
+audits check FP16 boundaries and cache I/O. Config hashes include coefficients,
+LUT and index-rule identity, rejecting mixed LM/structured caches.
+
+Key artifacts under the root: `protocol.json`, `codebook/optimization.json`,
+`offline_quality.json`, `isolated_probes.json`, `comparison.json`/`.csv`,
+`reports/k8_only_audit.json`, `tests/cpu_regression_complete.xml` and
+`final_verification.json`. Physical comparisons and detailed per-stage/per-bit
+CSVs are under `structured_k8_20261013_optrace/`. Previous result files,
+failed preflight artifacts and numerical gate failures are preserved.
+
+Implementation: `structured_k8.py`, `config.py`, `reference.py`, `export.py`,
+`native_decoder.py`, `numerics.py`; experiment/quality/profile/probe-summary
+scripts named `*structured_k8*`; opt-in HTP probe arguments and extended
+codec/current-KV tests. Historical experiment sections below are unchanged.
+
 ## Hardware-aligned mixed-bit experiment (opt-in)
 
 `mixed_k5_v3_uniform`, `mixed_k6_v2_uniform` and their `*_mse` variants

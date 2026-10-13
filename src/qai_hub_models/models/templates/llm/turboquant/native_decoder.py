@@ -14,7 +14,7 @@ from onnx import TensorProto, helper, numpy_helper
 
 from qai_hub_models.models.templates.llm.turboquant.config import TurboQuantConfig
 from qai_hub_models.models.templates.llm.turboquant.graph_surgery import SurgeryResult
-from qai_hub_models.models.templates.llm.turboquant.reference import load_codebook
+from qai_hub_models.models.templates.llm.turboquant.reference import spec_codebook
 from qai_hub_models.models.templates.llm.turboquant.tiled_attention import _prune
 
 NATIVE_DOMAIN = "turboquant"
@@ -27,6 +27,8 @@ def native_op(config: TurboQuantConfig, kind: str) -> str:
 
 
 def native_table(config: TurboQuantConfig, kind: str) -> str:
+    if getattr(config, kind).quantizer != "lloyd_max":
+        return "tq_native_structured_k8_centroids_fp16"
     if config.qjl and kind == "key":
         return "tq_native_key3_centroids_fp16"
     bits = getattr(config, kind).bits
@@ -69,7 +71,7 @@ def use_native_decoder(
         if table_name in tables:
             continue
         tables.add(table_name)
-        values = load_codebook(getattr(layer_config, kind).bits, 128)
+        values = spec_codebook(getattr(layer_config, kind), 128)
         if config.qjl and kind == "key":
             values = np.tile(values, 2)
         graph.initializer.append(

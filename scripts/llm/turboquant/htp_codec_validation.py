@@ -656,6 +656,7 @@ def main() -> None:
             "k5_v3_scaled",
             "k6_v2_scaled",
             "k8_v4_scaled",
+            "structured_k8_v4_scaled",
         ],
         default=PROFILE,
     )
