@@ -176,7 +176,7 @@ def _restore_tile(
     sg.extend(
         decode_subgraph(
             config,
-            getattr(config, io.kind),
+            config.codec_for(io.kind, io.layer),
             packed,
             norm,
             restored,

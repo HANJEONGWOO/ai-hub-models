@@ -27,6 +27,9 @@ def main() -> None:
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--pilot-label", default="pilot")
     parser.add_argument(
+        "--device-prefix", help="Unique remote namespace; defaults to root basename."
+    )
+    parser.add_argument(
         "--groups",
         nargs="+",
         default=["fp16", "turboquant"],
@@ -35,6 +38,9 @@ def main() -> None:
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.root.name):
         raise ValueError("Root basename must be safe for a device directory")
+    device_prefix = args.device_prefix or args.root.name
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", device_prefix):
+        raise ValueError("Device prefix must be safe for a device directory")
     reference = read(args.reference_reports / "experiment.json")
     for group in args.groups:
         if (
@@ -112,7 +118,7 @@ def main() -> None:
         output.mkdir(exist_ok=False)
         _, source = source_for("turboquant")
         binary, meta = checked_context("turboquant", 2)
-        remote = f"{DEVICE_ROOT}/diagnostics/{args.root.name}_{args.pilot_label}"
+        remote = f"{DEVICE_ROOT}/diagnostics/{device_prefix}_{args.pilot_label}"
         adb("shell", f"test ! -e {remote} && mkdir -p {remote}/trace")
         push(binary, remote + "/part2_of_4.bin")
         package = native(source, remote)
@@ -197,7 +203,7 @@ def main() -> None:
             != source["native_decoder"]["libraries"]["hexagon-v81"]["sha256"]
         ):
             raise ValueError("Reference and profiled runtime kernels differ")
-        name = args.root.name + "_" + group
+        name = device_prefix + "_" + group
         remote = f"{DEVICE_ROOT}/bundles/{name}"
         adb("shell", f"test ! -e {remote} && mkdir -p {remote}")
         contexts = {}

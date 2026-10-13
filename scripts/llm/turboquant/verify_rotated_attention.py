@@ -86,8 +86,10 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
     conversion = json.loads((bundle / "convert_report.json").read_text())
     config = conversion["config"]
 
-    def expected_decoder(kind: str) -> str:
+    def expected_decoder(kind: str, layer: int) -> str:
         bits = 4 if config.get("qjl") and kind == "key" else config[kind]["bits"]
+        if plan := config.get("layer_plan"):
+            bits = plan["bits"][layer][kind == "value"]
         return f"Decode{bits}"
 
     errors: list[str] = []
@@ -227,7 +229,7 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                     native = info.producer.get(prefix + "native_fp16")
                     if (
                         native is None
-                        or native.op_type != expected_decoder(kind)
+                        or native.op_type != expected_decoder(kind, number)
                         or [t.dtype for t in native.inputs]
                         != ["Uint_8", "Float_16", "Float_16"]
                         or [t.dtype for t in native.outputs] != ["Float_16"]
@@ -284,7 +286,8 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                 decoder = info.producer.get(prefix + "native_fp16")
                 if (
                     decoder is None
-                    or decoder.op_type != expected_decoder(entry["kind"])
+                    or decoder.op_type
+                    != expected_decoder(entry["kind"], entry["layer"])
                     or [t.dtype for t in decoder.inputs]
                     != ["Uint_8", "Float_16", "Float_16"]
                     or decoder.inputs[0].name != entry["packed"]
@@ -318,7 +321,18 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                     errors.append(f"Current QJL correction is missing: {prefix}")
     elif current_entries:
         errors.append("Current-token policy disagrees with graph manifest.")
-    current = get_profile(conversion["profile"], Rotation(config["rotation"]))
+    plan = config.get("layer_plan")
+    current = get_profile(
+        conversion["profile"],
+        Rotation(config["rotation"]),
+        layer_plan={
+            **plan,
+            "profile": conversion["profile"],
+            "config_hash": conversion["config_hash"],
+        }
+        if plan and conversion["profile"] == "k4_v8_custom"
+        else None,
+    )
     if current.config_hash() != conversion["config_hash"]:
         errors.append("Bundle rotation/config hash does not match current constants.")
     errors.extend(verify_rotations(graph, config))
@@ -377,8 +391,7 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
         "new_tokens": layers[0]["new_tokens"],
         "max_rotated_intermediate_bytes": max(sizes, default=0),
         "native_decoder_ops": sum(
-            op.op_type in {"Decode2", "Decode3", "Decode4", "Decode5", "Decode6"}
-            for op in info.ops
+            op.op_type in {f"Decode{b}" for b in range(2, 9)} for op in info.ops
         ),
         "rotation": config["rotation"],
         "quantize_current_kv": conversion.get("quantize_current_kv", False),

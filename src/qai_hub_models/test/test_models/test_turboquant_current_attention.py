@@ -53,6 +53,7 @@ from qai_hub_models.test.test_models import test_turboquant_tiled_attention as f
         "fwht",
         "k5_v3_scaled",
         "k6_v2_scaled",
+        "k4_v8_scaled",
     ],
 )
 @pytest.mark.parametrize(("seq", "valid"), [(1, 0), (3, 13), (128, 0)])
@@ -78,7 +79,14 @@ def test_current_cache_values_feed_attention(
     )
     model, enc = fixture.attention_part(seq, key_divisor)
     before = apply_kv_profile(model, enc, config, seq, context)
-    native = mode in ("native", "qjl", "fwht", "k5_v3_scaled", "k6_v2_scaled")
+    native = mode in (
+        "native",
+        "qjl",
+        "fwht",
+        "k5_v3_scaled",
+        "k6_v2_scaled",
+        "k4_v8_scaled",
+    )
     if mode != "full":
         before = tile_kv_attention(before, config, 7, rotated=mode != "tiled")
     if native:

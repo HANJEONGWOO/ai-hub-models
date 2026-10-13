@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
-"""ONNX lowering of PolarQuant encode/decode (4-bit legacy; scaled 2..6-bit).
+"""ONNX lowering of PolarQuant encode/decode (4-bit legacy; scaled 2..8-bit).
 
 The subgraphs use only ops the QNN HTP backend implements for FP16/INT32 tensors
 (QAIRT 2.48 op-def supplement): HTP has no bitwise ops and no UINT_8 arithmetic,
@@ -80,7 +80,7 @@ class Subgraph:
 def _check_supported(spec: KVCodecSpec, config: TurboQuantConfig) -> None:
     if not spec.is_polar or (spec.bits != 4 and not config.precomputed_norm):
         raise NotImplementedError(
-            "ONNX lowering requires 4-bit or scaled 2..6-bit PolarQuant."
+            "ONNX lowering requires 4-bit or scaled 2..8-bit PolarQuant."
         )
     if config.block_size % 8:
         raise ValueError("Packed codecs require a block size divisible by eight.")
@@ -124,8 +124,8 @@ def _scalar_index_tree(
     Leaf selection uses bit*hi + (1-bit)*lo: static/static Where fails HTP
     detailed execution, while lo + bit*(hi-lo) can shift FP16 boundaries.
     """
-    if bits not in (2, 3, 4, 5, 6):
-        raise ValueError("Scalar tree requires a frozen 2..6-bit codebook.")
+    if bits not in range(2, 9):
+        raise ValueError("Scalar tree requires a frozen 2..8-bit codebook.")
     boundaries = load_boundaries(bits, block_size).astype(np.float32)
 
     def constant(name: str, value: float) -> str:
@@ -384,7 +384,15 @@ def encode_subgraph(
         [index, sg.shape([heads, num_tokens, d])],
         [f"{p}index"],
     )
-    if storage_bits(config, spec) == 4:
+    if storage_bits(config, spec) == 8:
+        # An 8-bit Lloyd-Max index IS the stored byte. No bit regrouping.
+        sg.node("Cast", [f"{p}index"], [f"{p}byte_u8"], to=TensorProto.UINT8)
+        sg.node(
+            "Reshape",
+            [f"{p}byte_u8", sg.shape([*storage_lead, num_tokens, d])],
+            [packed_out],
+        )
+    elif storage_bits(config, spec) == 4:
         sg.node("Slice", [f"{p}index", start0, end_d, axis2, step2], [f"{p}index_hi"])
         sg.node("Slice", [f"{p}index", start1, end_d, axis2, step2], [f"{p}index_lo"])
         sg.node("Mul", [f"{p}index_hi", sixteen], [f"{p}index_hi_shifted"])
@@ -451,7 +459,7 @@ def _select_centroid(
     block_size: int,
     prefix: str,
 ) -> str:
-    """Symmetric affine-pair lookup for frozen 2..6-bit centroid tables.
+    """Symmetric affine-pair lookup for frozen 2..8-bit centroid tables.
 
     The frozen codebook is symmetric. Fold indices to magnitudes 0..7, then
     select one of four lines, each interpolating two adjacent centroids.
@@ -459,8 +467,8 @@ def _select_centroid(
     all elementwise operations keep head_dim innermost. Where leaves depend
     on the input (constant-only leaves fail HTP detailed profiling).
     """
-    if bits not in (2, 3, 4, 5, 6) or not np.array_equal(centroids, -centroids[::-1]):
-        raise ValueError("Affine-pair lookup requires a symmetric 2..6-bit codebook.")
+    if bits not in range(2, 9) or not np.array_equal(centroids, -centroids[::-1]):
+        raise ValueError("Affine-pair lookup requires a symmetric 2..8-bit codebook.")
     p = prefix
 
     def scalar(name: str, value: float) -> str:
@@ -580,7 +588,9 @@ def decode_subgraph(
             [f"{p}canonical_norm"],
         )
         norm_in = f"{p}canonical_norm"
-    if storage_bits(config, spec) == 4:
+    if storage_bits(config, spec) == 8:
+        sg.node("Identity", [f"{p}byte_f"], [f"{p}index_f"])
+    elif storage_bits(config, spec) == 4:
         sg.node("Mul", [f"{p}byte_f", inv16], [f"{p}byte_div16"])
         sg.node("Floor", [f"{p}byte_div16"], [f"{p}nibble_hi"])
         sg.node("Mul", [f"{p}nibble_hi", sixteen_f], [f"{p}nibble_hi16"])

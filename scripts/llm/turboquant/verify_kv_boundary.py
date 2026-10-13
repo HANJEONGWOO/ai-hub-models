@@ -345,7 +345,7 @@ def check_graph(
     violations = report["violations"]
     for layer in layers:
         for kind in ("key", "value"):
-            spec = config.key if kind == "key" else config.value
+            spec = config.codec_for(kind, layer)
             if not spec.modifies_graph:
                 continue
             present = f"past_{kind}_{layer}_out"
@@ -546,7 +546,17 @@ def main() -> None:
     bundle = args.bundle.expanduser()
     convert_report = json.loads((bundle / "convert_report.json").read_text())
     profile = args.profile or convert_report["profile"]
-    config = get_profile(profile)
+    plan = convert_report["config"].get("layer_plan")
+    config = get_profile(
+        profile,
+        layer_plan={
+            **plan,
+            "profile": profile,
+            "config_hash": convert_report["config_hash"],
+        }
+        if plan and profile == "k4_v8_custom"
+        else None,
+    )
     graphs = args.graphs or sorted(
         p.stem.removesuffix(".dlcinfo") for p in bundle.glob("*.dlcinfo.txt")
     )

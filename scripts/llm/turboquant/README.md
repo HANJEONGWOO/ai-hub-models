@@ -10,6 +10,302 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+<!-- Boundary-V experiment is opt-in; historical sections below are preserved. -->
+
+## Boundary-aware V protection (2026-10-13, opt-in)
+
+Work branch: `exp/boundary-v-quantization`, based on
+`exp/asymmetric-kv-quantization` at `b751124c3`. Only codec, UINT8 storage,
+HVX decoder and layer-I/O support are reused from `exp/hardware-aligned-mixed-kv`
+at `c022fecee`; its allocation optimizer, profiles and experimental results are
+not copied or changed. No commit or default promotion is performed.
+
+All 28 Qwen3-1.7B layers retain **K4**, Dense K42/V542, exact LM tree,
+frozen Lloyd-Max centroids, QJL-off, compressed current/past KV, FP16 effective
+scales with norm correction, Native HVX LUT and rotated tile256 attention.
+Weights, activation calibration, Query rotation, QK/AV and GQA stay unchanged.
+V8 is non-affine **256-centroid Lloyd-Max**, not INT8 affine quantization. Its
+index is stored directly in one UINT8 byte; no Slice/Shift/Concat repacking.
+V2 retains the existing tight two-bit format. The decoder restores FP16 V
+tiles for the unchanged AV path; this is not fused packed attention.
+
+Layer IDs are zero-based. No placement selection or training is performed.
+
+| Group | Opt-in profile | V8 layers | Other V | Index payload | FP16 scales | CL1024 host KV |
+|---|---|---|---|---:|---:|---:|
+| K4/V4 | `k4_v4_scaled` (unchanged default) | none | V4 | 28 MiB | 0.875 MiB | 28.875 MiB |
+| K4/V2 | `k4_v2_scaled` | none | V2 | 21 MiB | 0.875 MiB | 21.875 MiB |
+| Boundary V8 | `k4_v8_boundary` | 0, 1, 26, 27 | V2 | 24 MiB | 0.875 MiB | 24.875 MiB |
+| Middle V8 | `k4_v8_middle` | 12, 13, 14, 15 | V2 | 24 MiB | 0.875 MiB | 24.875 MiB |
+
+Boundary and Middle have identical budgets: average V = 20/7 bits and
+K+V = 48/7 bits, excluding scales. Each adds 3 MiB (+13.714%) over K4/V2
+and saves 4 MiB (-13.853%) relative to K4/V4. These are cache array sizes,
+not model weights or every internal HTP allocation. The runtime's actual
+cache and I/O allocation are checked separately from the formulas.
+
+### Single-run full-model results
+
+S26 Ultra / SM8850 V81, QAIRT 2.48.0.260626, same W4A16 checkpoint,
+CL1024, HTP burst. All four groups are freshly measured; the K4/V4 binaries
+alone are reused. **Long input: 897 prompt + 128 generated tokens.**
+
+| Group | Four-window PPL | Mean NLL | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) | Actual KV (MiB) |
+|---|---:|---:|---:|---:|---:|---:|
+| K4/V4 | 25.660831 | 3.244966 | 556.31 | 1615.27 | 37.80 | 28.875 |
+| K4/V2 | 28.345872 | 3.344481 | 535.93 | 1676.83 | 38.46 | 21.875 |
+| Boundary V8 | 26.041064 | 3.259675 | 616.19 | 1458.05 | 36.53 | 24.875 |
+| Middle V8 | 27.905470 | 3.328823 | 612.72 | 1466.39 | 36.29 | 24.875 |
+
+**Short input: 35 prompt + 128 generated tokens**, also fixed CL1024 and
+one unprofiled session per group:
+
+| Group | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) |
+|---|---:|---:|---:|
+| K4/V4 | 66.44 | 531.03 | 38.56 |
+| K4/V2 | 63.84 | 551.62 | 39.15 |
+| Boundary V8 | 73.78 | 477.20 | 37.29 |
+| Middle V8 | 69.08 | 509.03 | 37.90 |
+
+Window PPLs are descriptive; the aggregate above uses summed NLL:
+
+| Window | K4/V4 | K4/V2 | Boundary V8 | Middle V8 |
+|---|---:|---:|---:|---:|
+| w0 | 13.876348 | 15.239544 | 14.619466 | 15.212708 |
+| w1 | 33.952901 | 37.967250 | 35.112796 | 37.134075 |
+| w2 | 25.053085 | 29.929226 | 26.964656 | 29.361657 |
+| w3 | 36.734116 | 37.280581 | 33.223326 | 36.559283 |
+
+**Primary finding:** Boundary beats Middle on aggregate PPL and **all four
+windows** at the same actual cache/I/O budget. This supports boundary-layer
+V protection on this model and these windows. It does not isolate the first
+two layers' contribution from the last two layers', establish a universal
+layer rule, or constitute independent heldout generalization.
+
+Relative to K4/V2, each protection scheme costs exactly **3 MiB** more cache:
+
+| Change versus K4/V2 | Boundary V8 | Middle V8 |
+|---|---:|---:|
+| PPL reduction | 2.304808 (8.131%) | 0.440402 (1.554%) |
+| Mean NLL reduction | 0.084807 | 0.015659 |
+| Recovery of K4/V2 minus K4/V4 NLL gap | 85.219% | 15.735% |
+| Long TTFT increase | 14.976% | 14.329% |
+| Long decode latency/token increase | 5.278% | 5.984% |
+
+Recovery means `(NLL_V2 - NLL_candidate)/(NLL_V2 - NLL_V4)`; it is relative
+to **K4/V4**, not an FP16 ground truth or a generic percentage of accuracy.
+Boundary remains slightly worse than K4/V4 in aggregate PPL (26.041 vs 25.661),
+while saving 4 MiB of KV. It is a memory/quality trade-off, **not a speed win**:
+both protection schemes are slower than K4/V2 in this single-run measurement.
+Boundary versus Middle has no consistent speed ordering across short/long
+conditions; small timing differences must not be treated as statistically
+established. No extra run was selected to improve the reported numbers.
+
+Actual long-run memory and mean decode components:
+
+| Group | I/O buffers (MiB) | End VmRSS (MiB) | Process VmHWM (MiB) | Binaries total (MiB) | KV prepare (ms/token) | QNN (ms/token) |
+|---|---:|---:|---:|---:|---:|---:|
+| K4/V4 | 96.929 | 151.727 | 606.355 | 1623.312 | 1.133 | 24.726 |
+| K4/V2 | 82.929 | 130.293 | 605.855 | 1622.039 | 0.890 | 24.509 |
+| Boundary V8 | 88.929 | 140.520 | 605.996 | 1627.129 | 1.013 | 25.755 |
+| Middle V8 | 88.929 | 139.469 | 605.273 | 1626.258 | 1.022 | 25.920 |
+
+VmRSS/VmHWM are host process measurements, not every internal HTP allocation.
+All four source/compiled audits pass; K/Query nodes and rotation constants,
+non-codec graph nodes, weights and activation encodings remain unchanged.
+All cache-reset checks pass, and long generation reaches 1024 cached tokens.
+The historical K4/V4 PPL is reproduced exactly. The strict encoder numeric
+failure below is tracked separately and is **not** waived by these checks.
+
+### Frozen protocol and reproduction
+
+Artifacts: `/mnt/d/ai-hub-models/binaries/turboquant/boundary_v_20261013`.
+`protocol.json` freezes profiles, layer plans, codebook/rotation/config hashes,
+the unchanged baseline binaries, runner, checkpoint manifest, Native package
+and input token hashes. Incompatible cache/config hashes are rejected.
+`probe_protocol.json` separately fixes codec diagnostic inputs and tolerances.
+
+The user's follow-up overrides the original three repetitions: **one
+unprofiled short35+128 and one long897+128 session per group**, CL1024,
+AR128 prefill and AR1 decode, HTP burst, model loading excluded from TTFT.
+Group order is K4/V4, K4/V2, Boundary, Middle. There is no mean/standard
+deviation across repeats or statistical timing superiority claim. Battery
+temperature before/after is recorded, not actively controlled.
+Each legacy WikiText window is teacher-forced once, 1023 targets per window,
+4092 in total. Aggregate PPL is `exp(sum(NLL_sum)/4092)`, not mean window PPL.
+The four windows are reused historical evaluation data, **not new heldout**.
+Separate reset checks and diagnostic traces are not performance samples.
+
+Use a **fresh** root; the scripts refuse duplicate measurements/attempt logs:
+
+```bash
+TQ_V_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/boundary_v_NEW
+export PYTHONPATH=src
+venv/bin/python scripts/llm/turboquant/native_decoder/build.py --out "$TQ_V_ROOT/native" --test-hvx
+venv/bin/python scripts/llm/turboquant/benchmark_boundary_v_once.py prepare --root "$TQ_V_ROOT"
+venv/bin/python scripts/llm/turboquant/validate_boundary_v.py run --root "$TQ_V_ROOT"
+venv/bin/python scripts/llm/turboquant/validate_boundary_v.py summarize --root "$TQ_V_ROOT"
+venv/bin/python scripts/llm/turboquant/summarize_boundary_v_probes.py --root "$TQ_V_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_boundary_v_once.py build --root "$TQ_V_ROOT" --build-jobs 3
+venv/bin/python scripts/llm/turboquant/benchmark_boundary_v_once.py evaluate --root "$TQ_V_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_boundary_v_once.py summarize --root "$TQ_V_ROOT"
+for stage in freeze build measure render summarize; do
+  venv/bin/python scripts/llm/turboquant/profile_boundary_v_once.py "$stage" \
+    --experiment "$TQ_V_ROOT" --root "$TQ_V_ROOT/optrace" || break
+done
+venv/bin/python scripts/llm/turboquant/summarize_boundary_v_profiles.py \
+  --experiment "$TQ_V_ROOT" --root "$TQ_V_ROOT/optrace"
+```
+
+All device runs are serial. `--build-jobs` controls host compilation only;
+choose 1 if memory is limited. Existing K4/V4 binaries are reused unchanged;
+the other three bundles are built in new directories. Native package defaults,
+old model bundles and earlier reports are untouched. QAIRT's `float fallback`
+in conversion logs refers to FP16 **on HTP**, not CPU inference fallback.
+
+### Codec validation
+
+CPU regression: **647 passed** (two existing SWIG deprecation warnings).
+Coverage includes 8-bit boundaries/extremes, packing, non-affine codebook,
+layer budgets, unchanged baseline hashes, Native current/past routing,
+batch/token-wise cache equality, reset, state restore and mixed-cache rejection.
+HVX host tests cover exact FP16 LUT products, lane order, unaligned access,
+slice tails and guard pages. Device Native Decode2/4/8 is bit-exact against
+the independent FP16 LUT-times-stored-scale reference for 1/3/256 tokens.
+There are zero unexplained encoder index mismatches.
+
+**The strict encoder scale gate remains failed; its 0.2% tolerance is unchanged.**
+
+| Codec | AR1 max relative scale error | AR128 max relative scale error |
+|---|---:|---:|
+| K4 (all groups) | 0.1802% (pass) | 0.2752% (fail) |
+| V2 | 0.1597% (pass) | 0.2720% (fail) |
+| V4 | 0.1653% (pass) | 0.2477% (fail) |
+| V8 | 0.2058% (fail, synthetic range only) | 0.2741% (fail) |
+
+AR1 V8's real layer0/layer27 inputs pass. AR128 includes real-input failures.
+The synthetic range case is scaled by 0.5 as in the previous effective-scale
+probe; real Qwen KV snapshots are unscaled. Decoder correctness or PPL must
+not be used to claim that this separate strict encoder gate passed.
+
+### Standalone diagnostic work (not end-to-end latency)
+
+Same layer27 V input, 8 KV heads x 128 tokens x 128 coordinates:
+
+| V bits | Scalar named-op cycles | Correction named-op cycles | Packing named-op cycles | SDK accelerator execute (us) |
+|---|---:|---:|---:|---:|
+| 2 | 417,945 | 586,648 | 962,524 | 590 |
+| 4 | 1,424,761 | 1,360,389 | 382,640 | 698 |
+| 8 | 15,975,524 | 12,450,053 | 38,908 | 2,376 |
+
+V8 removes bit regrouping but retains the much larger scalar tree and
+centroid lookup for norm correction. Native Decode2/4/8 at 256 tokens costs
+319,783 / 337,933 / 591,805 diagnostic named-op cycles, respectively.
+These isolated probes use qnn-net-run's power policy, not full-model burst.
+Named-op counters may attribute fused work to another owner and are not
+physical busy intervals, additive wall latency or TTFT saving percentages.
+
+### Full-model physical HTP profiling
+
+One separate diagnostic session per group captures eight AR128 prefill chunks
+and decode steps 0/63/126. All **176 traces** render successfully; every
+profiled session reproduces its unprofiled reference's generated token IDs.
+The following values sum **millions of physical HVX/HMX busy cycles**, across
+28 layers and active execution lanes. They are work counters, **not ms,
+critical-path times or TTFT percentages**. Prefill includes the first chunk
+with one valid token and seven full chunks (897 prompt tokens).
+
+| Prefill stage (million busy cycles) | K4/V4 | K4/V2 | Boundary V8 | Middle V8 |
+|---|---:|---:|---:|---:|
+| Normalize | 225.683 | 227.189 | 235.135 | 230.073 |
+| Dense rotation | 1.631 | 1.555 | 1.494 | 1.499 |
+| Scalar index | 661.425 | 440.471 | 882.838 | 881.869 |
+| Norm/scale correction | 578.662 | 425.714 | 788.632 | 790.963 |
+| Packing/output cast | 136.520 | 286.549 | 259.303 | 256.963 |
+| Native current-KV decode | 57.856 | 58.193 | 66.498 | 65.269 |
+| Native past-KV decode | 374.457 | 367.434 | 401.827 | 400.049 |
+
+| Decode step126 stage (million busy cycles) | K4/V4 | K4/V2 | Boundary V8 | Middle V8 |
+|---|---:|---:|---:|---:|
+| Normalize | 1.412 | 1.352 | 1.344 | 1.374 |
+| Dense rotation | 0.017 | 0.018 | 0.022 | 0.018 |
+| Scalar index | 2.939 | 2.151 | 5.193 | 5.453 |
+| Norm/scale correction | 2.556 | 1.875 | 3.748 | 3.838 |
+| Packing/output cast | 1.726 | 3.830 | 3.548 | 3.703 |
+| Native current-KV decode | 2.385 | 2.038 | 2.940 | 2.985 |
+| Native past-KV decode | 51.235 | 51.237 | 55.060 | 55.517 |
+
+The Native rows combine loading, unpacking, LUT lookup and FP16 scale
+multiplication; they do **not** isolate pure bit extraction. Dense rotation
+is attributed to **HMX**, Native decode/packing/correction to **HVX**; scalar
+index work is mostly HVX with some HMX. This is not CPU fallback or missing
+hardware acceleration. It is the cost of the larger compiled scalar tree,
+centroid selection for norm correction, and 256-entry Native decode path.
+
+For a width-normalized view, average prefill **V work per layer** is:
+
+| V bits / source | Scalar index | Norm/scale | Packing/output cast | Native current | Native past |
+|---|---:|---:|---:|---:|---:|
+| V2 / all 28 K4/V2 layers | 3.920 | 4.479 | 7.782 | 1.019 | 6.637 |
+| V4 / all 28 K4/V4 layers | 12.057 | 10.394 | 2.590 | 1.011 | 6.834 |
+| V8 / 4 Boundary layers | 114.591 | 96.169 | 0.216 | 2.904 | 14.290 |
+
+Units remain million physical busy cycles. These are same-shape **different
+layer inputs**, not a controlled same-tensor microbenchmark; the latter is
+reported separately above. The CSV retains all groups, K/V splits, bit widths,
+layer counts, resources and measured decode steps.
+
+Compared with K4/V2, Boundary's total prefill packing work falls **9.51%**
+(27.246 million cycles), but scalar indexing grows **2.00x** (+442.367 million)
+and norm/scale correction **1.85x** (+362.918 million). Native past decode also
+grows 9.36%. At decode step126, scalar/correction grow 2.41x/2.00x and Native
+past decode grows 7.46%, while packing falls 7.36%. The packing saving is
+therefore outweighed in measured codec work; V8's direct-byte format does not
+make the complete codec faster. In the **unprofiled** long run, Boundary's
+mean QNN time rises from 24.509 to 25.755 ms/token (+1.246 ms), versus KV
+preparation increasing only 0.123 ms/token. These observations support the
+measured slowdown without converting busy-cycle ratios into latency ratios.
+
+### Explicit future boundary expansion (not evaluated here)
+
+`v8_layer_profile(layers)` constructs a K4/V2+V8 config without changing the
+default. For 4+4 or 6+6 protection, pass the first/last 4 or 6 zero-based IDs,
+save its `to_dict()["layer_plan"]` plus `profile` and `config_hash` to JSON,
+and export with `--profile k4_v8_custom --layer-plan PATH`.
+Layer count, K4/V2/V8 constraints and the frozen config/codebook hash are
+checked; a different plan requires a new bundle/cache. No follow-up expansion
+is automatically selected or measured by the four-group experiment driver.
+
+### Implementation map and result files
+
+- `config.py`: unchanged legacy hashes, opt-in V2/V8 profiles, layer resolver,
+  strict custom-plan hash validation and expansion helper.
+- `cache.py`, `graph_surgery.py`, `current_attention.py`, `tiled_attention.py`,
+  `native_decoder.py`: per-layer cache widths, current/past routing and Native LUT.
+- `constants.py`, `packing.py`, `export.py`, `native_decoder/{Decode4.xml,
+  decoder.cpp,hvx_decode.h,build.py,test_hvx.cpp}`: reused frozen 7/8-bit codec
+  extension and exact HVX decoding; no new allocation optimizer.
+- `convert_parts.py`, `evaluate_qwen3_kv.py`, `verify_kv_boundary.py`,
+  `verify_rotated_attention.py`: layer-aware export/reference/audits.
+- `benchmark_boundary_v_once.py`: frozen four-group protocol, unchanged-K and
+  source/compiled audits, once-only measurement, comparison and provenance.
+- `validate_boundary_v.py`, `summarize_boundary_v_probes.py`: fixed standalone
+  CPU-oracle/HTP diagnostics with unchanged tolerances.
+- `profile_boundary_v_once.py`, `summarize_boundary_v_profiles.py`: separate
+  physical HTP profiling. The shared `profile_optrace_once.py` adds an optional
+  safe device prefix to preserve earlier experiments whose roots also end in
+  `optrace`; its default behavior is unchanged. The initial naming collision
+  was caught **before inference**, and the old device directory was not removed.
+- `test_turboquant_boundary_v.py` plus extended codec/current/asymmetric tests:
+  budgets, invalid plans, compatibility, packing, current/past, reset and defaults.
+
+`comparison.json/csv` contains the four-group quality/performance comparison;
+`reports/` retains every raw single-run result and structural audit;
+`codec_validation.json` and `isolated_probes.json` retain the strict numeric
+results and microdiagnostics. `optrace/comparison.json`, stage/bit-width CSVs
+and original trace/schematic hashes distinguish physical HVX/HMX work from
+wall latency. No earlier experiment or failed diagnostic is overwritten.
+
 ## Binary storage on WSL
 
 On this WSL machine, artifact directories are redirected with ordinary directory

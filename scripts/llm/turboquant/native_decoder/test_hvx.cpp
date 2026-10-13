@@ -44,6 +44,8 @@ int test_case(uint8_t* packed, unsigned rows, unsigned offset, const char* layou
   __fp16 table[1u << Bits];
   for (unsigned i = 0; i < (1u << Bits); ++i)
     table[i] = (float(i) - ((1u << Bits) - 1) / 2.0f) / 128;
+  // The K8 symmetric fast path must not change arbitrary LUT semantics.
+  if constexpr (Bits == 8) if (rows == 17) table[0] += 1.0f / 64;
   // Non-vector-aligned scales/output are deliberate. Sentinels cover zero rows
   // too, and ensure a slice cannot overwrite its neighbour's output.
   std::vector<__fp16> scales(rows + 1);
@@ -120,7 +122,7 @@ template<unsigned Bits> int test_bits() {
 }
 
 int main() {
-  if (test_bits<2>() || test_bits<3>() || test_bits<4>() || test_bits<5>() || test_bits<6>())
+  if (test_bits<2>() || test_bits<3>() || test_bits<4>() || test_bits<5>() || test_bits<6>() || test_bits<7>() || test_bits<8>())
     return 1;
   puts("HVX packing, LUT lane order, exact FP16 products, unaligned I/O, slice tails and guard pages passed");
 }

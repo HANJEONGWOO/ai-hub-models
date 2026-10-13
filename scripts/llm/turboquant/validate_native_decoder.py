@@ -255,7 +255,7 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[3])
-    parser.add_argument("--bits", type=int, choices=[2, 3, 4, 5, 6], default=4)
+    parser.add_argument("--bits", type=int, choices=list(range(2, 9)), default=4)
     parser.add_argument("--lut", choices=["mse4", "mse3", "qjl_sign"], default="mse4")
     parser.add_argument(
         "--device-dir", default="/data/local/tmp/qaihm_turboquant/native_smoke_20260918"

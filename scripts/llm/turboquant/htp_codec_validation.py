@@ -650,7 +650,14 @@ def main() -> None:
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=["k4_v4", "k4_v4_scaled", "k5_v3_scaled", "k6_v2_scaled"],
+        choices=[
+            "k4_v4",
+            "k4_v4_scaled",
+            "k5_v3_scaled",
+            "k6_v2_scaled",
+            "k4_v2_scaled",
+            "k4_v8_scaled",
+        ],
         default=PROFILE,
     )
     parser.add_argument("--rotation", choices=[r.value for r in Rotation])

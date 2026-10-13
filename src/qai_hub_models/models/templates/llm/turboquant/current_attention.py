@@ -129,6 +129,7 @@ def quantize_current_attention(
 
     for io in result.codec_io:
         layer, kind, heads, seq = io.layer, io.kind, io.num_kv_heads, io.new_tokens
+        layer_config = config.for_layer(layer)
         info = layers.get(layer)
         rotated = bool(info and info["strategy"] == "rotated_precomputed_scale")
         use_native = bool(info and info.get("decoder") == "native_unpack_lut_v1")
@@ -137,11 +138,11 @@ def quantize_current_attention(
             restored = native(
                 io.packed_out,
                 io.norm_out,
-                native_table(config, kind),
+                native_table(layer_config, kind),
                 prefix,
                 heads,
                 seq,
-                native_op(config, kind),
+                native_op(layer_config, kind),
             )
         else:
             scale = io.norm_out
@@ -159,7 +160,7 @@ def quantize_current_attention(
             sg.extend(
                 decode_subgraph(
                     config,
-                    getattr(config, kind),
+                    config.codec_for(kind, layer),
                     io.packed_out,
                     scale,
                     restored,

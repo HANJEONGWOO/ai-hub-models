@@ -48,8 +48,7 @@ def use_native_decoder(
         not config.precomputed_norm
         or config.norm_dtype != "float16"
         or config.block_size != 128
-        or config.key.bits not in (2, 3, 4, 5, 6)
-        or config.value.bits not in (2, 3, 4, 5, 6)
+        or any(s.bits not in range(2, 9) for s in config.codecs)
         or not result.attention_tiles
         or any(
             t["strategy"] != "rotated_precomputed_scale" for t in result.attention_tiles
@@ -57,17 +56,20 @@ def use_native_decoder(
         or any(t.get("decoder") for t in result.attention_tiles)
     ):
         raise ValueError(
-            "Native decoder requires rotated tiled attention and scaled 2..6-bit KV, D=128"
+            "Native decoder requires rotated tiled attention and scaled 2..8-bit KV, D=128"
         )
     result = copy.deepcopy(result)
     graph = result.model.graph
     tables = set()
-    for kind in ("value", "key"):
-        table_name = native_table(config, kind)
+    for layer_id, kind in (
+        (t["layer"], k) for t in result.attention_tiles for k in ("value", "key")
+    ):
+        layer_config = config.for_layer(layer_id)
+        table_name = native_table(layer_config, kind)
         if table_name in tables:
             continue
         tables.add(table_name)
-        values = load_codebook(getattr(config, kind).bits, 128)
+        values = load_codebook(getattr(layer_config, kind).bits, 128)
         if config.qjl and kind == "key":
             values = np.tile(values, 2)
         graph.initializer.append(
@@ -78,6 +80,7 @@ def use_native_decoder(
         )
     replacements = {}
     for layer in result.attention_tiles:
+        layer_config = config.for_layer(layer["layer"])
         layer["decoder"] = "native_unpack_lut_v1"
         for tile in layer["tiles"]:
             for kind in ("key", "value"):
@@ -94,11 +97,11 @@ def use_native_decoder(
                         to=TensorProto.FLOAT16,
                     ),
                     helper.make_node(
-                        native_op(config, kind),
+                        native_op(layer_config, kind),
                         [
                             prefix + "packed",
                             scale16,
-                            native_table(config, kind),
+                            native_table(layer_config, kind),
                         ],
                         [output16],
                         domain=NATIVE_DOMAIN,
@@ -187,7 +190,7 @@ def with_reference_decoder(model: onnx.ModelProto) -> onnx.ModelProto:
             [helper.make_opsetid("", 17)],
         )
     )
-    for bits in (2, 3, 5, 6):
+    for bits in (2, 3, 5, 6, 7, 8):
         op = f"Decode{bits}"
         if not any(
             n.domain == NATIVE_DOMAIN and n.op_type == op for n in result.graph.node
