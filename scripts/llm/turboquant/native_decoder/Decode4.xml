@@ -127,5 +127,55 @@
       </Output>
       <SupportedBackend>HTP</SupportedBackend>
     </OpDef>
+    <OpDef>
+      <Name>Decode7</Name>
+      <Description><Content>Lloyd-Max 7-bit indices times FP16 effective scale; HVX only.</Content></Description>
+      <Input>
+        <Name>packed</Name><Description><Content>MSB-first bytes; 8-bit is a direct UINT8 index.</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_UINT_8</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,112</Text></Shape>
+      </Input>
+      <Input>
+        <Name>scale</Name><Description><Content>Effective scales</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,1</Text></Shape>
+      </Input>
+      <Input>
+        <Name>centroids</Name><Description><Content>Frozen Lloyd-Max table</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>1,1,1,128</Text></Shape>
+      </Input>
+      <Output>
+        <Name>decoded</Name><Description><Content>Rotated-domain KV</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,128</Text></Shape>
+      </Output>
+      <SupportedBackend>HTP</SupportedBackend>
+    </OpDef>
+    <OpDef>
+      <Name>Decode8</Name>
+      <Description><Content>Lloyd-Max 8-bit indices times FP16 effective scale; HVX only.</Content></Description>
+      <Input>
+        <Name>packed</Name><Description><Content>MSB-first bytes; 8-bit is a direct UINT8 index.</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_UINT_8</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,128</Text></Shape>
+      </Input>
+      <Input>
+        <Name>scale</Name><Description><Content>Effective scales</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,1</Text></Shape>
+      </Input>
+      <Input>
+        <Name>centroids</Name><Description><Content>Frozen Lloyd-Max table</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>1,1,1,256</Text></Shape>
+      </Input>
+      <Output>
+        <Name>decoded</Name><Description><Content>Rotated-domain KV</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,128</Text></Shape>
+      </Output>
+      <SupportedBackend>HTP</SupportedBackend>
+    </OpDef>
   </OpDefList>
 </OpDefCollection>

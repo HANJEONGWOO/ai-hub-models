@@ -65,9 +65,9 @@ class KVCodecSpec:
     def __post_init__(self) -> None:
         if self.kind != CodecKind.POLAR and (self.bits != 0 or self.seed != 0):
             raise ValueError(f"{self.kind.name} codec takes no bits or seed.")
-        if self.kind == CodecKind.POLAR and self.bits not in (2, 3, 4, 5, 6):
+        if self.kind == CodecKind.POLAR and self.bits not in range(2, 9):
             raise ValueError(
-                f"PolarQuant bit width must be 2 through 6, got {self.bits}. "
+                f"PolarQuant bit width must be 2 through 8, got {self.bits}. "
                 "Other widths have no frozen codebook."
             )
 
@@ -112,8 +112,57 @@ class TurboQuantConfig:
     precomputed_norm: bool = False
     qjl: bool = False
     reference_commit: str = field(default=REFERENCE_COMMIT)
+    # Empty retains every legacy profile's serialization/hash. Layer indices
+    # are absolute model layer IDs, not part-local IDs.
+    layer_bits: tuple[tuple[int, int], ...] = ()
+    layer_policy: str = ""
+
+    def codec_for(self, kind: str, layer: int) -> KVCodecSpec:
+        if kind not in ("key", "value"):
+            raise ValueError(f"Unknown KV kind: {kind}")
+        spec = getattr(self, kind)
+        if not self.layer_bits:
+            return spec
+        if not 0 <= layer < len(self.layer_bits):
+            raise ValueError(f"Layer {layer} is outside the mixed-bit plan.")
+        return replace(spec, bits=self.layer_bits[layer][kind == "value"])
+
+    def for_layer(self, layer: int) -> TurboQuantConfig:
+        if not self.layer_bits:
+            return self
+        return replace(
+            self,
+            key=self.codec_for("key", layer),
+            value=self.codec_for("value", layer),
+            layer_bits=(),
+            layer_policy="",
+        )
 
     def __post_init__(self) -> None:
+        if self.layer_bits:
+            if not isinstance(self.layer_bits, tuple) or any(
+                not isinstance(pair, tuple) or any(type(bit) is not int for bit in pair)
+                for pair in self.layer_bits
+            ):
+                raise ValueError(
+                    "Layer plan must be an immutable tuple of integer bit pairs."
+                )
+            if (
+                self.qjl
+                or not self.precomputed_norm
+                or not all(s.is_polar for s in (self.key, self.value))
+            ):
+                raise ValueError(
+                    "Mixed-bit requires scaled PolarQuant K/V without QJL."
+                )
+            if self.layer_policy not in ("uniform", "attention_mse"):
+                raise ValueError(
+                    "Mixed-bit requires a recorded layer selection policy."
+                )
+            if any(len(pair) != 2 for pair in self.layer_bits):
+                raise ValueError("Each layer requires exactly K and V bit widths.")
+        elif self.layer_policy:
+            raise ValueError("A layer policy requires a layer plan.")
         if any(s.is_fp16 for s in self.codecs) and not all(
             s.is_fp16 for s in self.codecs
         ):
@@ -159,8 +208,14 @@ class TurboQuantConfig:
                 )
 
     @property
-    def codecs(self) -> tuple[KVCodecSpec, KVCodecSpec]:
-        return (self.key, self.value)
+    def codecs(self) -> tuple[KVCodecSpec, ...]:
+        if not self.layer_bits:
+            return (self.key, self.value)
+        return tuple(
+            self.codec_for(kind, layer)
+            for layer in range(len(self.layer_bits))
+            for kind in ("key", "value")
+        )
 
     @property
     def enabled(self) -> bool:
@@ -182,6 +237,10 @@ class TurboQuantConfig:
         """Reject model shapes this format version cannot store without truncation."""
         if num_layers <= 0 or num_kv_heads <= 0:
             raise ValueError("num_layers and num_kv_heads must be positive.")
+        if self.layer_bits and len(self.layer_bits) != num_layers:
+            raise ValueError(
+                "Mixed-bit layer plan length differs from model layer count."
+            )
         if not self.enabled:
             return
         if head_dim & (head_dim - 1) or head_dim <= 0:
@@ -212,6 +271,18 @@ class TurboQuantConfig:
         }
         if self.precomputed_norm:
             data["norm_representation"] = "effective_scale"
+        if self.layer_bits:
+            data["layer_plan"] = {
+                "bits": [list(pair) for pair in self.layer_bits],
+                "policy": self.layer_policy,
+                "codebook_sha256": {
+                    str(bits): CODEBOOK_SHA256[(bits, self.block_size)]
+                    for bits in sorted({s.bits for s in self.codecs})
+                },
+                "average_payload_bits": sum(sum(pair) for pair in self.layer_bits)
+                / len(self.layer_bits),
+                "packing": "msb_first;8bit=uint8_index",
+            }
         if self.enabled:
             # Fixed implementation, not a selectable strategy. Invalidate old
             # broadcast bundles even though the codebook/cache ABI is unchanged.
@@ -325,16 +396,75 @@ PROFILES: dict[str, TurboQuantConfig] = {
 }
 
 
-def get_profile(name: str, rotation: Rotation | None = None) -> TurboQuantConfig:
+for _budget, _period in ((5, 4), (6, 2)):
+    _name = f"mixed_k{_budget}_v{8 - _budget}_uniform"
+    PROFILES[_name] = TurboQuantConfig(
+        _name,
+        _polar(4, KEY_SEED),
+        _polar(2, VALUE_SEED),
+        format_version=2,
+        precomputed_norm=True,
+        layer_policy="uniform",
+        layer_bits=tuple(
+            (
+                8 if (layer + 1) % _period == 0 else 4,
+                4 if _budget == 5 and layer % 2 else 2,
+            )
+            for layer in range(28)
+        ),
+    )
+PROFILES["k8_v4_scaled"] = TurboQuantConfig(
+    "k8_v4_scaled",
+    _polar(8, KEY_SEED),
+    _polar(4, VALUE_SEED),
+    format_version=2,
+    precomputed_norm=True,
+)
+
+
+def get_profile(
+    name: str,
+    rotation: Rotation | None = None,
+    *,
+    layer_plan: dict[str, Any] | None = None,
+) -> TurboQuantConfig:
     """Get a profile; an explicit rotation selects the legacy FWHT rotation."""
     if name == "qjl_reference":
         raise NotImplementedError(
             "qjl_reference is a research option outside the first milestone; "
             "the default path is QJL-off PolarQuant."
         )
-    if name not in PROFILES:
+    lookup = name.replace("_mse", "_uniform") if name.startswith("mixed_") else name
+    if lookup not in PROFILES:
         raise ValueError(
             f"Unknown TurboQuant profile '{name}'. Choose from {sorted(PROFILES)}."
         )
-    config = PROFILES[name]
+    config = PROFILES[lookup]
+    if name.endswith("_mse"):
+        if rotation is not None and rotation != config.rotation:
+            raise ValueError(
+                "MSE-selected layer plans are fixed to their Dense rotation."
+            )
+        if (
+            layer_plan is None
+            or layer_plan.get("profile") != name
+            or layer_plan.get("policy") != "attention_mse"
+        ):
+            raise ValueError(
+                "MSE profile requires its frozen, matching layer-plan JSON."
+            )
+        pairs = tuple(tuple(pair) for pair in layer_plan["bits"])
+        if sorted(p[0] for p in pairs) != sorted(
+            p[0] for p in config.layer_bits
+        ) or sorted(p[1] for p in pairs) != sorted(p[1] for p in config.layer_bits):
+            raise ValueError("Layer plan violates the exact mixed-bit budget/quotas.")
+        config = replace(
+            config, profile=name, layer_bits=pairs, layer_policy="attention_mse"
+        )
+        if layer_plan.get("config_hash") != config.config_hash():
+            raise ValueError("Layer plan/config/codebook hash mismatch.")
+    elif layer_plan is not None:
+        raise ValueError(
+            "External layer plans are only accepted for mixed MSE profiles."
+        )
     return replace(config, rotation=rotation) if rotation is not None else config

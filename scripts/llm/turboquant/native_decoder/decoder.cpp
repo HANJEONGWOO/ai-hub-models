@@ -12,10 +12,10 @@
 
 namespace {
 constexpr const char* kPackage = "TurboQuantNative";
-const char* kOps[] = {"Decode4", "Decode2", "Decode3", "Decode5", "Decode6"};
+const char* kOps[] = {"Decode4", "Decode2", "Decode3", "Decode5", "Decode6", "Decode7", "Decode8"};
 Qnn_ApiVersion_t apiVersion = QNN_HTP_API_VERSION_INIT;
 Qnn_Version_t opVersion = {1, 0, 0};
-QnnOpPackage_Info_t packageInfo = {kPackage, kOps, nullptr, 5, nullptr, 0,
+QnnOpPackage_Info_t packageInfo = {kPackage, kOps, nullptr, 7, nullptr, 0,
     QNN_SDK_BUILD_ID, &apiVersion, nullptr, &opVersion, {0}};
 bool initialized = false;
 
@@ -123,8 +123,8 @@ QHPI_Tensor_Signature_v1 inputSignatures[] = {
     {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM}};
 QHPI_Tensor_Signature_v1 outputSignatures[] = {
     {QHPI_FLOAT16, QHPI_LAYOUT_FLAT_4, QHPI_STORAGE_DIRECT, QHPI_MEM_LOC_DDR_OR_TCM}};
-QHPI_Kernel_v1 kernels[5] = {};
-QHPI_OpInfo_v1 ops[5] = {};
+QHPI_Kernel_v1 kernels[7] = {};
+QHPI_OpInfo_v1 ops[7] = {};
 }  // namespace
 
 extern "C" Qnn_ErrorHandle_t TurboQuantInterfaceProvider(QnnOpPackage_Interface_t* out) {
@@ -144,15 +144,17 @@ extern "C" Qnn_ErrorHandle_t TurboQuantInterfaceProvider(QnnOpPackage_Interface_
 }
 
 extern "C" const char* qhpi_init() {
-  const char* functions[] = {"tq_decode4", "tq_decode2", "tq_decode3", "tq_decode5", "tq_decode6"};
+  const char* functions[] = {"tq_decode4", "tq_decode2", "tq_decode3", "tq_decode5", "tq_decode6", "tq_decode7", "tq_decode8"};
   const char* names[] = {"TurboQuantNative::Decode4", "TurboQuantNative::Decode2",
-      "TurboQuantNative::Decode3", "TurboQuantNative::Decode5", "TurboQuantNative::Decode6"};
+      "TurboQuantNative::Decode3", "TurboQuantNative::Decode5", "TurboQuantNative::Decode6", "TurboQuantNative::Decode7", "TurboQuantNative::Decode8"};
   kernels[0].function = decode<4>;
   kernels[1].function = decode<2>;
   kernels[2].function = decode<3>;
   kernels[3].function = decode<5>;
   kernels[4].function = decode<6>;
-  for (unsigned i = 0; i < 5; ++i) {
+  kernels[5].function = decode<7>;
+  kernels[6].function = decode<8>;
+  for (unsigned i = 0; i < 7; ++i) {
     auto& kernel = kernels[i];
     kernel.function_name = functions[i];
     kernel.resources = QHPI_RESOURCE_HVX;
@@ -166,6 +168,6 @@ extern "C" const char* qhpi_init() {
     ops[i].num_kernels = 1;
     ops[i].kernels = &kernel;
   }
-  qhpi_register_ops_v1(5, ops, kPackage);
+  qhpi_register_ops_v1(7, ops, kPackage);
   return kPackage;
 }

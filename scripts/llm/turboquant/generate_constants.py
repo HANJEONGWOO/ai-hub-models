@@ -35,7 +35,7 @@ import numpy as np
 REFERENCE_URL = "https://github.com/TheTom/turboquant_plus"
 REFERENCE_COMMIT = "ba52ad107d1fdd02bc9be8fd85308226b75c905b"
 BLOCK_SIZE = 128
-BIT_WIDTHS = (2, 3, 4, 5, 6)
+BIT_WIDTHS = (2, 3, 4, 5, 6, 7, 8)
 # Reference KVCacheCompressor policy: K uses seed, V uses seed + 500.
 SEEDS = (42, 542)
 

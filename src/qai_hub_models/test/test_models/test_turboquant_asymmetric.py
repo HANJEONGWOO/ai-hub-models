@@ -35,7 +35,7 @@ from qai_hub_models.models.templates.llm.turboquant.reference import (
 from qai_hub_models.test.test_models.test_turboquant_export import run
 
 
-@pytest.mark.parametrize("bits", [2, 3, 5, 6])
+@pytest.mark.parametrize("bits", [2, 3, 5, 6, 7, 8])
 def test_tight_repacking_all_codes_and_random(bits: int) -> None:
     rng = np.random.default_rng(42)
     codes = rng.integers(0, 1 << bits, (2, 1, 9, 128), dtype=np.int32)
@@ -61,7 +61,7 @@ def test_tight_repacking_all_codes_and_random(bits: int) -> None:
     np.testing.assert_array_equal(restored, codes)
 
 
-@pytest.mark.parametrize("bits", [2, 3, 5, 6])
+@pytest.mark.parametrize("bits", [2, 3, 5, 6, 7, 8])
 def test_tree_boundaries_and_extremes(bits: int) -> None:
     boundaries = load_boundaries(bits, 128).astype(np.float32)
     x = np.concatenate(
@@ -84,7 +84,7 @@ def test_tree_boundaries_and_extremes(bits: int) -> None:
     np.testing.assert_array_equal(actual, np.searchsorted(boundaries, x, side="left"))
 
 
-@pytest.mark.parametrize("profile", ["k5_v3_scaled", "k6_v2_scaled"])
+@pytest.mark.parametrize("profile", ["k5_v3_scaled", "k6_v2_scaled", "k8_v4_scaled"])
 @pytest.mark.parametrize("kind", ["key", "value"])
 def test_asymmetric_encoder_and_native_lut(profile: str, kind: str) -> None:
     config = get_profile(profile)

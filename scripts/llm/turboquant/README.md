@@ -10,6 +10,296 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Hardware-aligned mixed-bit experiment (opt-in)
+
+`mixed_k5_v3_uniform`, `mixed_k6_v2_uniform` and their `*_mse` variants
+are separate Qwen3-1.7B/28-layer profiles. The default `k4_v4_scaled`, legacy
+profiles and their configuration hashes are unchanged. The old `k8_v3` name
+still means affine INT8 K; **`k8_v4_scaled` is the new Lloyd–Max K8 probe**.
+
+The pinned reference generator now freezes 7/8-bit tables as well as the
+unchanged 2–6-bit tables. It retains the reference's 100 Gaussian Lloyd
+iterations; this is not a claim of convergence or a globally optimal codebook.
+K8 uses 256 nonuniform centroids and eight exact tree
+decisions, stores the index directly as one UINT8 byte (no Slice/Shift/Concat
+packing), and retains the existing norm correction/effective FP16 scale.
+`Decode8` reads those bytes directly and uses banked HVX LUT lookup followed by
+one FP16 product. Bitwise-symmetric LM tables use the positive half table and
+restore the FP16 sign; arbitrary tables retain the full HVX LUT path. It is not
+affine INT8, bit-plane attention or a CPU fallback.
+The expanded scalar tree and encoder centroid lookup can still be expensive;
+removing packing does not by itself imply faster inference.
+V2 deliberately reuses the existing tight-stream packer (including its graph
+Slice/arithmetic/Concat operations); only K8 bypasses packing. These profiles
+test byte-aligned K allocation, not a claim that every encoder is fully fused
+or that V2 packing has been newly optimized.
+
+| Profile | K allocation | V allocation | Payload budget | KV including FP16 scales, CL1024 |
+|---|---|---|---:|---:|
+| Mixed K5/V3 | 21 K4 + 7 K8 layers | 14 V2 + 14 V4 layers | average K+V = 8 bits | 28.875 MiB |
+| Mixed K6/V2 | 14 K4 + 14 K8 layers | 28 V2 layers | average K+V = 8 bits | 28.875 MiB |
+
+Uniform placement uses K8 on every fourth/second layer (zero-based layer IDs
+3,7,… / 1,3,…) and V4 on odd layers for Mixed K5/V3. MSE placement uses actual
+captured Q/K/V and FP16-KV Attention outputs from the same W4A16 model, with
+fixed Dense K seed42/V seed542. Four source training documents select the plan;
+two separate source validation documents check it. The legacy four WikiText
+PPL windows are never used to select layers. An exact quota-constrained dynamic
+program minimizes the **sum of local absolute Attention-output MSE** over the
+four possible K4/K8 × V2/V4 choices. This is not end-to-end NLL optimization;
+absolute MSE may favor late high-magnitude layers.
+
+Layer plans, codebook hashes and selection policy are part of the immutable
+configuration hash. Cache loading rejects different plans. MSE profiles require
+their hash-checked `--layer-plan` JSON; they cannot silently fall back to uniform
+placement. Every layer's packed I/O width is exported separately. No per-token
+bit metadata is added. Native packages containing the new ops require new
+compiled contexts; do not replace libraries inside existing baseline bundles.
+
+Reproduce with a **fresh** artifact root (no automatic commits):
+
+```bash
+TQ_MIXED_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/hardware_aligned_mixed_kv_NEW
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/native_decoder/build.py \
+  --out "$TQ_MIXED_ROOT/native" --test-hvx
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/select_mixed_layers.py \
+  --captures /mnt/d/ai-hub-models/binaries/turboquant/k_rotation_quality_20261006 \
+  --out "$TQ_MIXED_ROOT/selection"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_mixed_once.py prepare --root "$TQ_MIXED_ROOT"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_mixed_once.py build --root "$TQ_MIXED_ROOT"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_mixed_once.py evaluate --root "$TQ_MIXED_ROOT"
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_mixed_once.py summarize --root "$TQ_MIXED_ROOT"
+```
+
+Performance is **one unprofiled session per configuration/condition**:
+short35+128 and long897+128. No run-to-run mean/std or confidence interval is
+reported. Each of the four PPL windows is scored once, with aggregate
+`exp(sum(NLL_sum)/4092)`. Cache-reset checks and HTP probes/optrace are separate
+diagnostics, not extra throughput samples. The comparison contains seven rows:
+three old profiles plus two mixed budgets × two placement policies.
+
+Optional separate stage profiling after the unprofiled runs:
+
+```bash
+for stage in freeze build measure render summarize; do
+  PYTHONPATH=src venv/bin/python scripts/llm/turboquant/profile_mixed_once.py "$stage" \
+    --experiment "$TQ_MIXED_ROOT" --root "$TQ_MIXED_ROOT/optrace" || break
+done
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/summarize_mixed_profiles.py \
+  --experiment "$TQ_MIXED_ROOT" --root "$TQ_MIXED_ROOT/optrace"
+```
+
+Artifacts for the current experiment are under
+`/mnt/d/ai-hub-models/binaries/turboquant/hardware_aligned_mixed_kv_20261010/`.
+The initial Native package and diagnostics remain in `native/` and
+`isolated_probes.json`. Before any mixed full-model measurement,
+`native_runtime_amendment.json` froze a header-only symmetric-LUT runtime in
+`native_symmetric8/`; package registration and the x86 prepare library match.
+`isolated_probes_final.json` records its separate correctness diagnostic. Old
+baseline packages remain unchanged. A fresh reproduction with the commands
+above builds this final kernel directly, without an amendment.
+Full-model single-run performance/quality results are in `comparison.json` and
+`comparison.csv`; per-window scores, reset checks and source/compiled graph
+audits are in `reports/`. Binary/config/input hashes are recorded there and in
+`protocol.json`. Stage optrace analysis is separate from these measurements.
+
+### Validation
+
+- Existing/default configuration hashes remain unchanged; Python regression:
+  628 tests passed.
+- HVX host oracle: 840 shapes/alignment/tail cases across 2–8 bits, including
+  guard-page cases, passed.
+- K8 Native HTP decoder: 1/3/256 tokens, all outputs bit-exact to independent
+  FP16 LUT × FP16 scale reference.
+- K8 encoder: no unexplained index mismatches, all graph ops accounted for on
+  HTP. AR1 passed. AR128 **fails the unchanged 0.2% scale-relative-error gate**
+  (maximum 0.256993%); the accompanying unchanged V4 path also fails (0.247664%).
+  This numerical limitation is tracked separately, not hidden by HTP success.
+- All seven full-model source/compiled audits passed: unchanged non-codec
+  weights/calibration, matched K/Query/V rotations, FP16 attention/native
+  boundaries, correct layer-specific UINT8 I/O and compressed current/past KV.
+  Cache reset was deterministic. The three reused baselines reproduced their
+  previous four-window PPL exactly.
+
+### Single-run comparison: 2026-10-10, S26 Ultra / SM8850 V81
+
+Qwen3-1.7B W4A16, CL1024, AR128 prefill, AR1 decode, tile256, HTP burst power.
+Model load is excluded from TTFT. Each row/condition has **one** unprofiled
+session; PPL uses the same legacy four windows / 4092 targets. Means/std across
+runs cannot be estimated. Existing baselines ran first, followed by the four
+mixed variants after building; this is not an interleaved/thermal-controlled
+repetition study. Do not treat small speed differences as statistically proven.
+
+Long condition: 897 prompt tokens + 128 generated tokens.
+
+| Configuration | PPL ↓ | TTFT ms ↓ | Prefill tok/s ↑ | Decode tok/s ↑ |
+|---|---:|---:|---:|---:|
+| K4/V4 | 25.661 | 564.0 | 1593.19 | 37.72 |
+| K5/V3 | 22.470 | 650.6 | 1380.86 | 35.76 |
+| K6/V2 | 19.845 | 671.3 | 1338.16 | 34.48 |
+| Mixed K5/V3 uniform | 25.369 | 688.5 | 1304.76 | 35.01 |
+| Mixed K6/V2 uniform | 23.983 | 812.2 | 1105.76 | 32.89 |
+| Mixed K5/V3 MSE | 27.600 | 669.6 | 1341.63 | 34.99 |
+| Mixed K6/V2 MSE | 27.242 | 755.2 | 1189.32 | 32.85 |
+
+Short condition: 35 prompt tokens + 128 generated tokens.
+
+| Configuration | TTFT ms ↓ | Prefill tok/s ↑ | Decode tok/s ↑ |
+|---|---:|---:|---:|
+| K4/V4 | 65.80 | 535.78 | 38.56 |
+| K5/V3 | 77.58 | 454.13 | 36.89 |
+| K6/V2 | 81.20 | 433.92 | 35.27 |
+| Mixed K5/V3 uniform | 86.15 | 410.97 | 35.71 |
+| Mixed K6/V2 uniform | 101.92 | 346.39 | 33.52 |
+| Mixed K5/V3 MSE | 80.96 | 434.90 | 35.92 |
+| Mixed K6/V2 MSE | 95.35 | 370.81 | 33.60 |
+
+**Actual allocated host KV is 30,277,632 bytes = 28.875 MiB in every row**:
+28 MiB indices + 0.875 MiB FP16 scales. The eight-bit budget describes K+V
+index payload, not scales. Runner I/O buffers are also identical at
+96.929203 MiB. Long-session ending VmRSS is 151.18–154.99 MiB and process
+VmHWM is 605.42–606.15 MiB. These are host/process metrics, not a measurement
+of every internal HTP allocation. Exact per-profile memory and binary hashes
+are in the JSON/CSV. Context binary totals are 1623.312/1625.262/1627.500 MiB
+for K4/V4, K5/V3, K6/V2 and 1630.988/1635.695/1629.219/1634.949 MiB for the
+four mixed rows in the table's order.
+
+### Placement quality: local MSE did not predict end-to-end PPL
+
+| Allocation | Train Attention MSE | Separate validation Attention MSE | Test PPL |
+|---|---:|---:|---:|
+| Mixed K5/V3 uniform | 0.296910 | 0.305943 | 25.369 |
+| Mixed K5/V3 MSE | 0.052217 | 0.051684 | 27.600 |
+| Mixed K6/V2 uniform | 0.440162 | 0.449656 | 23.983 |
+| Mixed K6/V2 MSE | 0.392957 | 0.398296 | 27.242 |
+
+The MSE-selected K8 layers are `20,22,23,24,25,26,27` for Mixed K5/V3,
+and `10,15,16,...,27` for Mixed K6/V2 (zero-based). MSE Mixed K5/V3 puts V4
+on layers 14–27; MSE Mixed K6/V2 keeps V2 everywhere. Plans were frozen using
+training MSE before validation/PPL, and were not changed after seeing results.
+
+Absolute local output MSE can favor high-magnitude late layers. Captured
+FP16-KV inputs do not include the accumulated upstream errors of the fully
+compressed model, and this objective is not NLL. Those are plausible reasons
+for the disagreement, not individually established causes without ablations.
+Local validation MSE and PPL use different documents, so this comparison does
+not isolate objective mismatch from data-distribution/generalization effects.
+The CPU hard-forward implementation reproduces the earlier seed42 K4/V4
+validation MSE (0.1683944842), which is a useful emulator regression check but
+not a proof of full-model/HTP bit-exactness.
+
+### Isolated codec diagnostics (not LLM latency)
+
+Same captured layer27 K input, 8 KV heads × 128 tokens × 128 coordinates.
+Encoder columns are **millions of named-op cycles**, not physical interval
+latencies; fused work can be attributed to its owning node. No average of the
+three distinct layer0/layer27/range inputs is presented.
+
+| K width | Scalar index Mcycles | Packing Mcycles | Centroid lookup + norm/scale Mcycles | Native decoder cycles, 256 tokens |
+|---|---:|---:|---:|---:|
+| 4 | 1.396 | 0.340 | 1.346 | 325,333 |
+| 5 | 2.413 | 3.408 | 1.967 | 370,208 |
+| 6 | 4.186 | 3.657 | 3.315 | 386,229 |
+| 8 | 15.856 | 0.033 | 12.444 | 580,093 |
+
+K8 eliminates bit regrouping but still casts/stores its UINT8 index. Eight
+logical tree comparisons do **not** mean eight exported operators: selecting
+their thresholds expands the HTP graph (547 index nodes versus 47 for K4),
+and the encoder's centroid lookup/norm path also grows. Native Decode8 runs
+HVX, not a CPU fallback, but its larger LUT is not free. Its standalone probe
+uses default `qnn-net-run` power, unlike the full-model burst policy; the two
+sets of timing values must not be combined. The symmetric-LUT change's
+256-token diagnostic was 580,093 cycles versus 585,260 initially; small-case
+probes were slower, so no robust kernel speedup is claimed from this alone.
+
+This implementation did **not** achieve the joint goal of matching/improving
+existing asymmetric PPL while reducing overall latency. Uniform mixed layouts
+improve PPL over K4/V4 but are slower; both MSE layouts worsen PPL.
+All mixed rows are worse in PPL and measured latency than their same-average
+K5/V3 or K6/V2 comparator. Defaults remain unchanged.
+
+### Full-model physical optrace
+
+Seven separate diagnostic sessions produced 44 traces each (308 total). All
+generated token IDs match their corresponding unprofiled reference. These
+diagnostics are **not** additional throughput samples. Tables use millions of
+physical HVX/HMX busy cycles summed across parallel execution lanes, **not
+milliseconds or wall-latency percentages**. Source/compiled-owner attribution
+and verified HMX MatMul-parent attribution are retained from the prior profiler.
+Shared/fused work is not an independently timed Python algorithm function.
+
+Prefill: all eight AR128 calls for the 897-token prompt, including the padded
+first call. `Correction` includes encoder centroid lookup and norm/FP16 scale
+correction; `Normalize` is the input-vector normalization stage.
+
+| Configuration | Normalize | Scalar index | Correction | Packing | Native current | Native past |
+|---|---:|---:|---:|---:|---:|---:|
+| K4/V4 | 225.402 | 660.450 | 578.108 | 136.178 | 57.760 | 374.376 |
+| K5/V3 | 235.047 | 719.633 | 568.249 | 1056.346 | 63.842 | 407.168 |
+| K6/V2 | 229.627 | 1028.265 | 842.336 | 1111.707 | 65.933 | 441.544 |
+| Mixed K5/V3 uniform | 235.589 | 1269.048 | 1104.026 | 203.327 | 73.094 | 436.340 |
+| Mixed K6/V2 uniform | 238.442 | 1897.370 | 1626.086 | 260.770 | 86.067 | 490.803 |
+| Mixed K5/V3 MSE | 231.816 | 1297.332 | 1128.307 | 198.256 | 72.661 | 432.067 |
+| Mixed K6/V2 MSE | 234.350 | 1903.891 | 1644.928 | 258.262 | 85.085 | 493.846 |
+
+Last decode call (`decode_126`, 1023 cached tokens), same units:
+
+| Configuration | Normalize | Scalar index | Correction | Packing | Native current | Native past |
+|---|---:|---:|---:|---:|---:|---:|
+| K4/V4 | 1.420 | 2.905 | 2.534 | 1.660 | 2.384 | 51.106 |
+| K5/V3 | 1.379 | 4.026 | 3.050 | 6.061 | 2.477 | 56.311 |
+| K6/V2 | 1.415 | 6.196 | 4.359 | 5.466 | 3.207 | 59.559 |
+| Mixed K5/V3 uniform | 1.365 | 8.033 | 5.603 | 3.391 | 3.756 | 58.872 |
+| Mixed K6/V2 uniform | 1.408 | 12.849 | 8.344 | 4.059 | 5.024 | 65.337 |
+| Mixed K5/V3 MSE | 1.374 | 7.850 | 5.391 | 2.733 | 3.761 | 58.014 |
+| Mixed K6/V2 MSE | 1.386 | 12.587 | 8.262 | 3.692 | 5.031 | 64.719 |
+
+Relative to the corresponding conventional asymmetric profile, mixed prefill
+packing work falls by **76.5–81.2%**, but scalar index work rises by
+**76.3–85.2%** and centroid/norm-scale correction by **93.0–98.6%**.
+In the last decode call, past Native work rises by **3.0–9.7%** and current
+Native work by **51.6–56.9%**. The expanded encoder and larger decoder LUT
+therefore offset packing savings in this implementation. This supports the
+observed latency direction, but these work ratios are not TTFT/decode latency
+ratios. It is not a CPU fallback: Native unpack/LUT work executes on HVX;
+existing FP16-input attention and Dense MatMul paths are retained.
+
+For K-only past decoding at `decode_126`, per-layer work is 0.897/1.038/1.181
+Mcycles for the K4/K5/K6 baseline rows. In uniform Mixed K6/V2, K4 is 0.938
+and K8 is 1.878 Mcycles per layer (14 layers each): roughly twice the work for
+K8 inside that model. This is a different-layer/input comparison, not another
+isolated kernel benchmark. All recorded Native decode busy cycles are on HVX.
+
+`optrace/comparison.json`, `stage_comparison.csv` and `bit_width_comparison.csv`
+include every stage, K/V split, HVX/HMX resource split and decode steps 0/63/126.
+The bit-width table normalizes by the number of participating layers; those
+layers have different real inputs, so the isolated matched-input diagnostics
+above remain a separate comparison. Instrumented accelerator event times are
+saved separately from unprofiled TTFT and must not replace it.
+
+### Changed-file map
+
+- Core package (`src/qai_hub_models/models/templates/llm/turboquant/`):
+  `config.py`, `constants.py`, `packing.py`, `cache.py` add frozen 7/8-bit
+  tables, direct-byte storage, immutable layer plans and cache identity;
+  `export.py`, `graph_surgery.py`, `current_attention.py`, `tiled_attention.py`,
+  `native_decoder.py` resolve each layer's codec and preserve current/past ABI.
+- Native package (`scripts/llm/turboquant/native_decoder/`): `decoder.cpp`,
+  `hvx_decode.h`, `Decode4.xml`, `build.py`, `test_hvx.cpp` register/test 7/8-bit
+  HVX operations while retaining the old operation IDs and 2–6-bit kernels.
+- Export/reference/audits: `convert_parts.py`, `evaluate_qwen3_kv.py`,
+  `generate_constants.py`, `htp_codec_validation.py`, `validate_native_decoder.py`,
+  `verify_kv_boundary.py`, `verify_rotated_attention.py` support the new profiles.
+- New experiment tools: `select_mixed_layers.py`, `benchmark_mixed_once.py`,
+  `profile_mixed_once.py`, `summarize_mixed_probes.py`,
+  `summarize_mixed_profiles.py` freeze choices, refuse repeated measurements,
+  preserve provenance and separate diagnostic work from wall-clock speed.
+- Tests (`src/qai_hub_models/test/test_models/`): new
+  `test_turboquant_mixed.py`, extended `test_turboquant_asymmetric.py`,
+  `test_turboquant_codec.py`, `test_turboquant_current_attention.py`.
+  This README records the protocol, results and limitations. No default profile
+  was promoted and no commit was created automatically.
+
 ## Binary storage on WSL
 
 On this WSL machine, artifact directories are redirected with ordinary directory

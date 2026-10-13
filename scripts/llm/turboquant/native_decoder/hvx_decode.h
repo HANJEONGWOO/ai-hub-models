@@ -44,11 +44,47 @@ inline void tq_decode_hvx(const uint8_t* packed, const uint16_t* scales,
 // multi-bank centroid lookup and FP16 products all execute on HVX. Full vector
 // loads avoid scalarizing a partial-row memcpy into one byte load per byte.
 // Bounds are the current QHPI slice, not allocator padding or another slice.
+// Large Lloyd-Max tables: keep raw UINT8 indices, select 64-entry HVX banks.
+// No FP32 decoder or affine INT8 interpretation. Products round once to FP16.
+template<unsigned Bits, bool Symmetric = false>
+inline void tq_store_large_row(HVX_Vector indices, const HVX_Vector* tables,
+                               uint16_t scale, uint16_t* output,
+                               HVX_Vector original = Q6_V_vzero()) {
+  const auto local = Q6_V_vand_VV(indices, Q6_Vb_vsplat_R(63));
+  const auto wide = Q6_W_vshuff_VVR(Q6_V_vzero(), indices, -1);
+  const auto mask = Q6_Vh_vsplat_R(192);
+  auto out0 = Q6_V_vzero(), out1 = Q6_V_vzero();
+  for (unsigned bank = 0; bank < (1u << (Bits - 6)); ++bank) {
+    auto selected = Q6_Wh_vlut16_VbVhI(local, tables[bank], 0);
+    selected = Q6_Wh_vlut16or_WhVbVhI(selected, local, tables[bank], 1);
+    selected = Q6_Wh_vlut16or_WhVbVhI(selected, local, tables[bank], 2);
+    selected = Q6_Wh_vlut16or_WhVbVhI(selected, local, tables[bank], 3);
+    const auto ordered = Q6_W_vshuff_VVR(Q6_V_hi_W(selected), Q6_V_lo_W(selected), -2);
+    const auto tag = Q6_Vh_vsplat_R(bank * 64);
+    out0 = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VhVh(Q6_V_vand_VV(Q6_V_lo_W(wide), mask), tag), Q6_V_lo_W(ordered), out0);
+    out1 = Q6_V_vmux_QVV(Q6_Q_vcmp_eq_VhVh(Q6_V_vand_VV(Q6_V_hi_W(wide), mask), tag), Q6_V_hi_W(ordered), out1);
+  }
+  const auto factor = Q6_Vh_vsplat_R(scale);
+  out0 = Q6_Vhf_vmpy_VhfVhf(out0, factor);
+  out1 = Q6_Vhf_vmpy_VhfVhf(out1, factor);
+  if constexpr (Symmetric) {
+    // Positive-half LUT plus an exact FP16 sign flip (including signed zero).
+    const auto codes = Q6_W_vshuff_VVR(Q6_V_vzero(), original, -1);
+    const auto sign = Q6_Vh_vsplat_R(128);
+    const auto neg0 = Q6_Vh_vasl_VhR(Q6_V_vxor_VV(Q6_V_vand_VV(Q6_V_lo_W(codes), sign), sign), 8);
+    const auto neg1 = Q6_Vh_vasl_VhR(Q6_V_vxor_VV(Q6_V_vand_VV(Q6_V_hi_W(codes), sign), sign), 8);
+    out0 = Q6_V_vxor_VV(out0, neg0);
+    out1 = Q6_V_vxor_VV(out1, neg1);
+  }
+  memcpy(output, &out0, 128);
+  memcpy(output + 64, &out1, 128);
+}
+
 template<unsigned Bits>
 inline void tq_decode_bits_hvx(const uint8_t* packed, const uint16_t* scales,
                               const uint16_t* centroids, uint16_t* output,
                               uint32_t rows) {
-  static_assert(Bits >= 2 && Bits <= 6);
+  static_assert(Bits >= 2 && Bits <= 8);
   if (!rows) return;
   alignas(128) uint8_t offsets[128], next[128];
   alignas(128) uint16_t shifts[128], table[64];
@@ -62,6 +98,21 @@ inline void tq_decode_bits_hvx(const uint8_t* packed, const uint16_t* scales,
     table[j] = index < (1u << Bits) ? centroids[index] : 0;
   }
   HVX_Vector off, nxt, shift0, shift1, lut;
+  HVX_Vector large_tables[4];
+  bool symmetric = false;
+  if constexpr (Bits == 8) {
+    symmetric = true;
+    for (unsigned i = 0; i < 128; ++i)
+      symmetric &= centroids[i] == (centroids[255 - i] ^ 0x8000u);
+  }
+  if constexpr (Bits >= 7) {
+    for (unsigned bank = 0; bank < (symmetric ? 2u : (1u << (Bits - 6))); ++bank) {
+      alignas(128) uint16_t values[64];
+      for (unsigned j = 0; j < 64; ++j)
+        values[j] = centroids[(symmetric ? 128 : 0) + bank * 64 + j / 2 + (j % 2) * 32];
+      memcpy(&large_tables[bank], values, 128);
+    }
+  }
   memcpy(&off, offsets, 128); memcpy(&nxt, next, 128);
   memcpy(&shift0, shifts, 128); memcpy(&shift1, shifts + 64, 128);
   memcpy(&lut, table, 128);
@@ -86,6 +137,19 @@ inline void tq_decode_bits_hvx(const uint8_t* packed, const uint16_t* scales,
     HVX_Vector bytes;
     if (offset + 128 <= byte_count) memcpy(&bytes, packed + offset, 128);
     else bytes = Q6_V_vror_VR(tail, offset - tail_start);
+    if constexpr (Bits == 8) {
+      if (symmetric) {
+        const auto half = Q6_Vb_vsplat_R(127);
+        const auto negative = Q6_Q_vcmp_gt_VubVub(Q6_Vb_vsplat_R(128), bytes);
+        const auto reflected = Q6_Vb_vsub_VbVb(half, bytes);
+        const auto magnitude = Q6_V_vand_VV(Q6_V_vmux_QVV(negative, reflected, bytes), half);
+        tq_store_large_row<7, true>(magnitude, large_tables, scales[row], output + row * 128, bytes);
+      } else {
+        // Retain exact generic LUT semantics for a non-symmetric caller.
+        tq_store_large_row<8>(bytes, large_tables, scales[row], output + row * 128);
+      }
+      continue;
+    }
     // vlut32 tables interleave entries 0..63 with entries 64..127.
     const auto byte_lut = Q6_Vb_vshuff_Vb(bytes);
     auto first = Q6_Vb_vlut32_VbVbI(off, byte_lut, 0);
@@ -98,10 +162,18 @@ inline void tq_decode_bits_hvx(const uint8_t* packed, const uint16_t* scales,
       first = Q6_Vb_vlut32or_VbVbVbI(first, off, byte_lut, 2);
       second = Q6_Vb_vlut32or_VbVbVbI(second, nxt, byte_lut, 2);
     }
+    if constexpr (Bits == 7) {
+      first = Q6_Vb_vlut32or_VbVbVbI(first, off, byte_lut, 3);
+      second = Q6_Vb_vlut32or_VbVbVbI(second, nxt, byte_lut, 3);
+    }
     const auto words = Q6_W_vshuff_VVR(first, second, -1);
     const auto lo = Q6_V_vand_VV(Q6_Vh_vlsr_VhVh(Q6_V_lo_W(words), shift0), mask);
     const auto hi = Q6_V_vand_VV(Q6_Vh_vlsr_VhVh(Q6_V_hi_W(words), shift1), mask);
     const auto indices = Q6_Vb_vpacke_VhVh(hi, lo);
+    if constexpr (Bits == 7) {
+      tq_store_large_row<7>(indices, large_tables, scales[row], output + row * 128);
+      continue;
+    }
     auto selected = Q6_Wh_vlut16_VbVhI(indices, lut, 0);
     if constexpr (Bits >= 5)
       selected = Q6_Wh_vlut16or_WhVbVhI(selected, indices, lut, 1);
