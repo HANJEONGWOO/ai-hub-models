@@ -553,8 +553,10 @@ def main() -> None:
             **plan,
             "profile": profile,
             "config_hash": convert_report["config_hash"],
+            "k8_layers": [i for i, pair in enumerate(plan["bits"]) if pair[0] == 8],
+            "config": convert_report["config"],
         }
-        if plan and plan["policy"] == "attention_mse"
+        if plan and plan["policy"] in ("attention_mse", "nll_allocation")
         else None,
     )
     graphs = args.graphs or sorted(

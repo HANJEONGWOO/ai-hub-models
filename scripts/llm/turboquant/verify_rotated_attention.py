@@ -336,8 +336,10 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
             **plan,
             "profile": conversion["profile"],
             "config_hash": conversion["config_hash"],
+            "k8_layers": [i for i, pair in enumerate(plan["bits"]) if pair[0] == 8],
+            "config": config,
         }
-        if plan and plan["policy"] == "attention_mse"
+        if plan and plan["policy"] in ("attention_mse", "nll_allocation")
         else None,
     )
     if current.config_hash() != conversion["config_hash"]:

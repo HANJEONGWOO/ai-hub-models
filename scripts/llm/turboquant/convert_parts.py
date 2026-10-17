@@ -349,7 +349,9 @@ def main() -> None:
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--profile", default="baseline_int8")
     parser.add_argument(
-        "--layer-plan", type=Path, help="Frozen MSE mixed-bit plan JSON (hash checked)."
+        "--layer-plan",
+        type=Path,
+        help="Frozen MSE or Structured K8 allocation JSON (hash checked).",
     )
     parser.add_argument(
         "--rotation",

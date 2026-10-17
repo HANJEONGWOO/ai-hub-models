@@ -190,7 +190,7 @@ class TurboQuantConfig:
                 raise ValueError(
                     "Mixed-bit requires scaled PolarQuant K/V without QJL."
                 )
-            if self.layer_policy not in ("uniform", "attention_mse"):
+            if self.layer_policy not in ("uniform", "attention_mse", "nll_allocation"):
                 raise ValueError(
                     "Mixed-bit requires a recorded layer selection policy."
                 )
@@ -484,6 +484,44 @@ PROFILES["structured_k8_v4_scaled"] = replace(
     key=KVCodecSpec(CodecKind.POLAR, 8, KEY_SEED, "structured_k8_two_region_v1"),
 )
 
+STRUCTURED_ALLOCATION_PROFILE = "mixed_k6_v2_structured_k8_allocation"
+_STRUCTURED_ALLOCATION_BASE = replace(
+    PROFILES["mixed_k6_v2_uniform_structured_k8"],
+    profile=STRUCTURED_ALLOCATION_PROFILE,
+    layer_policy="nll_allocation",
+)
+
+
+def structured_allocation_plan(k8_layers: object) -> dict[str, Any]:
+    """Create a canonical, hash-checked K8x14/K4x14/V2 allocation artifact.
+
+    The policy describes this opt-in experiment, not its selection objective;
+    fixed masks and NLL-selected masks use the same inference identity scheme.
+    Diagnostic single-layer flips are deliberately not deployable here.
+    """
+    if (
+        not isinstance(k8_layers, list)
+        or len(k8_layers) != 14
+        or any(type(layer) is not int or not 0 <= layer < 28 for layer in k8_layers)
+        or len(set(k8_layers)) != 14
+    ):
+        raise ValueError(
+            "Allocation requires exactly 14 distinct integer layers in [0,27]"
+        )
+    layers = sorted(k8_layers)
+    config = replace(
+        _STRUCTURED_ALLOCATION_BASE,
+        layer_bits=tuple((8 if layer in layers else 4, 2) for layer in range(28)),
+    )
+    return {
+        "profile": STRUCTURED_ALLOCATION_PROFILE,
+        "policy": "nll_allocation",
+        "k8_layers": layers,
+        "bits": [list(pair) for pair in config.layer_bits],
+        "config_hash": config.config_hash(),
+        "config": config.to_dict(),
+    }
+
 
 def get_profile(
     name: str,
@@ -498,12 +536,31 @@ def get_profile(
             "the default path is QJL-off PolarQuant."
         )
     lookup = name.replace("_mse", "_uniform") if name.startswith("mixed_") else name
-    if lookup not in PROFILES:
+    if lookup not in PROFILES and name != STRUCTURED_ALLOCATION_PROFILE:
         raise ValueError(
             f"Unknown TurboQuant profile '{name}'. Choose from {sorted(PROFILES)}."
         )
-    config = PROFILES[lookup]
-    if name.endswith("_mse"):
+    config = (
+        _STRUCTURED_ALLOCATION_BASE
+        if name == STRUCTURED_ALLOCATION_PROFILE
+        else PROFILES[lookup]
+    )
+    if name == STRUCTURED_ALLOCATION_PROFILE:
+        if rotation is not None and rotation != Rotation.DENSE_QR:
+            raise ValueError("Structured allocation requires Dense QR")
+        if layer_plan is None:
+            raise ValueError(
+                "Structured allocation requires its frozen layer-plan JSON"
+            )
+        expected = structured_allocation_plan(layer_plan.get("k8_layers"))
+        if any(layer_plan.get(key) != value for key, value in expected.items()):
+            raise ValueError(
+                "Allocation plan/config/codebook hash or bit budget mismatch"
+            )
+        config = replace(
+            config, layer_bits=tuple(tuple(pair) for pair in expected["bits"])
+        )
+    elif name.endswith("_mse"):
         if rotation is not None and rotation != config.rotation:
             raise ValueError(
                 "MSE-selected layer plans are fixed to their Dense rotation."

@@ -10,6 +10,344 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Structured K8 NLL layer allocation (opt-in, 2026-10-13)
+
+Branch `exp/structured-k8-nll-allocation`, based on
+`exp/structured-k8-decoder` commit `fe744cddb`. This experiment does not
+change any default, train weights, recalibrate activations, change a codebook,
+or modify the Native package. No automatic commit.
+
+The new `mixed_k6_v2_structured_k8_allocation` profile requires an explicit
+layer-plan JSON. `structured_allocation_plan(k8_layers)` creates a canonical
+plan containing the full configuration and its hash. Exactly 14 distinct
+integer K8 layers in `[0,27]` are required; the other 14 use K4 and all 28 use
+V2. Loading a plan with inconsistent bits, configuration, codebook or hash
+fails. Cache state from a different allocation is rejected. K8 uses the
+existing Structured quantizer and opt-in HVX arithmetic decoder; K4/V2 use
+the existing LM tree and Native decoders. Dense K42/V542, tile256, GQA,
+current/past compression, FP16 effective scales and W4A16 weights are unchanged.
+
+At CL1024 the real host allocation is **30,277,632 bytes = 28.875 MiB**:
+28 MiB of indices plus 0.875 MiB of FP16 scales. The average **index** budget
+is K6/V2 (8 bits combined), not eight bits including scale metadata.
+
+| Static allocation | K8 layers, zero-based |
+|---|---|
+| Uniform-Odd | 1,3,...,27 |
+| Uniform-Even | 0,2,...,26 |
+| Early | 0..13 |
+| Late | 14..27 |
+| Middle | 7..20 |
+| Boundary | 0..6 and 21..27 |
+
+### Frozen search and data protocol
+
+Artifacts are kept outside the repository at
+`/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_nll_allocation_20261013`.
+`protocol.json` and `data_manifest.json` freeze the inputs and hashes before
+selection. Four allocation-calibration documents are reused from the previous
+rotation experiment's validation manifest: Éva Gauthier, Die Another Day,
+Battle of the Hongorai River, and Exit Through the Kwik-E-Mart. These are
+**not activation calibration**. Final quality uses the unchanged legacy four
+WikiText windows, excluded from this search. No contiguous 16-token span is
+shared between the two input sets. Each window has 1024 tokens and 1023 scored
+targets. Overall PPL is `exp(sum(NLL_sum) / 4092)`, not the mean of window PPLs.
+The test windows have appeared in earlier experiments; they are not a newly
+unseen generalization benchmark.
+
+`allocation_offline_model.py` replays the actual exported W4A16 weights and
+fixed activation/parameter quantization grids on CUDA. It does not substitute
+an unquantized Hugging Face model. Full-model teacher-forced logits are
+recomputed for each candidate. The KV codec reproduces the existing CPU
+reference's LM/Structured index decisions, norm correction and FP16 rounding;
+attention follows the AR128 mask/chunk geometry and tile256 accumulation.
+However, GEMM/reduction arithmetic and quantized-grid emulation are **not
+bit-exact HTP**. GPU use here is an offline search tool, not a CPU/GPU fallback
+in the deployed HTP graph.
+
+Search starts at Uniform-Odd. Each of at most **three iterations** evaluates
+28 single flips, ranks four promotions and four demotions by full-model
+calibration NLL, and evaluates their 16 swaps. Only an improvement larger
+than `1e-6` mean NLL is accepted; ties use `(NLL, promotion, demotion)`.
+Single flips temporarily use 13/15 K8 layers only for offline sensitivity;
+every swap and exported profile retains exactly 14. Scores are cached by
+mask and immutable evaluator identity. This is bounded greedy search, not a
+proof of an optimal layer allocation. Attention MSE is not the objective.
+
+The protocol also fixes an **HTP calibration acceptance gate**: evaluate the
+final offline candidate and Uniform-Odd on the same four calibration inputs,
+then retain the candidate only if actual HTP mean NLL improves by more than
+`1e-6`. Otherwise retain Uniform-Odd. Freeze `selection.json` before any test
+scoring. Static allocation test results cannot change that selection.
+
+Offline search history (four calibration windows; these are **not HTP NLLs**):
+
+| Step | Promote K4→K8 | Demote K8→K4 | Mean NLL |
+|---|---:|---:|---:|
+| Initial Uniform-Odd | — | — | 3.52375509 |
+| 1 | 0 | 11 | 3.26225743 |
+| 2 | 4 | 19 | 3.24126212 |
+| 3 | 2 | 25 | 3.22837518 |
+
+The proposed mask is `[0,1,2,3,4,5,7,9,13,15,17,21,23,27]`.
+The offline mean NLLs of the six static masks are respectively
+`3.52375509 / 3.24887410 / 3.23081409 / 3.62499426 / 3.58707253 / 3.23703912`.
+The prior Attention-MSE mask `[10,15,16,17,18,19,20,21,22,23,24,25,26,27]`,
+replayed with this experiment's Structured K8 codec, scores `3.60810823`
+offline. This last replay is a mask comparison, not an eighth HTP benchmark.
+The raw history, all single-flip/swapped-mask document NLLs, evaluator identity
+and proposal are retained under `offline/` and `plans/nll_candidate.json`.
+The exact evaluator sources used for selection are archived under
+`offline/source_used/` and match `offline/identity.json`. After scoring finished,
+only the standard repository license header was added to the working copies;
+their parsed Python ASTs are identical. `source_archive_note.json` records this
+non-semantic change. Resume checks remain fail-closed on source-byte changes;
+use a fresh directory for reproduction with the final sources.
+
+HTP calibration accepted this proposal **before test evaluation**:
+
+| Calibration mean NLL, same four documents | Uniform-Odd | Uniform-Even diagnostic | NLL-selected |
+|---|---:|---:|---:|
+| Offline W4A16 surrogate | 3.52375509 | 3.24887410 | 3.22837518 |
+| Actual full-model HTP | 3.60778174 | 3.27215053 | 3.23615315 |
+
+The selected mask lowers HTP calibration mean NLL by `0.37162858` versus
+Odd and by `0.03599738` versus Even. All four calibration documents improve
+versus Odd; their mean NLL deltas are
+`-0.92127229 / -0.28701896 / -0.19416345 / -0.08405963`.
+The first document supplies about 62% of the total calibration gain, so it
+would be inappropriate to describe this small selection set as broad
+generalization evidence. The observed candidate improvement transfers to
+HTP, but the emulator's error magnitude remains allocation-dependent.
+`selection.json` and `plans/nll_selected.json` freeze the chosen mask; no
+static test result can revise it.
+
+Full configuration hashes (each JSON also embeds its codebook/rotation identity):
+
+| Plan | SHA-256 |
+|---|---|
+| Uniform-Odd | `f7e7fa3ce4ea8e73547beb80f5a6a04ac78485a17c55832938e1cba026d985b5` |
+| Uniform-Even | `01226307def7cd6780398969d690cb93cc6652268da474f139c9f4243f7e01db` |
+| Early | `533a9bf507cc4bf6d650b42ab110afca84f2e739014c01680d81708e4883baea` |
+| Late | `07d6a9f3ae1dd173eac74fea7e36dabcadebc972cb3b150e316f9bd5d74624ee` |
+| Middle | `02545f3a7e8307291e782742327713cbbbb2f55bbf485f6603fdfcee982fa038` |
+| Boundary | `c6e905f027b370548fba9ca92e51abd627d170e363573c9f767d473492039d60` |
+| NLL proposal | `ccf1f776ed92e0e56239e94b1373ba35fc9a1e31a67fcce72749afbe8fdcfc42` |
+
+### Fidelity and validation limits
+
+The emulator's first-layer Q/K/V are close to an existing actual FP16-KV HTP
+capture (relative MSE approximately `2.08e-6 / 7.86e-7 / 4.54e-5`), but this
+does not establish full-model equivalence. On Uniform-Odd calibration, the
+offline-minus-HTP document mean NLL ranges from **-0.553 to +0.139** and mean
+`KL(HTP || offline)` from **0.187 to 0.518**. Therefore the offline sensitivities
+are explicitly surrogate results, not measured HTP sensitivities. The final
+candidate must pass the independent HTP acceptance gate described above.
+Accumulation/fusion and error propagation can contribute to this discrepancy;
+these checks do not isolate a unique cause.
+
+CPU regression including the new allocation/search tests: **681 passed**,
+two existing SWIG warnings. Tests cover exact count/range/type/hash checks,
+cache incompatibility, storage accounting, greedy stopping/budget rules and
+codec agreement with the existing reference. Export audits compare all
+non-Key-codec ONNX nodes/constants and weight encodings, then inspect compiled
+rotations, FP16 boundaries, per-layer decoder types and cache I/O. The old
+encoder AR128 scale-gate failures remain separate known limitations; no
+tolerance is relaxed and no new claim of encoder bit-exactness is made.
+Ruff and `git diff --check` pass. Targeted mypy on the changed configuration
+and two new test files passes with `--follow-imports=silent`. A dependency-aware
+check also exposed existing tuple/list typing errors in unchanged
+`export.py:585,593` (present in the base commit); this is not reported as a
+clean repository-wide mypy run.
+
+The runner only gains optional teacher-forced logit dumping for KL analysis.
+The no-dump performance path executes the same graphs and is measured once
+per unique configuration, unprofiled, with 897 input + 128 generated tokens.
+Test KL is `KL(Uniform-Odd || candidate)`, including per-target P95/P99; it is
+not a divergence from an FP16 baseline. Single observations do not establish
+statistical speed superiority.
+
+Each score dump is 621,722,112 bytes. To avoid filling device storage,
+`release_allocation_device_logits.py` can remove this experiment's exact
+device-side logit filenames **only after host/device SHA-256 agreement**.
+All host dumps under `/mnt/d`, reports, receipts and model binaries remain.
+The device copy can be restored with `adb push`. Run archival cleanup between
+measurements, not concurrently with a timed performance run.
+
+### Fixed test and single-run performance results
+
+S26 Ultra (SM-S948N / SM8850), Qwen3-1.7B W4A16, CL1024. Quality is the
+same four legacy WikiText windows (4092 scored targets). Performance is one
+unprofiled 897-input / 128-generated-token run per configuration, in table
+order. TTFT excludes model/context loading; decode throughput uses the
+existing runner's 127 post-first-token steps. Score-mode logit dumping is
+separate from the no-dump performance runs.
+
+| Allocation | Test mean NLL | Test PPL | PPL reduction vs Odd | TTFT (ms) | Prefill (tok/s) | Decode (tok/s) |
+|---|---:|---:|---:|---:|---:|---:|
+| Uniform-Odd | 3.161763 | 23.612187 | 0.000% | 499.132 | 1798.643 | 37.272 |
+| Uniform-Even | 3.043824 | 20.985342 | 11.125% | 493.144 | 1820.514 | 37.350 |
+| Early | 3.010394 | 20.295398 | 14.047% | 497.889 | 1803.033 | 37.402 |
+| Late | 3.321210 | 27.693837 | -17.286% | 496.150 | 1809.453 | 37.409 |
+| Middle | 3.290510 | 26.856561 | -13.740% | 530.565 | 1693.198 | 37.327 |
+| Boundary | 3.004137 | 20.168807 | 14.583% | 535.336 | 1678.634 | 37.243 |
+| NLL-selected | 3.010138 | 20.290203 | 14.069% | 496.275 | 1809.032 | 37.281 |
+
+**The NLL-selected mask improves over Uniform-Odd, but is not the best test
+mask among these seven.** Its test mean NLL decreases by `0.15162482` and PPL
+by 14.069%. Boundary has 0.60% lower PPL than the selected mask, and Early is
+almost identical (20.295398 versus 20.290203). This supports transfer of the
+selected candidate's gain over its initialization, not superiority of greedy
+NLL selection over every static policy. No Boundary result was fed back into
+selection and neither mask was promoted to a default.
+
+The selected mask improves all four test windows over Odd:
+
+| Window | Selected NLL | Selected PPL | Selected − Odd NLL | Selected − Boundary NLL |
+|---|---:|---:|---:|---:|
+| w0 | 2.485617 | 12.008527 | -0.058773 | -0.018375 |
+| w1 | 3.236655 | 25.448456 | -0.191913 | +0.005243 |
+| w2 | 3.002939 | 20.144649 | -0.178128 | +0.028282 |
+| w3 | 3.315342 | 27.531807 | -0.177684 | +0.008854 |
+
+The early-protecting masks outperform Odd in this test, while Late and Middle
+worsen it. The initial offline single-flip diagnostic identifies layer 0 as
+the largest promotion benefit (`-0.255798` mean NLL versus at most `-0.020932`
+for the other initial promotions). These observations suggest that early K
+protection matters here, but neither isolate layer 0's HTP causal contribution
+nor establish a universal rule for other models or data. The three accepted
+swaps promote 0/4/2 and demote 11/19/25; sensitivities are recomputed each round.
+
+The selected run's TTFT changes by -0.57% and decode throughput by +0.024%
+versus Odd: essentially unchanged **in these single observations**. Middle
+and Boundary have higher measured TTFT; this is preserved in the table, not
+normalized away. No repeat-based variance estimate, statistical speedup or
+causal compiler/thermal explanation is claimed. Uniform-Odd's PPL exactly
+reproduces the preceding arithmetic-decoder experiment.
+
+Every configuration has **28.875 MiB actual host KV storage** and
+**96.929 MiB runtime I/O buffers**. There is no per-token allocation metadata.
+Other memory figures are distinct from KV storage:
+
+| Allocation | End VmRSS (MiB) | Process VmHWM (MiB) | Four context binaries (MiB) |
+|---|---:|---:|---:|
+| Uniform-Odd | 150.125 | 604.863 | 1621.328 |
+| Uniform-Even | 150.012 | 605.332 | 1621.301 |
+| Early | 146.926 | 602.949 | 1621.160 |
+| Late | 150.082 | 605.176 | 1621.234 |
+| Middle | 150.816 | 605.734 | 1621.195 |
+| Boundary | 150.613 | 605.387 | 1621.332 |
+| NLL-selected | 150.156 | 605.285 | 1621.344 |
+
+Logit divergence over all 4092 test targets, in nats:
+
+| Allocation | Mean KL(Odd ∥ allocation) | P95 | P99 |
+|---|---:|---:|---:|
+| Uniform-Odd | 0 | 0 | 0 |
+| Uniform-Even | 0.429715 | 1.678416 | 4.486211 |
+| Early | 0.471868 | 1.911581 | 4.954686 |
+| Late | 0.336313 | 1.295130 | 3.267350 |
+| Middle | 0.311449 | 1.229007 | 3.235573 |
+| Boundary | 0.458332 | 1.773342 | 5.044264 |
+| NLL-selected | 0.451241 | 1.778218 | 5.214410 |
+
+Odd is itself quantized, not a quality oracle: smaller KL to Odd does not
+imply lower NLL. Late/Middle demonstrate this distinction. The saved logit
+rows are independently checked against the exact teacher-forced target IDs;
+their recomputed mean NLL must agree with the runner within `1e-6`.
+
+Historical same-window quality references, **not new device measurements**:
+
+| Earlier configuration | PPL |
+|---|---:|
+| Uniform LM K6/V2 | 19.844793 |
+| Mixed K6/V2, Uniform LM K8 | 23.983459 |
+| Mixed K6/V2, Attention-MSE-selected LM K8 | 27.241766 |
+| This NLL-selected Structured K8 | 20.290203 |
+
+The selected mask remains **0.445410 PPL / 2.24% above** the earlier uniform
+K6/V2 result at the same cache size. The earlier MSE-selected allocation is
+worse, but its codebook and selection protocol differ; this comparison does
+not establish general superiority of NLL selection over Attention MSE.
+The same prior mask is additionally compared with Structured K8 in the
+offline calibration table above, without an unrequested eighth HTP run.
+
+### Files and retained artifacts
+
+- `config.py`: opt-in allocation factory, exact quota/config/codebook hash checks.
+- `convert_parts.py`, `verify_kv_boundary.py`, `verify_rotated_attention.py`:
+  external-plan help and audit reconstruction for the new opt-in profile.
+- `qnn_runner/src/main.cpp`: optional score-mode logit dump; no-dump timing path unchanged.
+- `allocation_offline_model.py`, `search_nll_allocation.py`: exported W4A16
+  surrogate, full-model NLL sensitivity, immutable cached scores and bounded swaps.
+- `benchmark_nll_allocation.py`: frozen protocol, isolated builds, graph audits,
+  serial HTP quality/performance and pre-test selection gate.
+- `summarize_nll_allocation.py`: paired NLL/PPL, logit-alignment audit, KL and figures.
+- `release_allocation_device_logits.py`: hash-verified archival cleanup of only
+  this experiment's device logit duplicates; host originals are retained.
+- `test_turboquant_allocation.py`, `test_turboquant_allocation_search.py`:
+  21 new allocation/cache/search/reference tests; README: this report and commands.
+
+The artifact root contains `comparison.json/csv`, `document_nll.csv`,
+`logit_kl.json`, `layer_nll_sensitivity.csv`, all seven plans, `selection.json`,
+the complete `offline/` search history and source archive, raw `reports/`,
+model/codebook/configuration/binary provenance, and validation logs.
+`figures/layer_masks.svg` and `figures/initial_nll_sensitivity.svg` visualize
+all masks and the initial per-layer NLL sensitivity; PNG counterparts are
+included. All older experiment directories remain intact. Device cleanup
+receipts identify identical retained host copies; no model binaries are deleted.
+
+### Reproduction
+
+Run from the repository root with the existing Android/QAIRT environment.
+Use a **new output directory**; scripts refuse to overwrite completed results.
+The source artifacts and Native package are pinned by `benchmark_nll_allocation.py`.
+
+```bash
+export PYTHONPATH=src:scripts/llm/turboquant
+RUN=/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_nll_allocation_NEW
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py prepare --root "$RUN"
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py build --root "$RUN"
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py push --root "$RUN" --groups uniform_odd uniform_even
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py calibration --root "$RUN" --groups uniform_odd uniform_even
+venv/bin/python scripts/llm/turboquant/release_allocation_device_logits.py --root "$RUN"
+venv/bin/python scripts/llm/turboquant/search_nll_allocation.py preflight --root "$RUN"
+venv/bin/python scripts/llm/turboquant/search_nll_allocation.py search --root "$RUN"
+venv/bin/python scripts/llm/turboquant/search_nll_allocation.py static-offline --root "$RUN"
+# For a novel candidate; reuse the matching static bundle if masks coincide.
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py build --root "$RUN" --groups nll_candidate
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py push --root "$RUN" --groups nll_candidate
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py calibration --root "$RUN" --groups nll_candidate
+venv/bin/python scripts/llm/turboquant/release_allocation_device_logits.py --root "$RUN"
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py finalize --root "$RUN"
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py push --root "$RUN" --groups early late middle boundary
+for GROUP in uniform_odd uniform_even early late middle boundary; do
+  venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py evaluate --root "$RUN" --groups "$GROUP"
+  venv/bin/python scripts/llm/turboquant/release_allocation_device_logits.py --root "$RUN"
+done
+# If selection.json selected a novel nll_candidate, evaluate it once as well.
+venv/bin/python scripts/llm/turboquant/benchmark_nll_allocation.py evaluate --root "$RUN" --groups nll_candidate
+venv/bin/python scripts/llm/turboquant/release_allocation_device_logits.py --root "$RUN"
+venv/bin/python scripts/llm/turboquant/summarize_nll_allocation.py --root "$RUN"
+```
+
+An arbitrary allocation can be generated without editing defaults:
+
+```python
+import json
+from pathlib import Path
+from qai_hub_models.models.templates.llm.turboquant.config import structured_allocation_plan
+
+plan = structured_allocation_plan(list(range(0, 28, 2)))
+with Path("my_allocation.json").open("x") as stream:
+    json.dump(plan, stream, indent=2)
+```
+
+Pass it to `convert_parts.py --profile mixed_k6_v2_structured_k8_allocation
+--layer-plan my_allocation.json --structured-k8-decoder arithmetic` alongside
+the ordinary split/output/Native-package options. The allocation profile has
+no implicit mask; `get_profile()` rejects it without its frozen JSON.
+
 ## Structured K8 arithmetic decoder (opt-in, 2026-10-13)
 
 Branch `exp/structured-k8-decoder`, based on `exp/structured-k8-codebook`
