@@ -314,6 +314,8 @@ def test_scalar_indexing_identity_is_fixed_for_compressed_profiles(name: str) ->
         assert data["scalar_indexing"] == (
             "lloyd_tree_except_structured_k8_arithmetic"
             if config.structured_k8
+            else "lloyd_tree_except_uniform_k8_arithmetic"
+            if config.uniform_k8
             else "lloyd_tree"
         )
     else:

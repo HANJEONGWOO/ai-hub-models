@@ -178,6 +178,52 @@ def _structured_arithmetic(
     return n("Cast", [index], "index_i32", to=TensorProto.INT32)
 
 
+def _quantizer_arithmetic(
+    sg: Subgraph, src: str, prefix: str, quantizer: str, *, centroid: bool = False
+) -> str:
+    if quantizer == "structured_k8_two_region_v1":
+        return _structured_arithmetic(sg, src, prefix, centroid=centroid)
+    if quantizer != "uniform_k8_gaussian_v1":
+        raise ValueError("Unknown arithmetic K8 quantizer")
+    from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import coefficients
+
+    offset, step = coefficients()
+
+    def c(name: str, value: float) -> str:
+        return sg.const("tq_uniform_k8_" + name, np.array(value, np.float32))
+
+    def n(op: str, inputs: list[str], name: str, **attrs: Any) -> str:
+        out = prefix + name
+        sg.node(op, inputs, [out], **attrs)
+        return out
+
+    def half(value: str, name: str) -> str:
+        narrowed = n("Cast", [value], name + "16", to=TensorProto.FLOAT16)
+        return n("Cast", [narrowed], name, to=TensorProto.FLOAT)
+
+    if centroid:
+        center = n("Sub", [src, c("center", 127.5)], "centered")
+        local = n("Sub", [n("Abs", [center], "abs"), c("half", 0.5)], "magnitude")
+        positive = n("GreaterOrEqual", [src, c("sign_edge", 128)], "positive")
+        product = half(
+            n("Mul", [local, c("step", step)], "local_product"), "rounded_product"
+        )
+        value = half(
+            n("Add", [product, c("offset", offset)], "unsigned"), "rounded_unsigned"
+        )
+        return n("Where", [positive, value, n("Neg", [value], "negative")], "centroid")
+    magnitude = n("Abs", [src], "magnitude")
+    position = n("Mul", [magnitude, c("reciprocal", 1 / step)], "position")
+    local = n(
+        "Clip", [n("Floor", [position], "floor"), c("zero", 0), c("last", 127)], "local"
+    )
+    positive = n("GreaterOrEqual", [src, c("zero", 0)], "positive")
+    pos = n("Add", [c("sign_edge", 128), local], "positive_code")
+    neg = n("Sub", [c("last", 127), local], "negative_code")
+    index = n("Where", [positive, pos, neg], "index_f")
+    return n("Cast", [index], "index_i32", to=TensorProto.INT32)
+
+
 def _scalar_index_tree(
     sg: Subgraph,
     src: str,
@@ -452,7 +498,7 @@ def encode_subgraph(
     )
     # Preserve head_dim as the vectorized innermost axis, without a boundary axis.
     index = (
-        _structured_arithmetic(sg, f"{p}rotated", p + "scalar_")
+        _quantizer_arithmetic(sg, f"{p}rotated", p + "scalar_", spec.quantizer)
         if spec.quantizer != "lloyd_max"
         else _scalar_index_tree(
             sg,
@@ -513,8 +559,8 @@ def encode_subgraph(
                 [f"{p}scale_index"],
             )
             y_hat = (
-                _structured_arithmetic(
-                    sg, f"{p}scale_index", p + "scale_", centroid=True
+                _quantizer_arithmetic(
+                    sg, f"{p}scale_index", p + "scale_", spec.quantizer, centroid=True
                 )
                 if spec.quantizer != "lloyd_max"
                 else _select_centroid(
@@ -717,7 +763,7 @@ def decode_subgraph(
         )
         index_f = f"{p}mse_index"
     y_hat = (
-        _structured_arithmetic(sg, index_f, p, centroid=True)
+        _quantizer_arithmetic(sg, index_f, p, spec.quantizer, centroid=True)
         if spec.quantizer != "lloyd_max"
         else _select_centroid(sg, index_f, centroids, spec.bits, d, p)
     )

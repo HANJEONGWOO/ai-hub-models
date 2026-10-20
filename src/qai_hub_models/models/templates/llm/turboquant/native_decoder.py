@@ -22,14 +22,20 @@ NATIVE_DOMAIN = "turboquant"
 NATIVE_OP = "Decode4"
 STRUCTURED_OP = "Decode8Structured"
 STRUCTURED_COEFFICIENTS = "tq_native_structured_k8_coefficients_fp16"
+UNIFORM_OP = "Decode8Uniform"
+UNIFORM_COEFFICIENTS = "tq_native_uniform_k8_coefficients_fp16"
 
 
 def native_op(config: TurboQuantConfig, kind: str) -> str:
+    if getattr(config, kind).quantizer == "uniform_k8_gaussian_v1":
+        return UNIFORM_OP
     bits = 4 if config.qjl and kind == "key" else getattr(config, kind).bits
     return f"Decode{bits}"
 
 
 def native_table(config: TurboQuantConfig, kind: str) -> str:
+    if getattr(config, kind).quantizer == "uniform_k8_gaussian_v1":
+        return UNIFORM_COEFFICIENTS
     if getattr(config, kind).codebook_variant:
         return "tq_native_converged_k8_centroids_fp16"
     if getattr(config, kind).quantizer != "lloyd_max":
@@ -77,6 +83,12 @@ def use_native_decoder(
             continue
         tables.add(table_name)
         values = spec_codebook(getattr(layer_config, kind), 128)
+        if table_name == UNIFORM_COEFFICIENTS:
+            from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+                coefficients,
+            )
+
+            values = coefficients()
         if config.qjl and kind == "key":
             values = np.tile(values, 2)
         graph.initializer.append(
@@ -89,6 +101,8 @@ def use_native_decoder(
     for layer in result.attention_tiles:
         layer_config = config.for_layer(layer["layer"])
         layer["decoder"] = "native_unpack_lut_v1"
+        if layer_config.key.quantizer == "uniform_k8_gaussian_v1":
+            layer["key_decoder_op"] = UNIFORM_OP
         for tile in layer["tiles"]:
             for kind in ("key", "value"):
                 prefix = f"tq_{kind}_{layer['layer']}_tile{tile['start']}_"
@@ -239,15 +253,17 @@ def with_reference_decoder(model: onnx.ModelProto) -> onnx.ModelProto:
                 [helper.make_opsetid("", 17)],
             )
         )
-    if any(
-        n.domain == NATIVE_DOMAIN and n.op_type == STRUCTURED_OP
-        for n in result.graph.node
-    ):
+    for arithmetic_op in (STRUCTURED_OP, UNIFORM_OP):
+        if not any(
+            n.domain == NATIVE_DOMAIN and n.op_type == arithmetic_op
+            for n in result.graph.node
+        ):
+            continue
         nodes = []
         for name, value in (
             ("sign_edge", 128),
             ("negative_edge", 127),
-            ("region_stride", 64),
+            ("region_stride", 128 if arithmetic_op == UNIFORM_OP else 64),
             ("two", 2),
             ("one", 1),
         ):
@@ -299,7 +315,7 @@ def with_reference_decoder(model: onnx.ModelProto) -> onnx.ModelProto:
         result.functions.append(
             helper.make_function(
                 NATIVE_DOMAIN,
-                STRUCTURED_OP,
+                arithmetic_op,
                 ["packed", "scale", "coefficients"],
                 ["decoded"],
                 nodes,

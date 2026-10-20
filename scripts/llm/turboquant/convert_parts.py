@@ -484,6 +484,8 @@ def main() -> None:
         )
         if args.structured_k8_decoder == "arithmetic":
             required.add("Decode8Structured")
+        if config.uniform_k8:
+            required.add("Decode8Uniform")
         if not required.issubset(package_manifest.get("operations", ["Decode4"])):
             parser.error(
                 "Native package lacks the selected bit widths; build the updated package and pass --native-decoder-package"

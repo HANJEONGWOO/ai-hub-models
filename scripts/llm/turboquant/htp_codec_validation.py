@@ -663,6 +663,7 @@ def main() -> None:
             "k6_v2_scaled",
             "k8_v4_scaled",
             "structured_k8_v4_scaled",
+            "uniform_k8_v4_scaled",
             "lm8_converged_v4_scaled",
         ],
         default=PROFILE,

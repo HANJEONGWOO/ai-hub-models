@@ -90,6 +90,8 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
         bits = 4 if config.get("qjl") and kind == "key" else config[kind]["bits"]
         if plan := config.get("layer_plan"):
             bits = plan["bits"][layer][kind == "value"]
+        if config.get("uniform_k8") and kind == "key" and bits == 8:
+            return "Decode8Uniform"
         if (
             conversion.get("structured_k8_decoder") == "arithmetic"
             and kind == "key"

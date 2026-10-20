@@ -52,7 +52,11 @@ def compare_encode(
     bits = codec.spec.bits
     y, ref_norms = codec.rotate_normalized(x)
     ref_idx = np.searchsorted(codec.boundaries, y, side="left")
-    if codec.spec.quantizer != "lloyd_max":
+    if codec.spec.quantizer == "uniform_k8_gaussian_v1":
+        from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import indices
+
+        ref_idx = indices(y).astype(np.int64)
+    elif codec.spec.quantizer != "lloyd_max":
         from qai_hub_models.models.templates.llm.turboquant.structured_k8 import indices
 
         # Compare the requested arithmetic rule, not an LM nearest-LUT rule.

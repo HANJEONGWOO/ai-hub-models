@@ -47,7 +47,9 @@ def canonical(title: str) -> str:
     return " ".join(title.strip().strip("=").strip().lower().split())
 
 
-def heldout(root: Path, assets: dict) -> dict:
+def heldout(
+    root: Path, assets: dict, *, selection_salt: str = "LM8-heldout-20261020:"
+) -> dict:
     """Freeze four new documents by content hash order, never by model outcome."""
     inventory = read(NLL_PREVIOUS / "prior_data_inventory.json")
     excluded = set(inventory["canonical_titles"])
@@ -98,9 +100,7 @@ def heldout(root: Path, assets: dict) -> dict:
     if current:
         documents.append((title, "".join(current)))
     documents.sort(
-        key=lambda item: hashlib.sha256(
-            ("LM8-heldout-20261020:" + item[1]).encode()
-        ).hexdigest()
+        key=lambda item: hashlib.sha256((selection_salt + item[1]).encode()).hexdigest()
     )
     tokenizer = AutoTokenizer.from_pretrained(
         assets["checkpoint_dir"], local_files_only=True
@@ -150,7 +150,7 @@ def heldout(root: Path, assets: dict) -> dict:
         "revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
         "parquet": str(source),
         "parquet_sha256": digest(source),
-        "selection": "content-hash ascending salted LM8-heldout-20261020; offset min(256,length-1024); four eligible docs",
+        "selection": f"content-hash ascending salted {selection_salt.rstrip(':')}; offset min(256,length-1024); four eligible docs",
         "heldout": selected,
         "legacy": {k: assets["sha256"][k] for k in assets["wikitext_windows"]},
         "excluded_titles": sorted(excluded),
@@ -296,7 +296,7 @@ def validate(root: Path) -> dict:
     return protocol
 
 
-def freeze_sources(root: Path) -> None:
+def freeze_sources(root: Path, evaluation_order: list[str] | None = None) -> None:
     """Pin the actual exported model weights/grids, not only deployment contexts."""
     split = ARTIFACTS / "qwen3_1_7b_w4a16_split/split_manifest.json"
     files = [split]
@@ -309,8 +309,11 @@ def freeze_sources(root: Path) -> None:
         {
             "files_sha256": {str(p): digest(p) for p in files},
             "purpose": "Unchanged exported W4A16 weights/activation grids; no training or recalibration",
-            "actual_evaluation_order": ["structured", "lm8_100", "lm8_converged"],
-            "order_reason": "Reuse Structured while new LM contexts build; single run per group, no counterbalancing claim",
+            "actual_evaluation_order": evaluation_order
+            or ["structured", "lm8_100", "lm8_converged"],
+            "order_reason": "Predeclared repeated order; see protocol"
+            if evaluation_order
+            else "Reuse Structured while new LM contexts build; single run per group, no counterbalancing claim",
         },
     )
     import onnxruntime

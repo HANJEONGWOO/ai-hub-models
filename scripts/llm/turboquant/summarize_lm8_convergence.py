@@ -29,9 +29,15 @@ from summarize_optrace import physical_events, union_length
 from summarize_stage_profiles import semantic_stage
 
 
-def probes(root: Path) -> None:
+def probes(
+    root: Path,
+    groups: tuple[str, ...] | None = None,
+    *,
+    structured_lut_control: bool = True,
+) -> None:
+    groups = tuple(GROUPS) if groups is None else groups
     rows, numeric, hashes = [], {}, {}
-    for group in GROUPS:
+    for group in groups:
         work = root / ("encoder_" + group)
         manifest = read(work / "manifest.json")
         numeric[group] = read(work / "p2_report.json")
@@ -94,7 +100,9 @@ def probes(root: Path) -> None:
     else:
         save_new(config, features)
     decoders = []
-    for group in (*GROUPS, "structured_lut_control"):
+    for group in (
+        (*groups, "structured_lut_control") if structured_lut_control else groups
+    ):
         work = root / ("decoder_" + group)
         correctness = read(work / "correctness.json")
         hashes[str(work / "correctness.json")] = digest(work / "correctness.json")
@@ -150,7 +158,7 @@ def probes(root: Path) -> None:
             assert hvx and not any(
                 "uses_hmx" in e["args"].get("Flags", []) for e in events
             )
-            reference = root / "decoder_lm8_100"
+            reference = root / ("decoder_" + groups[0])
             for suffix in ("_packed.raw", "_scale.raw"):
                 assert digest(work / (name + suffix)) == digest(
                     reference / (name + suffix)
@@ -197,7 +205,9 @@ def probes(root: Path) -> None:
             "decoder": decoders,
             "encoder_numerics": numeric,
             "source_sha256": hashes,
-            "structured_lut_arithmetic_same_output": True,
+            "structured_lut_arithmetic_same_output": True
+            if structured_lut_control
+            else None,
             "limits": "Named-op encoder cycle counters and physical decoder HVX busy cycles are distinct measures, neither is a TTFT percentage. Isolated SDK execute times use qnn-net-run policy, not full-model burst policy. Diagnostic cases/shapes are not performance repeats.",
         },
     )

@@ -61,6 +61,12 @@ def load_boundaries(bits: int, block_size: int) -> np.ndarray:
 
 
 def spec_codebook(spec: KVCodecSpec, block_size: int) -> np.ndarray:
+    if spec.quantizer == "uniform_k8_gaussian_v1":
+        from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import codebook
+
+        if block_size != 128:
+            raise ValueError("Uniform K8 only supports D128")
+        return codebook()
     if spec.codebook_variant:
         from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import codebook
 
@@ -192,8 +198,14 @@ class PolarQuantReference:
         self.precomputed_norm = precomputed_norm
         self.centroids = spec_codebook(spec, block_size)
         self.boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2
-        if spec.quantizer != "lloyd_max":
+        if spec.quantizer == "structured_k8_two_region_v1":
             from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+                boundaries,
+            )
+
+            self.boundaries = boundaries()
+        if spec.quantizer == "uniform_k8_gaussian_v1":
+            from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
                 boundaries,
             )
 
@@ -220,7 +232,13 @@ class PolarQuantReference:
     def encode(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """``(indices uint8 [..., d], norms float64 [..., 1])``."""
         y, norms = self.rotate_normalized(x)
-        if self.spec.quantizer != "lloyd_max":
+        if self.spec.quantizer == "uniform_k8_gaussian_v1":
+            from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+                indices as uniform_indices,
+            )
+
+            indices = uniform_indices(y)
+        elif self.spec.quantizer != "lloyd_max":
             from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
                 indices as structured_indices,
             )

@@ -74,7 +74,11 @@ class KVCodecSpec:
             raise ValueError(
                 "Converged codebook requires the opt-in LM Polar K8 variant"
             )
-        if self.quantizer not in ("lloyd_max", "structured_k8_two_region_v1"):
+        if self.quantizer not in (
+            "lloyd_max",
+            "structured_k8_two_region_v1",
+            "uniform_k8_gaussian_v1",
+        ):
             raise ValueError("Unknown scalar quantizer")
         if self.quantizer != "lloyd_max" and (
             self.kind != CodecKind.POLAR or self.bits != 8
@@ -140,6 +144,7 @@ class TurboQuantConfig:
     layer_policy: str = ""
     structured_k8: bool = False
     converged_k8: bool = False
+    uniform_k8: bool = False
 
     def codec_for(self, kind: str, layer: int) -> KVCodecSpec:
         if kind not in ("key", "value"):
@@ -156,6 +161,8 @@ class TurboQuantConfig:
             quantizer=(
                 "structured_k8_two_region_v1"
                 if self.structured_k8 and kind == "key" and bits == 8
+                else "uniform_k8_gaussian_v1"
+                if self.uniform_k8 and kind == "key" and bits == 8
                 else "lloyd_max"
             ),
             codebook_variant=(
@@ -177,6 +184,19 @@ class TurboQuantConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.uniform_k8 and (
+            self.structured_k8
+            or self.converged_k8
+            or self.block_size != 128
+            or self.qjl
+            or not self.precomputed_norm
+            or not self.norm_correction
+            or self.norm_dtype != "float16"
+            or self.rotation != Rotation.DENSE_QR
+        ):
+            raise ValueError(
+                "Uniform K8 requires exclusive scaled Dense D128 K-only profile"
+            )
         if self.converged_k8 and (
             self.structured_k8
             or self.block_size != 128
@@ -210,9 +230,17 @@ class TurboQuantConfig:
                 "Structured K8 requires Dense D128, norm-corrected FP16 scales, no QJL"
             )
         if self.value.quantizer != "lloyd_max" or (
-            self.key.quantizer != "lloyd_max" and not self.structured_k8
+            self.key.quantizer != "lloyd_max"
+            and not (self.structured_k8 or self.uniform_k8)
         ):
             raise ValueError("Structured quantizer is opt-in K-only")
+        if (self.key.quantizer == "uniform_k8_gaussian_v1" and not self.uniform_k8) or (
+            self.key.quantizer == "structured_k8_two_region_v1"
+            and not self.structured_k8
+        ):
+            raise ValueError(
+                "K8 arithmetic quantizer does not match the opt-in profile"
+            )
         if self.layer_bits:
             if not isinstance(self.layer_bits, tuple) or any(
                 not isinstance(pair, tuple) or any(type(bit) is not int for bit in pair)
@@ -382,6 +410,17 @@ class TurboQuantConfig:
                 data["layer_plan"]["codebook_sha256"]["8"] = metadata()[
                     "codebook_sha256"
                 ]
+        if self.uniform_k8:
+            from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+                metadata,
+            )
+
+            data["uniform_k8"] = metadata()
+            data["scalar_indexing"] = "lloyd_tree_except_uniform_k8_arithmetic"
+            if self.layer_bits:
+                data["layer_plan"]["codebook_sha256"]["8"] = metadata()[
+                    "codebook_sha256"
+                ]
         if self.fp16_attention:
             data["attention"] = {
                 "kv_storage": "float16",
@@ -414,12 +453,18 @@ class TurboQuantConfig:
                 data[name]["codebook_sha256"] = CODEBOOK_SHA256[
                     (spec.bits, self.block_size)
                 ]
-                if spec.quantizer != "lloyd_max":
+                if spec.quantizer == "structured_k8_two_region_v1":
                     from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
                         CODEBOOK_SHA256 as structured_hash,
                     )
 
                     data[name]["codebook_sha256"] = structured_hash
+                if spec.quantizer == "uniform_k8_gaussian_v1":
+                    from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+                        CODEBOOK_SHA256 as uniform_hash,
+                    )
+
+                    data[name]["codebook_sha256"] = uniform_hash
                 if spec.codebook_variant:
                     from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import (
                         CODEBOOK_SHA256 as converged_hash,
@@ -550,6 +595,17 @@ PROFILES["structured_k8_v4_scaled"] = replace(
     profile="structured_k8_v4_scaled",
     structured_k8=True,
     key=KVCodecSpec(CodecKind.POLAR, 8, KEY_SEED, "structured_k8_two_region_v1"),
+)
+PROFILES["mixed_k6_v2_uniform_uniform_k8"] = replace(
+    PROFILES["mixed_k6_v2_uniform"],
+    profile="mixed_k6_v2_uniform_uniform_k8",
+    uniform_k8=True,
+)
+PROFILES["uniform_k8_v4_scaled"] = replace(
+    PROFILES["k8_v4_scaled"],
+    profile="uniform_k8_v4_scaled",
+    uniform_k8=True,
+    key=KVCodecSpec(CodecKind.POLAR, 8, KEY_SEED, "uniform_k8_gaussian_v1"),
 )
 
 STRUCTURED_ALLOCATION_PROFILE = "mixed_k6_v2_structured_k8_allocation"

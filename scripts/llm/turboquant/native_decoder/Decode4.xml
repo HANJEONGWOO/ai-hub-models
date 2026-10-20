@@ -202,5 +202,30 @@
       </Output>
       <SupportedBackend>HTP</SupportedBackend>
     </OpDef>
+    <OpDef>
+      <Name>Decode8Uniform</Name>
+      <Description><Content>Reflected sign and 7-bit magnitude. Separate FP16 multiply, add, sign and scale on HVX; no region or LUT.</Content></Description>
+      <Input>
+        <Name>packed</Name><Description><Content>Uniform K8 UINT8 cache indices</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_UINT_8</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,128</Text></Shape>
+      </Input>
+      <Input>
+        <Name>scale</Name><Description><Content>FP16 effective scales</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,1</Text></Shape>
+      </Input>
+      <Input>
+        <Name>coefficients</Name><Description><Content>Frozen delta/2,delta from uniform_k8.py</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>1,1,1,2</Text></Shape>
+      </Input>
+      <Output>
+        <Name>decoded</Name><Description><Content>Rotated-domain FP16 K tile</Content></Description>
+        <Mandatory>true</Mandatory><Datatype>QNN_DATATYPE_FLOAT_16</Datatype>
+        <Shape><Rank>4D</Rank><Text>heads,1,tokens,128</Text></Shape>
+      </Output>
+      <SupportedBackend>HTP</SupportedBackend>
+    </OpDef>
   </OpDefList>
 </OpDefCollection>

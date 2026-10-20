@@ -54,6 +54,12 @@ def build(args: argparse.Namespace) -> None:
         if args.bits != 8:
             raise ValueError("Structured K8 LUT requires 8 bits")
         centroids = codebook().astype(np.float16)
+    elif args.lut == "uniform_k8":
+        from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import codebook
+
+        if args.bits != 8:
+            raise ValueError("Uniform K8 requires 8 bits")
+        centroids = codebook().astype(np.float16)
     elif args.lut == "lm8_converged":
         from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import codebook
 
@@ -71,6 +77,14 @@ def build(args: argparse.Namespace) -> None:
 
         params = coefficients().astype(np.float16)
     op = "Decode8Structured" if arithmetic else f"Decode{args.bits}"
+    if getattr(args, "uniform_arithmetic", False):
+        from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+            coefficients,
+        )
+
+        params = coefficients().astype(np.float16)
+        arithmetic = True
+        op = "Decode8Uniform"
     parameter_name = "coefficients" if arithmetic else "centroids"
     (work / "lut.json").write_text(
         json.dumps({"kind": args.lut, "bits": args.bits, "values": centroids.tolist()})
@@ -323,6 +337,7 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, nargs="+", default=[3])
     parser.add_argument("--bits", type=int, choices=list(range(2, 9)), default=4)
     parser.add_argument("--structured-arithmetic", action="store_true")
+    parser.add_argument("--uniform-arithmetic", action="store_true")
     parser.add_argument("--scale-edges", action="store_true")
     parser.add_argument("--strict-bit-exact", action="store_true")
     parser.add_argument(
@@ -332,7 +347,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--lut",
-        choices=["mse4", "mse3", "qjl_sign", "structured_k8", "lm8_converged"],
+        choices=[
+            "mse4",
+            "mse3",
+            "qjl_sign",
+            "structured_k8",
+            "lm8_converged",
+            "uniform_k8",
+        ],
         default="mse4",
     )
     parser.add_argument(
@@ -354,6 +376,12 @@ def main() -> None:
         parser.error("QJL nibble LUT variants require --bits 4")
     if args.structured_arithmetic and (args.bits != 8 or args.lut != "structured_k8"):
         parser.error("Arithmetic decoder requires --bits 8 --lut structured_k8")
+    if args.uniform_arithmetic and (
+        args.structured_arithmetic or args.bits != 8 or args.lut != "uniform_k8"
+    ):
+        parser.error(
+            "Uniform arithmetic requires --bits 8 --lut uniform_k8 exclusively"
+        )
     if args.scale_edges and args.bits != 8:
         parser.error("Edge-scale probe requires byte indices")
     for stage in ("build", "run", "compare"):

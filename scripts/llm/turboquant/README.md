@@ -10,6 +10,238 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Uniform K8 versus Structured K8 (opt-in, 2026-10-20)
+
+Branch `exp/uniform-k8-baseline`, based on `exp/lloyd-max-k8-convergence`
+commit `70b8b006e`. Existing defaults, codebooks and experiment contents are
+preserved; no automatic commit, model training or activation recalibration.
+Artifacts: `/mnt/d/ai-hub-models/binaries/turboquant/uniform_k8_baseline_20261020`.
+
+Both groups use Qwen3-1.7B W4A16, S26 Ultra, CL1024, odd14 K8/even14 K4,
+V2 on every layer, Dense K42/V542, norm correction, FP16 effective scales,
+current/past KV compression and tile256 attention. K4/V2 remain Lloyd–Max.
+Index payload is 28 MiB plus 0.875 MiB of scales: **28.875 MiB** allocated KV.
+
+| Group | Profile | K8 decoder |
+|---|---|---|
+| Uniform | `mixed_k6_v2_uniform_uniform_k8` | new `Decode8Uniform` HVX arithmetic |
+| Structured | `mixed_k6_v2_uniform_structured_k8` | existing `Decode8Structured` HVX arithmetic |
+
+The first `uniform` in the profile name describes layer placement, the final
+`uniform_k8` describes the new quantizer. `uniform_k8_v4_scaled` is the
+isolated encoder probe, not the full model's V2 allocation. The opt-in
+configuration records coefficients and codebook hashes and rejects cache
+state from another quantizer. Legacy profile hashes remain unchanged.
+
+### One-spacing Gaussian optimization and FP16 contract
+
+`optimize_uniform_k8.py` optimizes the single FP64 spacing for a symmetric
+256-level **mid-rise** quantizer on `N(0,1/128)`. Positive centroids are
+`(j+1/2)*delta`, `j=0..127`; tails saturate. Three fixed bounded searches
+converge to the same nearest FP16 spacing. A fixed 2049-point broad grid and
+independent numerical integral check the result. No real KV, NLL or PPL is
+used to choose the spacing. No general global-optimality claim is made.
+
+- Ideal FP64 delta: `0.002719036573080505`.
+- Frozen FP16 delta: `0.002719879150390625` (`0x1.648p-9`).
+- Offset: `delta/2 = 0.0013599395751953125`, not an independently fitted parameter.
+- Ideal Gaussian MSE: `6.85048326435e-7`; numerical integral agrees to `4.6e-12` relative error.
+- FP16 centroid SHA256: `30d0dfd34829196d478b0ec8b77e71880f8f217ac236a189d7e74805bffa905e`.
+
+Encoder uses `j=clip(floor(abs(y)*reciprocal_delta),0,127)` and code
+`128+j` for nonnegative `y`, `127-j` otherwise. The code is stored directly
+as UINT8; no boundary tree, distance search, region branch or bit packing.
+The decoder reconstructs
+`FP16(FP16(j*delta)+offset)`, applies sign, then performs the FP16 effective
+scale multiply. These separate rounds match Structured's arithmetic contract;
+the compiled Uniform kernel has no centroid LUT. Normalization, rotation and
+the selected-centroid norm correction remain unchanged.
+
+Exact uniform spacing describes the pre-rounding codebook. FP16 execution
+necessarily perturbs the stored centroid spacing; ideal-nearest MSE must
+not be confused with executed arithmetic-index MSE. Zero vectors still
+restore to zero through a zero effective scale, despite the mid-rise codebook
+having no zero centroid.
+
+| Diagnostic metric | Uniform K8 | Structured K8 |
+|---|---:|---:|
+| FP16 centroids, ideal nearest-rule Gaussian MSE | 6.8467158e-7 | 4.7935449e-7 |
+| Gaussian MSE including FP16 input/index/centroid arithmetic | 6.8695588e-7 | 4.7989992e-7 |
+| Captured K reconstruction MSE, K8 layers only | 0.0012707398 | 0.0009215808 |
+| Captured QK score MSE, K8 layers only | 0.0033231618 | 0.0024291137 |
+
+The scalar FP16 calculation integrates over all 31,744 nonnegative finite
+binary16 input rounding cells, including saturation and the signed-zero
+convention. Vector diagnostics reuse two frozen historical W4A16 FP16-KV
+captures, all 28 layers and 32 fixed causal query positions/document, with
+GQA=2. QK errors here are for the unscaled dot product, before the usual
+`1/sqrt(head_dim)` attention scaling. The vector emulator has FP16 operation
+boundaries and FP32 reductions;
+it is **not HTP bit-exact**. All-layer/rotated-reference errors and a fixed-seed
+synthetic final-KV check are also in `offline_quality.json`.
+
+### Numerical validation and frozen evaluation protocol
+
+The CPU/ONNX tests cover sign symmetry, zero/extremes, decision boundaries,
+raw-byte format, cache-hash rejection and current/past Native routing. Native
+host tests retain all previous 2..8-bit tests and additionally check Uniform
+arithmetic against its FP16 LUT oracle under all codes, edge scales, signed
+zero, subnormals, unaligned I/O, partial slices and guard pages. The LUT is
+a **test oracle**, not a deployed Uniform decoder.
+
+The final TurboQuant regression suite passes **705 tests** (two existing SWIG
+deprecation warnings). All **17** previously registered profile hashes are
+unchanged. Ruff passes. An additional mypy check reports two pre-existing
+tuple/list typing errors in `_select_centroid` (`export.py`); that unchanged
+LM implementation is not rewritten as part of this experiment.
+
+Both HTP decoders are FP16 **bit-exact** for 1/3/256/1023-token probes.
+Uniform K encoder AR1/AR128 scale maximum relative errors are
+`0.11037% / 0.16041%`; Structured is `0.11062% / 0.17255%`, all below the
+unchanged 0.2% limit. Float64-oracle index differences are adjacent-boundary
+rounding differences: zero unexplained mismatches, not a claim of bit-exact
+indices across FP64 and HTP. Every encoder operator is present in the HTP
+profile. The common **V4** AR128 probe still fails its scale gate at
+`0.24766%`; this is tracked separately and is **not the full-model V2 path**.
+
+Legacy quality uses the unchanged four WikiText windows. New held-out
+documents are **Hed PE**, **The Heart of Ezra Greer**, **The Hustler (film)**,
+and **Josepha Petrick Kemarre**. Selection is frozen salted content-hash order,
+excluding previously recorded titles and any document with prior 16-token
+overlap, without looking at outcomes. Each document supplies one 1024-token
+window and 1023 scored targets. Aggregate PPL is `exp(total_NLL/4092)`, not
+the mean of window PPLs. This is independence from recorded experiments,
+not a claim about the pretrained model's training data.
+
+Unprofiled performance uses **897+128 tokens, three runs/group** in the
+predeclared order **Uniform, Structured, Structured, Uniform, Uniform,
+Structured**. Reports retain raw samples, mean, sample standard deviation
+(`ddof=1`), minimum and maximum. Reset checks and codec diagnostics are separate
+from throughput samples; PPL is scored once per window. Three observations
+are not a statistical-superiority guarantee. Both models use the same new
+Native library package; Structured source DLCs are reused and contexts are
+rebuilt privately, never through old output-file symlinks.
+
+All six paired graph audits pass: model I/O, non-K8 operations/constants,
+activation encodings and quantized-DLC MatMul/FullyConnected contracts match.
+The Uniform graph has 24 fewer quantized-DLC operators per K8 layer (336 across
+14 layers for each AR shape); no K8 decoder LUT is present. These are graph
+structure checks, not evidence of identical HTP scheduling or a proportional
+latency improvement. Full details are in `reports/graph_audit.json`.
+
+### Full-model results
+
+Performance cells are **mean +/- sample SD [min, max]**, three crossed runs
+per group, without profiling. Quality is one teacher-forced pass/window,
+4092 targets/split/group. No data or quantizer parameters were changed after
+seeing these results.
+
+| Metric | Uniform K8 | Structured K8 |
+|---|---:|---:|
+| TTFT (ms) | 536.446 +/- 7.752 [530.278, 545.149] | 539.084 +/- 5.060 [533.821, 543.915] |
+| Prefill (tok/s) | 1675.256 +/- 23.938 [1648.435, 1694.453] | 1666.834 +/- 15.706 [1651.927, 1683.232] |
+| Decode (tok/s) | 37.1770 +/- 0.0241 [37.1558, 37.2032] | 37.1122 +/- 0.0568 [37.0502, 37.1619] |
+| Legacy mean NLL | 3.16942902 | 3.16176300 |
+| Legacy PPL | 23.79389464 | 23.61218745 |
+| New held-out mean NLL | 3.62741375 | 3.50768736 |
+| New held-out PPL | 37.61540782 | 33.37100346 |
+| Allocated KV (MiB) | 28.875 | 28.875 |
+| Runtime I/O buffers (MiB) | 96.9292 | 96.9292 |
+| End VmRSS (MiB) | 150.992 +/- 0.140 | 151.159 +/- 0.052 |
+| Process VmHWM (MiB) | 605.914 +/- 0.228 | 606.003 +/- 0.095 |
+| Four context binaries, total (MiB) | 1620.8164 | 1621.3281 |
+
+The Structured legacy NLL sums match the prior experiment exactly for all
+four windows. The **new held-out set is different from previous experiments**;
+its absolute PPL must not be compared with an earlier held-out PPL.
+
+| New held-out document | Uniform mean NLL | Structured mean NLL | Uniform - Structured |
+|---|---:|---:|---:|
+| Hed PE | 3.03547252 | 3.04424901 | -0.00877649 |
+| The Heart of Ezra Greer | 3.88743994 | 3.85577839 | +0.03166155 |
+| The Hustler (film) | 3.96661961 | 3.58517121 | +0.38144840 |
+| Josepha Petrick Kemarre | 3.62012292 | 3.54555084 | +0.07457208 |
+
+Uniform changes aggregate legacy PPL by **+0.770%**, new held-out PPL by
+**+12.719%**, mean TTFT by **-0.489%**, prefill by **+0.505%**, and decode by
+**+0.175%**. Legacy windows split two better/two worse; held-out is one
+better/three worse. The Hustler accounts for about **79.65% of the net held-out
+NLL increase**. This is evidence on these frozen windows, not a claim that
+every document or corpus will suffer a 12.7% PPL increase.
+
+The one-spacing Uniform implementation is simpler, but this experiment does
+**not** establish a meaningful end-to-end speed advantage: timing differences
+are small, ranges overlap, and there are only three observations per group.
+The worse scalar/K/QK MSE and aggregate PPL do not support replacing Structured
+with Uniform on these conditions. Preserve Uniform as an opt-in research
+baseline; do not promote it or change the default.
+
+`comparison.json`, `comparison.csv` and `document_nll.csv` retain full precision,
+raw timing samples, document scores and configuration/binary hashes.
+`codec_costs.json` keeps named-op encoder cycle counters separate from physical
+decoder HVX busy cycles and elapsed SDK execute times; none of these cycle
+shares is an end-to-end TTFT percentage.
+
+| Instrumented codec diagnostic | Uniform | Structured |
+|---|---:|---:|
+| AR1 scalar-index named-op cycles | 57,498 | 95,563 |
+| AR128 scalar-index named-op cycles | 836,971 | 1,153,656 |
+| AR128 centroid/norm-scale named-op cycles | 617,539 | 794,858 |
+| AR128 direct-byte/output named-op cycles | 325,706 | 323,224 |
+| AR128 encoder SDK execute (us) | 1,459 | 1,421 |
+| Tile256 decoder physical HVX busy cycles | 354,100 | 356,227 |
+| Tile256 decoder interval-union cycles | 59,805 | 60,529 |
+| Tile256 decoder SDK execute (us) | 4,399 | 4,396 |
+| Tile256 decoder execute excluding wait (us) | 648 | 678 |
+
+These are separate single instrumented probes, not the three unprofiled
+end-to-end samples. Uniform removes the region decision and reduces the
+observed index/norm-scale work, but it does not remove byte-output traffic or
+the decoder's final scale multiply. The measured decoder busy-cycle difference
+is only about 0.6%; no decoder speed superiority is established. SDK execution
+also includes scheduling/launch/wait effects, so lower named-op cycle totals
+do not imply a lower elapsed encoder time.
+
+### Reproduction and files
+
+Use a new artifact root. Exclusive experiment logs/reports refuse overwriting
+previous attempts. Native builds stay in that root; do not overwrite a prior
+experiment's package. `benchmark_uniform_k8.py build` requires passed CPU and
+HTP decoder/K-encoder checks before full-model compilation.
+
+```bash
+TQ_UNIFORM_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/uniform_k8_baseline_repro
+venv/bin/python scripts/llm/turboquant/optimize_uniform_k8.py --out "$TQ_UNIFORM_ROOT/codebook"
+venv/bin/python scripts/llm/turboquant/native_decoder/build.py --out "$TQ_UNIFORM_ROOT/native" --test-hvx
+venv/bin/python scripts/llm/turboquant/benchmark_uniform_k8.py prepare --root "$TQ_UNIFORM_ROOT" \
+  --data-manifest /mnt/d/ai-hub-models/binaries/turboquant/uniform_k8_baseline_20261020/data_manifest.json
+venv/bin/python scripts/llm/turboquant/verify_uniform_k8.py hvx --root "$TQ_UNIFORM_ROOT"
+venv/bin/python scripts/llm/turboquant/verify_uniform_k8.py preservation --root "$TQ_UNIFORM_ROOT"
+venv/bin/python -m pytest -q src/qai_hub_models/test/test_models/test_turboquant*.py \
+  --junitxml="$TQ_UNIFORM_ROOT/tests/regression_final.xml"
+venv/bin/python scripts/llm/turboquant/evaluate_uniform_k8.py --root "$TQ_UNIFORM_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_uniform_k8.py probe-build --root "$TQ_UNIFORM_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_uniform_k8.py probe-run --root "$TQ_UNIFORM_ROOT"
+venv/bin/python scripts/llm/turboquant/report_uniform_k8.py probes --root "$TQ_UNIFORM_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_uniform_k8.py build --root "$TQ_UNIFORM_ROOT"
+venv/bin/python scripts/llm/turboquant/report_uniform_k8.py audit --root "$TQ_UNIFORM_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_uniform_k8.py evaluate --root "$TQ_UNIFORM_ROOT"
+venv/bin/python scripts/llm/turboquant/report_uniform_k8.py summary --root "$TQ_UNIFORM_ROOT"
+venv/bin/python -m pytest -q src/qai_hub_models/test/test_models/test_turboquant*.py \
+  --junitxml="$TQ_UNIFORM_ROOT/tests/regression_release.xml"
+venv/bin/python scripts/llm/turboquant/verify_uniform_k8.py final --root "$TQ_UNIFORM_ROOT"
+```
+
+Core additions are `turboquant/uniform_k8.py`, opt-in config/reference/export
+routing and `Decode8Uniform` in the Native package. Existing Structured/LM
+defaults and constants are not edited. `test_turboquant_uniform_k8.py` adds
+12 cases; the existing profile-identity test now recognizes Uniform's explicit
+arithmetic identity. The five `*_uniform_k8.py` tools cover optimization,
+protocol/build/measurement, offline errors, reporting and verification.
+`protocol.json`, `data_manifest.json`, `source_identity.json`, `environment.json`
+and `final_verification.json` retain parameters, data/binary/source hashes and
+preservation checks.
+
 ## Lloyd–Max K8 convergence versus Structured K8 (opt-in, 2026-10-20)
 
 Branch `exp/lloyd-max-k8-convergence`, based on

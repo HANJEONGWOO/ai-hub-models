@@ -121,7 +121,8 @@ template<unsigned Bits> int test_bits() {
   return 0;
 }
 
-int test_structured(const uint16_t* coeff, const uint16_t* table) {
+int test_structured(const uint16_t* coeff, const uint16_t* table, bool uniform = false) {
+  auto decode = uniform ? tq_decode_uniform8_hvx : tq_decode_structured8_hvx;
   const uint16_t special[] = {0, 0x8000, 1, 2, 0x03ff, 0x0400, 0x0401,
       0x1400, 0x3800, 0x3bff, 0x3c00, 0x3c01, 0x4000, 0x5000, 0x7bff,
       0x8001, 0x83ff, 0x8400, 0xbc00, 0xfbff};
@@ -139,7 +140,7 @@ int test_structured(const uint16_t* coeff, const uint16_t* table) {
       }
       tq_decode_bits_hvx<8>(packed.data() + offset, scales.data() + 1,
                             table, lut.data() + 1, rows);
-      tq_decode_structured8_hvx(packed.data() + offset, scales.data() + 1,
+      decode(packed.data() + offset, scales.data() + 1,
                                 coeff, arithmetic.data() + 1, rows);
       for (unsigned i = 0; i < lut.size(); ++i) {
         if (lut[i] != arithmetic[i]) {
@@ -159,12 +160,12 @@ int test_structured(const uint16_t* coeff, const uint16_t* table) {
       std::vector<uint16_t> scales(rows, 0x3c00), lut(rows * 128), arithmetic(rows * 128);
       for (unsigned i = 0; i < rows * 128; ++i) packed.data()[i] = i;
       tq_decode_bits_hvx<8>(packed.data(), scales.data(), table, lut.data(), rows);
-      tq_decode_structured8_hvx(packed.data(), scales.data(), coeff, arithmetic.data(), rows);
+      decode(packed.data(), scales.data(), coeff, arithmetic.data(), rows);
       if (lut != arithmetic) return 4;
     }
   }
 #endif
-  puts("Structured K8 arithmetic/LUT bit-exact: all codes, scale edges, signed zero, subnormals, unaligned I/O and guard pages");
+  printf("%s K8 arithmetic/LUT bit-exact: all codes, scale edges, signed zero, subnormals, unaligned I/O and guard pages\n", uniform ? "Uniform" : "Structured");
   return 0;
 }
 
@@ -172,10 +173,14 @@ int main(int argc, char** argv) {
   if (test_bits<2>() || test_bits<3>() || test_bits<4>() || test_bits<5>() || test_bits<6>() || test_bits<7>() || test_bits<8>())
     return 1;
   puts("HVX packing, LUT lane order, exact FP16 products, unaligned I/O, slice tails and guard pages passed");
-  if (argc != 2) return 5;
+  if (argc != 3) return 5;
   uint16_t reference[260];
   FILE* file = fopen(argv[1], "rb");
   if (!file || fread(reference, sizeof(*reference), 260, file) != 260) return 6;
   fclose(file);
-  return test_structured(reference, reference + 4);
+  if (test_structured(reference, reference + 4)) return 7;
+  file = fopen(argv[2], "rb");
+  if (!file || fread(reference, sizeof(*reference), 258, file) != 258) return 8;
+  fclose(file);
+  return test_structured(reference, reference + 2, true);
 }
