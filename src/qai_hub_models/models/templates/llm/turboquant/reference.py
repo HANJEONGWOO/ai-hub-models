@@ -61,6 +61,12 @@ def load_boundaries(bits: int, block_size: int) -> np.ndarray:
 
 
 def spec_codebook(spec: KVCodecSpec, block_size: int) -> np.ndarray:
+    if spec.codebook_variant:
+        from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import codebook
+
+        if block_size != 128:
+            raise ValueError("Converged K8 only supports D128")
+        return codebook()
     if spec.quantizer != "lloyd_max":
         from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
             codebook,

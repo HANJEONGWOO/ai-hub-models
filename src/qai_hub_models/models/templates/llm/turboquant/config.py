@@ -62,8 +62,18 @@ class KVCodecSpec:
     bits: int = 0
     seed: int = 0
     quantizer: str = "lloyd_max"
+    codebook_variant: str = ""
 
     def __post_init__(self) -> None:
+        if self.codebook_variant and (
+            self.codebook_variant != "lloyd_max_k8_converged_v1"
+            or self.quantizer != "lloyd_max"
+            or self.kind != CodecKind.POLAR
+            or self.bits != 8
+        ):
+            raise ValueError(
+                "Converged codebook requires the opt-in LM Polar K8 variant"
+            )
         if self.quantizer not in ("lloyd_max", "structured_k8_two_region_v1"):
             raise ValueError("Unknown scalar quantizer")
         if self.quantizer != "lloyd_max" and (
@@ -98,6 +108,8 @@ class KVCodecSpec:
         result = {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
         if self.quantizer != "lloyd_max":
             result["quantizer"] = self.quantizer
+        if self.codebook_variant:
+            result["codebook_variant"] = self.codebook_variant
         return result
 
 
@@ -127,6 +139,7 @@ class TurboQuantConfig:
     layer_bits: tuple[tuple[int, int], ...] = ()
     layer_policy: str = ""
     structured_k8: bool = False
+    converged_k8: bool = False
 
     def codec_for(self, kind: str, layer: int) -> KVCodecSpec:
         if kind not in ("key", "value"):
@@ -145,6 +158,11 @@ class TurboQuantConfig:
                 if self.structured_k8 and kind == "key" and bits == 8
                 else "lloyd_max"
             ),
+            codebook_variant=(
+                "lloyd_max_k8_converged_v1"
+                if self.converged_k8 and kind == "key" and bits == 8
+                else ""
+            ),
         )
 
     def for_layer(self, layer: int) -> TurboQuantConfig:
@@ -159,6 +177,27 @@ class TurboQuantConfig:
         )
 
     def __post_init__(self) -> None:
+        if self.converged_k8 and (
+            self.structured_k8
+            or self.block_size != 128
+            or self.qjl
+            or not self.precomputed_norm
+            or not self.norm_correction
+            or self.norm_dtype != "float16"
+            or self.rotation != Rotation.DENSE_QR
+        ):
+            raise ValueError("Converged K8 requires scaled Dense D128 LM without QJL")
+        if self.value.codebook_variant or (
+            self.key.codebook_variant and not self.converged_k8
+        ):
+            raise ValueError("Converged codebook is opt-in K-only")
+        if self.converged_k8 and (
+            self.value.bits == 8
+            or any(len(pair) == 2 and pair[1] == 8 for pair in self.layer_bits)
+        ):
+            raise ValueError(
+                "Converged K8 cannot share encoder constants with legacy V8"
+            )
         if self.structured_k8 and (
             self.block_size != 128
             or self.qjl
@@ -333,6 +372,16 @@ class TurboQuantConfig:
                 data["layer_plan"]["codebook_sha256"]["8"] = metadata()[
                     "codebook_sha256"
                 ]
+        if self.converged_k8:
+            from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import (
+                metadata,
+            )
+
+            data["converged_k8"] = metadata()
+            if self.layer_bits:
+                data["layer_plan"]["codebook_sha256"]["8"] = metadata()[
+                    "codebook_sha256"
+                ]
         if self.fp16_attention:
             data["attention"] = {
                 "kv_storage": "float16",
@@ -371,6 +420,12 @@ class TurboQuantConfig:
                     )
 
                     data[name]["codebook_sha256"] = structured_hash
+                if spec.codebook_variant:
+                    from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import (
+                        CODEBOOK_SHA256 as converged_hash,
+                    )
+
+                    data[name]["codebook_sha256"] = converged_hash
                 if self.rotation == Rotation.FWHT:
                     # Preserve the FWHT sign hashes; indexing identity is separate.
                     data[name]["signs_sha256"] = FWHT_SIGNS_SHA256[
@@ -471,6 +526,19 @@ PROFILES["k8_v4_scaled"] = TurboQuantConfig(
     _polar(4, VALUE_SEED),
     format_version=2,
     precomputed_norm=True,
+)
+PROFILES["mixed_k6_v2_uniform_lm8_converged"] = replace(
+    PROFILES["mixed_k6_v2_uniform"],
+    profile="mixed_k6_v2_uniform_lm8_converged",
+    converged_k8=True,
+)
+PROFILES["lm8_converged_v4_scaled"] = replace(
+    PROFILES["k8_v4_scaled"],
+    profile="lm8_converged_v4_scaled",
+    converged_k8=True,
+    key=KVCodecSpec(
+        CodecKind.POLAR, 8, KEY_SEED, codebook_variant="lloyd_max_k8_converged_v1"
+    ),
 )
 PROFILES["mixed_k6_v2_uniform_structured_k8"] = replace(
     PROFILES["mixed_k6_v2_uniform"],

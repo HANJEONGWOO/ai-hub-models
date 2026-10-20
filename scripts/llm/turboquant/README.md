@@ -10,6 +10,288 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Lloyd–Max K8 convergence versus Structured K8 (opt-in, 2026-10-20)
+
+Branch `exp/lloyd-max-k8-convergence`, based on
+`exp/structured-k8-nll-allocation` commit `cd8a3d509`. No default is promoted,
+no weights/activation grids are retrained or recalibrated, and no automatic
+commit is made. Prior constants, binaries and experiment results are retained.
+Artifacts: `/mnt/d/ai-hub-models/binaries/turboquant/lloyd_max_k8_convergence_20261020`.
+
+The three full-model configurations have the same 14 odd K8 layers, 14 even
+K4 layers and V2 on all 28 layers. Dense K42/V542, LM-tree K4/V2, current/past
+compression, FP16 effective scales, norm correction, tile256, attention and
+W4A16 parameters are fixed. Payload plus scales remains **28.875 MiB** at CL1024.
+
+| Group | Profile | K8 encoder | K8 decoder |
+|---|---|---|---|
+| LM8-100 | `mixed_k6_v2_uniform` | unchanged frozen 100-iteration LM | Native LUT |
+| LM8-Converged | `mixed_k6_v2_uniform_lm8_converged` | same tree/centroid lookup, new constants | same Native LUT |
+| Structured K8 | `mixed_k6_v2_uniform_structured_k8` | unchanged two-region arithmetic | unchanged opt-in HVX arithmetic |
+
+`KVCodecSpec.codebook_variant` and `TurboQuantConfig.converged_k8` are opt-in
+identities. Their default values are omitted from serialization; all existing
+profile hashes remain unchanged. K8 tables, encoder boundaries and norm
+correction constants come from the same frozen codebook. Different codebooks
+have incompatible cache hashes. `lm8_converged_v4_scaled` is an isolated K8
+probe profile, **not** the full model's V2 allocation.
+
+### FP64 convergence protocol and scalar results
+
+`optimize_lloyd_max_k8.py` minimizes the analytically integrated Gaussian
+scalar reconstruction MSE for `N(0,1/128)`. It does not fit Structured
+centroids or use KV, attention, calibration NLL or test PPL for optimization.
+Symmetric positive-half FP64 Lloyd updates use survival-function differences
+to avoid upper-tail CDF cancellation. Four deterministic initializations are
+fixed before evaluation: frozen LM8-100, Gaussian quantiles, uniform 4-sigma,
+and high-rate Gaussian companding. There is no random sample seed.
+
+Stop after **10 consecutive** iterations with maximum centroid movement
+`<= 1e-10 sigma` **and** relative MSE change `<= 1e-11`; maximum `200000`
+iterations. Choose the lowest final FP64 MSE among converged runs. No global
+optimality claim is made. Each CSV retains every iteration's MSE, maximum
+movement, relative MSE change and stability counter.
+
+| Initialization | Additional iterations | Converged |
+|---|---:|---|
+| Frozen LM8-100 | 92,584 | yes |
+| Gaussian quantiles | 92,684 | yes |
+| Uniform 4-sigma | 93,288 | yes |
+| High-rate companding | 62,495 | yes |
+
+The selected run is `uniform_4sigma`. All four runs produce the **same FP16
+table**; their tiny final FP64 MSE differences should not be interpreted as
+meaningful initialization superiority. Curves are in
+`figures/lloyd_convergence_nonnegative.{png,svg}`. The earlier plot with
+automatic negative-axis padding is preserved separately.
+
+| Scalar Gaussian MSE | LM8-100 | LM8-Converged | Structured K8 |
+|---|---:|---:|---:|
+| Nearest-centroid integrated MSE | 1.3054680e-6 | 3.2175846e-7 | 4.7935449e-7 |
+| After FP16 centroid rounding, nearest rule | 1.3057813e-6 | 3.2192792e-7 | 4.7935449e-7 |
+
+Convergence reduces the legacy scalar MSE by **75.35%**. Structured's
+nearest-centroid MSE is about **49% higher** than converged LM; its deployed
+arithmetic index rule and end-to-end quality are evaluated separately. The
+old 100-iteration table must not be described as a fully converged LM8 optimum.
+An independent piecewise numerical integral agrees with the analytic
+converged MSE to `6.8e-12` relative error. Re-executing the pinned historical
+100-step generator also reproduces its frozen FP64 and FP16 tables exactly.
+The converged FP16 LUT SHA256 is
+`c8d5945cbc5197a905e00ae1c70f5834d2a0122260ff9bb58e55a0fbcd44ae6b`;
+FP64/FP32-boundary/FP16-boundary identities are retained alongside it in
+`codebook/optimization.json` and the opt-in configuration metadata.
+
+### Captured KV/QK and numerical validation
+
+Offline errors use the same two historical W4A16 FP16-KV validation captures,
+all 28 layers and 32 fixed causal query positions/document. Query already
+contains attention scaling; GQA repeats each KV head twice. No captured
+data selects coefficients. The emulator applies FP16 operation boundaries,
+including norm correction, stored scale and restored product, but uses FP32
+reductions; it is **not HTP bit-exact**.
+
+| K8-layer metric only | LM8-100 | LM8-Converged | Structured K8 |
+|---|---:|---:|---:|
+| K reconstruction MSE, original coordinates | 0.0021052714 | 0.0006278402 | 0.0009215808 |
+| QK score MSE, original FP16-KV reference | 0.0061150458 | 0.0016754761 | 0.0024291137 |
+
+All-layer and rotated-reference results are retained in `offline_quality.json`.
+Gaussian scalar MSE, norm-corrected vector MSE, QK score MSE and full-model NLL
+are different objectives and are not substituted for each other.
+
+An important existing rounding limitation is explicitly checked: the LM
+encoder's affine-pair FP16 interpolation is not a literal LUT lookup. Of
+256 indices, **128 / 116** differ from the direct FP16 decoder LUT for
+LM8-100 / converged LM, with maximum absolute centroid differences
+`0.00146484375 / 0.003173828125`. These are executed arithmetic-rounding
+differences, **not mismatched source codebook hashes**. Structured's arithmetic
+centroids match its LUT exactly. Changing the LM encoder algorithm to remove
+this discrepancy would violate this experiment's constants-only comparison;
+it is not silently fixed or claimed bit-exact here.
+
+S26 Ultra isolated encoder checks retain the existing scale threshold `0.2%`
+and boundary-distance threshold `0.001`. No unexplained index mismatch or
+missing HTP-profiled operator is observed.
+
+| Maximum scale relative error | AR1 | AR128 |
+|---|---:|---:|
+| LM8-100 K | 0.13264% (pass) | 0.25699% (fail) |
+| Converged LM8 K | 0.11189% (pass) | 0.19189% (pass) |
+| Structured K8 K | 0.11062% (pass) | 0.17255% (pass) |
+| Common V4 standalone-probe control | 0.16533% (pass) | 0.24766% (fail) |
+
+The common V4 probe is not the V2 full-model path. Its historical failure is
+preserved and means **not all standalone encoder graphs pass**. All 16
+isolated decoder probes (three requested decoders plus Structured LUT control,
+each at 1/3/256/1023 tokens) are FP16 **bit-exact**, including all byte codes,
+edge scales and partial tiles. The extra Structured LUT control has identical
+inputs and outputs to the arithmetic decoder and isolates decoder cost without
+introducing a fourth full-model group.
+
+### Frozen evaluation data and measurement scope
+
+Full-model scoring uses the unchanged four legacy WikiText windows plus four
+new held-out test documents: **Hannah Dodd**, **Zrinski Battalion**,
+**Temple Beth Israel (Eugene, Oregon)**, and **Oxaziridine**. Documents are
+chosen by fixed salted content-hash order, not model outcomes. Previously
+recorded experiment titles and any document sharing a 16-token span with
+prior inputs are excluded. One 1024-token window per document, offset
+`min(256, document_length-1024)`, yields 1023 scored targets. Each split's
+overall PPL is `exp(total_NLL/4092)`, never the arithmetic mean of window PPLs.
+This is independence from recorded experiments, not exclusion from original
+model pretraining. Dataset revision, tokenizer, offsets and token hashes are
+retained in `data_manifest.json` and `assets/assets.json`.
+
+Performance is one unprofiled **897+128** session/group on S26 Ultra,
+CL1024, burst policy. Execution order is Structured, LM8-100, converged LM
+to reuse existing binaries during the new build. Reset diagnostics and
+codec profiling are separate and are not repeated performance samples.
+No variance, statistical superiority or counterbalanced-order claim is made.
+
+### Full-model results
+
+| Quality metric | LM8-100 | LM8-Converged | Structured K8 |
+|---|---:|---:|---:|
+| Legacy WikiText mean NLL | 3.17736437 | 3.14386415 | 3.16176300 |
+| Legacy WikiText PPL | 23.98346 | **23.19332** | 23.61219 |
+| New held-out mean NLL | 2.79712467 | 2.78602886 | 2.79758190 |
+| New held-out PPL | 16.39743 | **16.21649** | 16.40493 |
+
+| Single 897+128 session | LM8-100 | LM8-Converged | Structured K8 |
+|---|---:|---:|---:|
+| TTFT (ms, model load excluded) | 753.954 | 786.002 | 539.143 |
+| Prefill (tok/s) | 1190.344 | 1142.646 | 1666.205 |
+| Decode (tok/s) | 32.920 | 32.867 | 37.169 |
+| Allocated host KV (MiB) | 28.875 | 28.875 | 28.875 |
+| I/O buffers (MiB) | 96.929 | 96.929 | 96.929 |
+| End VmRSS (MiB) | 153.867 | 154.223 | 151.070 |
+| Process VmHWM (MiB) | 605.559 | 605.832 | 606.059 |
+| Four context binaries (MiB) | 1635.695 | 1635.566 | 1621.328 |
+
+**Interpretation:** converging LM8 lowers legacy PPL by **3.29%** and
+new held-out PPL by **1.10%** versus LM8-100. Legacy NLL improves on all
+four windows; held-out NLL improves on three of four documents and worsens
+on Zrinski Battalion. This is an observed aggregate quality improvement,
+not a universal per-document guarantee. Gaussian MSE's 75.35% reduction
+does not translate to a comparable percentage PPL reduction.
+
+Converged LM's measured TTFT is **4.25% higher**, with decode **0.16% lower**
+than LM8-100. A constants-only change does not remove the expensive LM8
+encoder structure. There is **no observed speed improvement** and one
+observation does not establish a systematic slowdown.
+
+Structured retains the latency advantage in this run: compared with
+converged LM its TTFT is **31.41% lower** and decode **13.09% higher**, but
+its legacy and held-out PPL are **1.81% / 1.16% higher**. The proper conclusion
+is a quality/latency trade-off, not that Structured beats fully converged LM
+in Gaussian MSE or overall quality. Converged LM wins three of four legacy
+windows against Structured; on held-out documents they win two each.
+These small test sets and single performance observations do not establish
+statistical or broad-domain superiority. Defaults remain unchanged.
+
+`comparison.json` / `.csv` contain the complete aggregate results, configuration
+and binary hashes; `document_nll.csv` retains all 24 window scores.
+`codec_costs.json` keeps named-op encoder cycle counters separate from physical
+decoder HVX busy cycles and SDK execute times. Busy-cycle percentages are
+**not TTFT or end-to-end latency reductions**. LM100 versus converged LM
+isolates codebook constants. Structured versus LM changes both quantizer and
+decoder; the separate same-codebook Structured decoder probes are necessary
+for decoder-only attribution.
+
+### Isolated codec costs
+
+The following AR128 encoder measurements use the same captured layer-0 K
+input. Stage columns are **named-op cycle counters**, not elapsed time and
+not mutually exclusive physical HVX occupancy. The SDK execute column is
+elapsed accelerator time from the separate instrumented probe.
+
+| K8 encoder | Normalize cycles | Rotation cycles | Scalar-index cycles | Pack/output cycles | Norm/scale cycles | SDK execute (us) |
+|---|---:|---:|---:|---:|---:|---:|
+| LM8-100 | 1,214,365 | 34,111 | 16,218,775 | 34,027 | 12,813,320 | 3,203 |
+| LM8-Converged | 1,157,135 | 35,570 | 15,666,367 | 42,710 | 12,195,259 | 3,187 |
+| Structured K8 | 1,119,549 | 15,917 | 1,146,338 | 308,389 | 822,695 | 1,523 |
+
+AR1 scalar-index / norm-scale counters are respectively
+`752434 / 529539`, `774935 / 561896`, and `89799 / 45922`; SDK execute times
+are `1480 / 1472 / 1328 us`. LM convergence changes constants, not tree depth
+or centroid-lookup structure. Both LM variants therefore retain the expensive
+8-bit index and norm-correction lookup. All groups store one UINT8 per K8
+coordinate: a changed pack/output counter is not a changed packing algorithm.
+
+For one **256-token** Native decoder invocation, using identical index and
+scale inputs:
+
+| Decoder | Physical HVX busy cycles | HVX interval-union cycles | SDK execute (us) | SDK execute excluding wait (us) |
+|---|---:|---:|---:|---:|
+| LM8-100 LUT | 536,340 | 90,389 | 4,318 | 678 |
+| LM8-Converged LUT | 583,426 | 98,146 | 4,491 | 758 |
+| Structured arithmetic | 358,972 | 60,605 | 4,429 | 653 |
+| Structured LUT control | 593,957 | 100,201 | 4,469 | 769 |
+
+Only the last two rows isolate the decoder algorithm with the **same
+codebook and bit-exact outputs**. Arithmetic records 39.56% fewer HVX busy
+cycles in this probe; this is not a 39.56% whole-model decode improvement.
+Wait/launch costs, probe power policy, profiling overhead and a single sample
+preclude converting these counters into a full-model speedup. No Native
+kernel was changed in this convergence experiment.
+
+### Reproduction
+
+Use a **new output directory**. Existing reports, input data, performance
+logs and codebook outputs are never replaced by the experiment harness.
+The original failed decoder build is retained as
+`decoder_lm8_100_failed_python_resolution`: no HTP measurement occurred in
+that attempt. A probe-tool fix now preserves the SDK venv interpreter path
+instead of resolving its symlink to `/usr/bin/python`; this does not change
+the model or Native kernel.
+
+`benchmark_lm8_convergence.py audit` compares all six attention-part
+AR1/AR128 ONNX graphs and quantized DLC operator contracts: only the K8
+boundary/centroid constants and LUT identifier may differ. It checks all
+255 boundaries, both FP16 LUTs, unchanged weight/activation encodings,
+I/O, MatMul shape/dtype and remaining operator connectivity. An SDK-generated
+RMS node name is normalized, not its operation or tensors. This does not
+claim that backend scheduling or measured execution time is identical.
+`verify_lm8_convergence.py` then audits frozen input hashes, all three bundles,
+24 scoring windows, three performance sessions, decoder/encoder checks and
+the 691-test regression report without executing the device again.
+
+One preservation issue is documented in
+`runtime_manifest_preservation_note.json`: the first Structured push
+regenerated an inherited runtime-manifest symlink with **identical bytes**,
+changing its host timestamp. The prior device copy and host SHA256 match;
+no prior binary or result content changed. The experiment now uses a private
+runtime manifest, and the harness refuses inherited runtime-manifest symlinks.
+
+Implementation changes are limited to opt-in config/reference/export/Native
+table routing and the frozen `turboquant/lloyd_max_k8.py` constants. No existing
+codebook constants or Native C++ kernels are edited. New experiment tools are
+`optimize_lloyd_max_k8.py`, `benchmark_lm8_convergence.py`,
+`evaluate_lm8_quality.py`, `probe_lm8_convergence.py`,
+`summarize_lm8_convergence.py`, and `verify_lm8_convergence.py`; the isolated
+probe CLIs accept the new profile/table, and
+`test_turboquant_lm8_convergence.py` adds eight regression cases.
+`final_verification.json` records the exact changed-file and report hashes.
+
+```bash
+TQ_LM_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/lloyd_max_k8_convergence_repro
+venv/bin/python scripts/llm/turboquant/optimize_lloyd_max_k8.py --out "$TQ_LM_ROOT/codebook"
+venv/bin/python scripts/llm/turboquant/benchmark_lm8_convergence.py prepare --root "$TQ_LM_ROOT" \
+  --data-manifest /mnt/d/ai-hub-models/binaries/turboquant/lloyd_max_k8_convergence_20261020/data_manifest.json
+venv/bin/python scripts/llm/turboquant/evaluate_lm8_quality.py --root "$TQ_LM_ROOT"
+venv/bin/python scripts/llm/turboquant/probe_lm8_convergence.py build --root "$TQ_LM_ROOT"
+venv/bin/python scripts/llm/turboquant/probe_lm8_convergence.py run --root "$TQ_LM_ROOT"
+venv/bin/python scripts/llm/turboquant/summarize_lm8_convergence.py probes --root "$TQ_LM_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_lm8_convergence.py build --root "$TQ_LM_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_lm8_convergence.py audit --root "$TQ_LM_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_lm8_convergence.py evaluate --root "$TQ_LM_ROOT"
+venv/bin/python scripts/llm/turboquant/summarize_lm8_convergence.py results --root "$TQ_LM_ROOT"
+venv/bin/python -m pytest -q src/qai_hub_models/test/test_models/test_turboquant*.py \
+  --junitxml="$TQ_LM_ROOT/tests/regression_final.xml"
+venv/bin/python scripts/llm/turboquant/verify_lm8_convergence.py --root "$TQ_LM_ROOT"
+```
+
 ## Structured K8 NLL layer allocation (opt-in, 2026-10-13)
 
 Branch `exp/structured-k8-nll-allocation`, based on

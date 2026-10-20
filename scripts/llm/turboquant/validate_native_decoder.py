@@ -54,6 +54,12 @@ def build(args: argparse.Namespace) -> None:
         if args.bits != 8:
             raise ValueError("Structured K8 LUT requires 8 bits")
         centroids = codebook().astype(np.float16)
+    elif args.lut == "lm8_converged":
+        from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import codebook
+
+        if args.bits != 8:
+            raise ValueError("Converged LM8 requires 8 bits")
+        centroids = codebook().astype(np.float16)
     elif args.lut == "qjl_sign":
         centroids = np.repeat(np.array([-1, 1], dtype=np.float16), 8)
     arithmetic = getattr(args, "structured_arithmetic", False)
@@ -325,7 +331,9 @@ def main() -> None:
         help="Separate diagnostic execution with physical HVX trace",
     )
     parser.add_argument(
-        "--lut", choices=["mse4", "mse3", "qjl_sign", "structured_k8"], default="mse4"
+        "--lut",
+        choices=["mse4", "mse3", "qjl_sign", "structured_k8", "lm8_converged"],
+        default="mse4",
     )
     parser.add_argument(
         "--device-dir", default="/data/local/tmp/qaihm_turboquant/native_smoke_20260918"
@@ -337,8 +345,11 @@ def main() -> None:
     args = parser.parse_args()
     # Context generation runs inside the probe directory to contain schematics.
     # Resolve CLI paths before changing cwd, including user-supplied relative ones.
-    for name in ("work_dir", "package", "sdk", "qnn_python"):
+    for name in ("work_dir", "package", "sdk"):
         setattr(args, name, getattr(args, name).resolve())
+    # Resolving a venv interpreter symlink selects /usr/bin/python and loses
+    # the SDK virtualenv. Make it absolute without dereferencing the executable.
+    args.qnn_python = args.qnn_python.expanduser().absolute()
     if args.bits != 4 and args.lut in ("mse3", "qjl_sign"):
         parser.error("QJL nibble LUT variants require --bits 4")
     if args.structured_arithmetic and (args.bits != 8 or args.lut != "structured_k8"):

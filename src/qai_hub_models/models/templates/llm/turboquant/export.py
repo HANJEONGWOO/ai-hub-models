@@ -179,7 +179,12 @@ def _structured_arithmetic(
 
 
 def _scalar_index_tree(
-    sg: Subgraph, src: str, bits: int, block_size: int, prefix: str
+    sg: Subgraph,
+    src: str,
+    bits: int,
+    block_size: int,
+    prefix: str,
+    codebook_override: np.ndarray | None = None,
 ) -> str:
     """Exact ``searchsorted(boundaries, src, side='left')``, same shape as src.
 
@@ -190,7 +195,11 @@ def _scalar_index_tree(
     """
     if bits not in range(2, 9):
         raise ValueError("Scalar tree requires a frozen 2..8-bit codebook.")
-    boundaries = load_boundaries(bits, block_size).astype(np.float32)
+    boundaries = (
+        load_boundaries(bits, block_size)
+        if codebook_override is None
+        else (codebook_override[:-1] + codebook_override[1:]) / 2
+    ).astype(np.float32)
 
     def constant(name: str, value: float) -> str:
         return sg.const(
@@ -445,7 +454,14 @@ def encode_subgraph(
     index = (
         _structured_arithmetic(sg, f"{p}rotated", p + "scalar_")
         if spec.quantizer != "lloyd_max"
-        else _scalar_index_tree(sg, f"{p}rotated", spec.bits, d, p + "scalar_")
+        else _scalar_index_tree(
+            sg,
+            f"{p}rotated",
+            spec.bits,
+            d,
+            p + "scalar_",
+            spec_codebook(spec, d) if spec.codebook_variant else None,
+        )
     )
     sg.node(
         "Reshape",
@@ -504,7 +520,7 @@ def encode_subgraph(
                 else _select_centroid(
                     sg,
                     f"{p}scale_index",
-                    load_codebook(spec.bits, d).astype(np.float32),
+                    spec_codebook(spec, d).astype(np.float32),
                     spec.bits,
                     d,
                     p + "scale_",

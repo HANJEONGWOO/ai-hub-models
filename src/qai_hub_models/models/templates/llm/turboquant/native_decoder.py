@@ -30,6 +30,8 @@ def native_op(config: TurboQuantConfig, kind: str) -> str:
 
 
 def native_table(config: TurboQuantConfig, kind: str) -> str:
+    if getattr(config, kind).codebook_variant:
+        return "tq_native_converged_k8_centroids_fp16"
     if getattr(config, kind).quantizer != "lloyd_max":
         return "tq_native_structured_k8_centroids_fp16"
     if config.qjl and kind == "key":
