@@ -10,6 +10,181 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Structured K8 seven-stage profiling (2026-10-21)
+
+Branch `exp/structured-k8-profiling`, based on the committed layer-search-v2
+result `8e35f0995`. This diagnostic changes no quantizer, kernel, allocation,
+default profile or existing experimental result. No automatic commit.
+
+Artifact root:
+`/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_stage_optrace_20261021`.
+Only Structured K8 is measured: **one** 897-token input + 128-token generation
+session, Qwen3-1.7B W4A16, S26 Ultra, CL1024. The existing selected
+`multi_beam` mask is frozen, not reselected:
+`[0,1,2,3,4,5,7,8,9,10,12,16,20,26]`.
+The 14 selected layers use Structured K8 + Arithmetic HVX `Decode8Structured`;
+the other 14 use LM K4, and all 28 use LM V2. Dense K42/V542, norm correction,
+FP16 effective scale, current-KV compression and Tile256 are unchanged.
+Configuration SHA-256:
+`bf4f94221ea619e19260b3cecfb53bbe62b86f9b245d379ade1a6465c9af5a6f`.
+
+K4/V4, optimized K5/V3 and optimized K6/V2 are **archived controls** from
+`asymmetric_optrace_20261010`; none is rerun. There is no new PPL evaluation,
+uninstrumented throughput measurement, synthetic probe or second generation
+session. Separate optrace contexts are built from the unchanged quantized DLCs;
+no ONNX conversion, recalibration or training is performed.
+
+The seven primary rows are prefill packing, scalar indexing and norm/effective
+scale correction, then decode past-KV restoration, packing, scalar indexing
+and norm/effective scale correction. Prefill sums eight AR128 calls (first one
+valid token, then seven full calls). Decode uses the final sampled step 126,
+with 1023 cached tokens. Steps 0 and 63 are retained as additional positions
+within the same session, **not repeat trials**. K4, Structured K8 and V2
+contributions are recorded separately and must reconcile with stage totals.
+
+Physical HVX/HMX track intervals use **cycles, not microseconds**. Percentages
+divide by all compute busy cycles in that phase, not the seven-row subset or
+TTFT. Parallel intervals overlap; their sum is work, not elapsed time. The
+unchanged historical classifier attributes fused work to its surviving QNN
+owner, including verified HMX arithmetic hidden by post-reshape naming.
+Per-stage wall-time fields remain explicitly **unavailable/null** because the
+trace provides no calibrated per-stage clock. SDK-reported accelerator time
+and instrumented host/QNN time are reported separately in ms and seconds.
+Physical-lane event counts are not independent source-node/kernel-call counts.
+K8 has no bit packing; any attributed UINT8 cast/output work is retained and
+distinguished from the K4/V2 packing paths.
+
+### Measured seven-stage comparison
+
+Units: **million physical HVX/HMX busy cycles**. The first three columns are
+preserved historical measurements; only the Structured column is new. The
+last column uses the **whole phase's compute work** as its denominator.
+
+| Phase / stage | K4/V4 | K5/V3 | K6/V2 | Structured K8 | Structured phase work share |
+|---|---:|---:|---:|---:|---:|
+| Prefill: packing / output cast | 136.077 | 1060.654 | 1108.444 | 283.714 | 6.745% |
+| Prefill: scalar index | 660.874 | 720.176 | 1028.252 | 369.919 | 8.794% |
+| Prefill: norm / effective scale | 578.312 | 569.031 | 842.750 | 363.797 | 8.649% |
+| Decode126: past KV restoration | 51.164 | 56.139 | 60.028 | 53.805 | 33.065% |
+| Decode126: packing / output cast | 1.720 | 6.162 | 5.338 | 3.673 | 2.257% |
+| Decode126: scalar index | 2.969 | 4.029 | 6.114 | 1.953 | 1.200% |
+| Decode126: norm / effective scale | 2.551 | 3.041 | 4.322 | 1.763 | 1.084% |
+
+Structured route contributions in the same cycle units:
+
+| Phase / stage | K4, 14 layers | Structured K8, 14 layers | V2, 28 layers |
+|---|---:|---:|---:|
+| Prefill: packing / output cast | 35.103 | 33.050 | 215.561 |
+| Prefill: scalar index | 165.651 | 93.394 | 110.874 |
+| Prefill: norm / effective scale | 150.789 | 87.408 | 125.600 |
+| Decode126: past KV restoration | 12.871 | 14.717 | 26.217 |
+| Decode126: packing / output cast | 0.598 | 0.177 | 2.898 |
+| Decode126: scalar index | 0.831 | 0.602 | 0.519 |
+| Decode126: norm / effective scale | 0.653 | 0.497 | 0.614 |
+
+Interpretation, limited to this diagnostic:
+
+1. Compared with K5/V3 and K6/V2, Structured prefill packing work falls
+   **73.25% / 74.40%**, index work **48.63% / 64.02%**, and correction work
+   **36.07% / 56.83%**. The expensive non-nibble K5/K6 path is avoided, but
+   the whole configuration is not packing-free.
+2. Compared with K4/V4, prefill index work falls **44.03%**, correction work
+   **37.09%**, while packing/output-cast work is **2.085x**. The three
+   requested prefill stages together use **26.02% less work**, not 26.02%
+   less TTFT. Their denominator is separate from the whole-phase percentages
+   above; the entire prefill phase uses 4206.343 million compute busy cycles.
+3. **V2 is the main remaining packing contributor:** 75.98% of prefill packing
+   and 78.90% of decode packing. Prefill V2 includes 106.763 million cycles
+   attributed to `q::Cast`, plus slice/layout and precision-conversion work.
+   Structured K8's 33.050-million-cycle prefill packing attribution is
+   `q::Cast` on direct UINT8 output, not nibble/extra-bit assembly. Fused-owner
+   attribution is retained; these are not isolated cast microbenchmarks.
+4. Decode past restoration is **5.16% above K4/V4**, although **4.16% / 10.37%
+   below K5/V3 / K6/V2**. Decode packing is **2.135x K4/V4**. Lower index and
+   correction costs therefore do not establish a decode advantage over K4/V4:
+   the four requested decode stages total **4.78% more work than K4/V4**, or
+   **19.27% less than K6/V2**. Past restoration dominates these four stages.
+   Across the *whole* decode step, layout/precision work remains even larger:
+   **61.668 million cycles (37.898%)**, versus restoration's **33.065%**.
+5. This is not evidence that hardware acceleration is missing. Dense KV
+   rotation is on **HMX** (1.441 million prefill / 0.0163 million final-decode
+   cycles); Native past restoration is entirely **HVX** in the trace.
+   Source graph counts are 70 `Decode8Structured`, 70 `Decode4` and 140
+   `Decode2` nodes per AR graph family (four past tiles + current, per layer),
+   not runtime invocation counts. There is no new CPU fallback path.
+6. Follow-up targets supported by this trace are **V2 packing/casts** and
+   **past-KV restoration / shared layout work**, not changing Dense rotation
+   solely because of this result. No optimization is implemented here.
+
+### Instrumented time, comparability and verification
+
+SDK accelerator-execute time summed across graph parts, in **milliseconds**:
+
+| Sample | K4/V4 historical | K5/V3 historical | K6/V2 historical | Structured new |
+|---|---:|---:|---:|---:|
+| Prefill, eight chunks | 448.277 | 531.317 | 548.667 | 426.581 |
+| Decode0, 897 cached tokens | 23.468 | 26.582 | 26.434 | 23.807 |
+| Decode63, 960 cached tokens | 26.049 | 27.138 | 29.199 | 23.757 |
+| Decode126, 1023 cached tokens | 26.902 | 28.006 | 26.519 | 26.531 |
+
+Structured's prefill and final-decode entries are **0.426581 s / 0.026531 s**.
+These are not per-stage times, complete QNN-call times or uninstrumented
+TTFT/throughput. No assumed DSP frequency converts stage cycles into seconds.
+The final decode wall-time ordering does not match the busy-work ordering;
+clock/scheduling causes were not measured and are not asserted.
+
+The prompt/assets, cache positions, CL1024, Tile256, current-KV policy,
+QNN SDK **2.48.0.260626**, backend API **2.37.0 / HTP 5.48.0**, device firmware
+fingerprint and burst-power setting agree. All three historical analysis-script
+hashes still match. **Runner and Native-library hashes differ** between the
+historical controls and the current experiment and are recorded, not concealed.
+The comparison is across complete configurations on different dates, not a
+paired isolated-kernel experiment or statistical superiority claim. Greedy
+continuations also differ across configurations.
+
+Structured generated all **128 token IDs identically** to its frozen previous
+uninstrumented run; 11 sampled positions / **44 graph traces** were collected
+in exactly **one** new session. All four configurations allocate
+**30,277,632 bytes (28.875 MiB)** of host KV and
+**101,637,636 bytes (96.9292 MiB)** of I/O buffers. Structured battery temperature
+was 25.9 -> 27.1 C; this is not DSP temperature or frequency. CPU regression:
+**735 passed**, with the two existing SWIG deprecation warnings; focused
+profiling tests: **39 passed**. Existing encoder scale-tolerance limitations
+are not repaired or retested by this profiling-only experiment.
+
+Artifacts include `comparison.json`, `seven_stage_comparison.csv`,
+`structured_route_costs.csv`, `all_stage_samples.csv`, `node_stage_mapping.csv`,
+`instrumented_graph_times.csv`, the original raw reports/traces, exact build-time
+schematics and `final_verification.json`. Stage time columns explicitly contain
+nulls instead of invented ms/s; physical event counts and per-event mean cycles
+are available in CSV. Source/default preservation checks cover **96 frozen
+files**. Final verification also checks raw trace/report hashes, recovery
+copies, test results and unchanged Git HEAD.
+
+Reproduce into a **new** artifact root; do not rerun the completed measurement:
+
+```bash
+export PYTHONPATH=src
+TQ_STAGE_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_stage_optrace_NEW
+venv/bin/python scripts/llm/turboquant/profile_structured_stages_once.py freeze --root "$TQ_STAGE_ROOT"
+venv/bin/python scripts/llm/turboquant/profile_structured_stages_once.py build --root "$TQ_STAGE_ROOT"
+venv/bin/python scripts/llm/turboquant/profile_structured_stages_once.py measure --root "$TQ_STAGE_ROOT"
+venv/bin/python scripts/llm/turboquant/profile_structured_stages_once.py render --root "$TQ_STAGE_ROOT"
+venv/bin/python scripts/llm/turboquant/profile_structured_stages_once.py summarize --root "$TQ_STAGE_ROOT"
+venv/bin/python scripts/llm/turboquant/profile_structured_stages_once.py verify --root "$TQ_STAGE_ROOT"
+```
+
+The measurement guard requires context-binary size plus 512 MiB of free device
+storage. For this run only, the user explicitly authorized cleanup after
+backup/hash verification: the four old device copies under
+`/data/local/tmp/qaihm_turboquant/llm/bundles/asymmetric_optrace_20261010_k4_v4/`
+were removed, reclaiming **1,702,166,528 bytes**. Their SHA-256-verified PC
+originals remain under `asymmetric_optrace_20261010/k4_v4/partN_of_4/` and can
+be restored with `adb push`. No PC original, report, raw trace, phone log,
+manifest or Native library was removed. Exact targets, hashes and restore
+paths are in `device_cleanup_authorized.json` and `device_cleanup_complete.json`.
+The explicit cleanup action is not part of the normal reproduction commands.
+
 ## Structured K8 layer search v2 (opt-in, 2026-10-20–21)
 
 Branch `exp/structured-k8-layer-search-v2`, based on
