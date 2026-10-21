@@ -78,7 +78,12 @@ def tables(bits: int, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Te
 
 
 def codec(
-    x: torch.Tensor, bits: int, seed: int, structured: bool = False
+    x: torch.Tensor,
+    bits: int,
+    seed: int,
+    structured: bool = False,
+    *,
+    structured_params: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x = rounded(x)
     maximum = x.abs().amax(-1, keepdim=True)
@@ -95,8 +100,12 @@ def codec(
     norm = rounded(rounded(maxpre * length) * post)
     y = rounded(unit @ rotation(seed, str(x.device)).T)
     if structured:
-        params = torch.tensor(
-            coefficients().astype(np.float16).astype(np.float32), device=x.device
+        params = (
+            torch.tensor(
+                coefficients().astype(np.float16).astype(np.float32), device=x.device
+            )
+            if structured_params is None
+            else structured_params
         )
         magnitude = y.abs()
         region = (magnitude > float(np.float16(region_boundary()))).long()

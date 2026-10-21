@@ -10,6 +10,415 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Structured K8 layer search v2 (opt-in, 2026-10-20–21)
+
+Branch `exp/structured-k8-layer-search-v2`, based on
+`exp/uniform-k8-baseline` commit `cdd68c447`. Artifact root:
+`/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_layer_search_v2_20261020`.
+No automatic commit, default promotion, new codebook, weight training or
+activation recalibration. Previous results are not overwritten.
+
+All deployable swap candidates and exported allocations keep **14 Structured K8 + 14 LM K4,
+all LM V2**, Dense K42/V542, norm correction, FP16 effective scales,
+current/past compression, tile256 and arithmetic HVX `Decode8Structured`.
+Qwen3-1.7B W4A16, S26 Ultra and CL1024 are fixed. Allocated host KV remains
+**30,277,632 bytes = 28.875 MiB**. “Uniform-Odd/Even” refers to layer placement,
+**not** the Uniform scalar quantizer from the preceding experiment.
+The existing allocation JSON/profile and inference implementation are reused.
+
+### Pre-registered documents and methods
+
+`protocol.json` and `data_manifest.json` were frozen before allocation scoring.
+New WikiText-2 train documents provide **12 search + 4 selection-validation**
+windows. Eight unused documents from the official **validation partition**
+are reserved as this experiment's independent test. This does not mean they
+are absent from pretraining or unknown original activation calibration.
+Prior recorded document titles and 16-token spans are excluded, as are
+cross-split overlaps. Every full window has 1024 tokens/1023 targets.
+Historical four-window WikiText NLL/PPL is reference-only after selection.
+Two historical inputs are used earlier only for eager/replay bit-exactness
+regression, not for an allocation score or selection decision.
+
+Selection is salted content-hash order with offset `min(256,length-1024)`,
+never a model score. Search, validation and test token/content/source hashes
+are retained. The scorer rejects `test` as an offline selection split.
+The HTP scoring helper also refuses independent-test and historical-reference
+evaluation until the final selection file exists, including direct helper calls.
+
+| Method | Starts | Search rule |
+|---|---|---|
+| Legacy Greedy | Uniform-Odd | Existing 28 single-flip sensitivity probes, top 4 promotions x top 4 demotions, at most 3 improving steps |
+| Multi-start Greedy | Odd, Even, Early, Late, Middle, Boundary | Same legacy rule/budget independently at all six starts |
+| Multi-start Beam/Swap | Same six starts | Width 2, at most 8 steps, all 196 simultaneous swaps per frontier parent |
+
+The legacy single-flip probes alone have 13/15 K8 layers; they are explicitly
+nondeployable diagnostics. Every combined swap, Structured HTP configuration
+and exported plan has exactly 14 K8 layers. Odd's greedy execution is shared
+between the legacy and multi-start comparison, not duplicated.
+
+For Beam/Swap, screen all 196 swaps on the **first 256 tokens of two fixed
+search documents**, then evaluate the four best unvisited swaps per parent
+on all **12 full search windows**. The beam may temporarily worsen; a separate
+incumbent always retains the lowest full-search NLL seen. This allows limited
+exploration beyond a greedy local minimum. Ties use ascending mask integer;
+incumbent improvements require more than `1e-6` NLL. No attention-MSE objective.
+
+Each start has the same budget within a method. Total budgets differ between
+methods: any quality comparison must also show the workload, not claim a
+matched-compute algorithm advantage. A SQLite cache keys immutable document
+scores by numerical-evaluator identity, configuration/mask, actual input hash
+and length. Logical unique requests and physical cache misses are separately
+recorded. Incremental wall time with this shared cache is not cold-cache
+standalone latency; method order is fixed Greedy then Beam.
+The final report also saves a standalone `offline/scores_release.sqlite`
+backup with all committed WAL rows, table counts and SHA-256, so the score
+cache can be reopened without depending on live journal files.
+
+### Offline fidelity and final HTP gate
+
+The existing exported-weight W4A16 surrogate is preserved numerically.
+`allocation_offline_model.codec` accepts optional pre-created Structured
+constants; its default path remains unchanged. `allocation_v2_replay.py`
+captures both key codecs and a device-side layer flag in CUDA Graphs to reduce
+Python launch overhead. This acceleration is **offline only**, not a deployment
+fallback or change to HTP attention.
+
+Shape-matched eager versus CUDA Graph logits are bit-exact in **24 checks**
+(six static masks, two historical documents, 256/1024 tokens). Observed replay
+cost is approximately **0.30 s / 0.85 s** for 256/1024 tokens on RTX 3090.
+This proves replay fidelity to the existing surrogate, **not HTP equivalence**.
+The first capture attempt failed because of per-call host-to-device constants;
+the optional pre-created constants resolved capture without changing arithmetic.
+Both successful preflight versions and later logs are retained.
+
+Choose each method's nominee by its lowest **full search-12** final NLL.
+Deduplicate nominees, filling to two distinct finalists from other completed
+searches when possible, at most three. Measure actual HTP search-12 and
+validation-4 NLL for the nominees and Uniform-Odd. Only **HTP validation-4**
+selects the final mask; ties within `1e-6` prefer Odd, otherwise mask integer.
+Freeze `selection.json` before any independent-test scoring.
+Calibration of Odd and already-fixed method nominees can run concurrently with the
+remaining GPU search. The final calibration stage validates and reuses these
+same per-document reports; it does not select a winner until all nominees
+are available, and does not rerun completed documents.
+
+After selection, check **all 196 swaps on full offline search-12** around that
+final mask. If any improves, report failure of this local-optimality check;
+do not silently extend search or change the selected mask. Even a passing
+check establishes neither HTP-local nor global optimality.
+`figures/local_swap_delta.svg` visualizes all 14 x 14 full-search NLL changes,
+with the best checked swap marked; it does not change the frozen selection.
+
+HTP comparisons include Odd, Early, Boundary, the three method nominees and
+uniform LM K6/V2. Exact aliases share binaries and scores. Performance uses
+897+128 tokens and three crossed rounds (forward, reverse, rotated order),
+with mean/sample SD/min/max. Independent test and historical reference PPL
+use `exp(total_NLL/total_targets)`. Existing encoder numerical limitations
+remain separate; no tolerance is relaxed.
+
+Early, Boundary and K6/V2 retain their original DLCs but receive private
+context rebuilds against the same current Native package used by Odd.
+The archived K6/V2 bundle is bin-only; its graph files are resolved from the
+original per-part directories with recorded hashes. The initial missing-DLC
+failure and retry logs are retained. No old bundle is rewritten.
+On-device copies share only the SHA-identical embedding `part1_of_4.bin`
+within this new experiment, using symbolic links to reduce staging space
+(the device denied hard-link creation; no permissions/policies were changed).
+No previous device artifact is deleted. Short load/reset probes consume only
+the pre-existing generic prompt, not a new calibration/test document.
+
+Final implementation/search regressions pass **723 tests**, with no failures,
+errors or skips. The completed HTP calibration, independent test and three-round
+timing results are reported below, including negative search/optimality results.
+Offline `physical_evaluation_seconds` measures synchronized scoring wall time,
+including transfer and loss reduction, not GPU busy time. Coarse 256-token and
+full 1024-token document evaluations are counted separately. Incremental wall
+times also reflect concurrent CPU build activity, not isolated cold-start runs.
+Method clocks start after model/replay setup and cover offline search only;
+HTP compilation and calibration are additional workflow costs, not included
+as separate charges in the method timing table.
+`offline_document_nll.csv` exports the cache's per-mask/document scores,
+diagnostic-only 13/15-layer flags and paired Odd differences where measured;
+`document_nll.csv` contains the actual HTP results. No extra inference is
+performed to fill missing offline reference scores.
+The final report also checks whether coarse screening excluded a neighbor
+whose full search-12 score was already cached by Greedy before Beam began.
+This uses only existing search scores, excludes visited/evaluated masks, and
+does not change nomination or selection. Coverage is partial; it is not an
+oracle over all neighbors or evidence of independent-test benefit.
+
+### Completed offline search
+
+All six starts completed both searches without changing the frozen budget.
+The following NLLs use only the full **search-12** set, not independent test.
+
+| Start | Initial NLL | Greedy final NLL | Beam final NLL | Greedy minutes | Beam minutes |
+|---|---:|---:|---:|---:|---:|
+| Uniform-Odd | 3.405098 | 3.142621 | 3.154515 | 23.04 | 36.54 |
+| Uniform-Even | 3.180709 | 3.137719 | 3.144728 | 23.11 | 35.76 |
+| Early | 3.152349 | 3.126730 | 3.136665 | 22.63 | 34.62 |
+| Late | 3.506036 | 3.169020 | 3.165531 | 22.97 | 35.96 |
+| Middle | 3.495229 | 3.153958 | 3.161785 | 23.08 | 35.12 |
+| Boundary | 3.158131 | 3.126435 | 3.144114 | 22.72 | 28.22 |
+
+| Method nominee | Full search NLL | Incremental wall minutes | 1024-token document evaluations, logical / physical | 256-token document evaluations, logical / physical |
+|---|---:|---:|---:|---:|
+| Legacy Greedy (Odd) | 3.142621 | 23.04 | 1,548 / 1,548 | 0 / 0 |
+| Multi-start Greedy (Boundary) | 3.126435 | 137.54 | 9,228 / 9,228 | 0 / 0 |
+| Multi-start Beam/Swap (Early) | 3.136665 | 206.22 | 4,080 / 3,900 | 28,170 / 28,170 |
+
+Legacy's work is included in Multi-start Greedy, not an additional execution.
+The first two methods request 49/289 deployable 14-layer masks and 80/480
+diagnostic-only 13/15-layer masks respectively at full length. Beam requests
+340 full-length deployable masks and 14,085 short-input masks. Shared-cache
+reuse saves 180 full document evaluations in Beam; these are measured
+incremental times after Greedy, not isolated cold-cache timings.
+Model/replay setup, HTP build/calibration, and the final local-swap check
+are outside these method clocks.
+
+Multi-start Greedy lowers search NLL relative to the legacy run with about
+six times its measured offline cost. Beam is worse than Multi-start Greedy
+despite more elapsed time; it beats the matching Greedy run at only the Late
+start. This does not establish a search-efficiency advantage.
+
+A **post-hoc read-only diagnostic** finds 15 of 48 Beam steps where screening
+excluded an unvisited neighbor with a better full-search score already known
+from the preceding Greedy runs. For example, Middle step 3 retained NLL
+3.181716 while a neighbor scoring 3.154127 ranked **102nd** on the short
+proxy and was excluded by the top-four shortlist. Its additional potential
+search-NLL reduction was 0.027589. This demonstrates false negatives in the
+two-document/256-token proxy, but is only partial neighbor coverage and does
+not prove the sole cause, HTP benefit or test improvement. No candidate,
+screening rule or final selection is changed using this diagnostic.
+
+### Actual HTP calibration and frozen selection
+
+| Configuration | HTP search-12 NLL | HTP validation-4 NLL | HTP validation PPL |
+|---|---:|---:|---:|
+| Uniform-Odd | 3.381782 | 3.641847 | 38.162252 |
+| Legacy Greedy | 3.138629 | 3.349474 | 28.487745 |
+| Multi-start Greedy | 3.132733 | 3.330721 | 27.958498 |
+| Multi-start Beam/Swap | 3.131240 | **3.323396** | **27.754447** |
+
+The pre-registered HTP validation rule selects **Multi-start Beam/Swap**,
+not the lowest offline-search nominee. Its K8 layers are:
+
+```text
+0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 16, 20, 26
+```
+
+`plans/final_selected.json` and `selection.json` freeze this allocation before
+any new test scoring. Configuration SHA256:
+`bf4f94221ea619e19260b3cecfb53bbe62b86f9b245d379ade1a6465c9af5a6f`.
+The reversed Greedy/Beam ranking between the offline and HTP search-12
+evaluators demonstrates that eager-exact CUDA replay is not a replacement
+for the actual HTP gate. Calibration gains alone are not test gains.
+
+### Independent test and historical reference
+
+All groups use the same eight new test windows, **8,184 scored targets per
+group**. The historical four-window column is a separate dataset, evaluated
+only after selection, and is not used to change the selected allocation.
+
+| Configuration | New test mean NLL | New test PPL | Historical WikiText PPL |
+|---|---:|---:|---:|
+| Uniform-Odd | 3.220856 | 25.049564 | 23.612187 |
+| Early | **2.977995** | **19.648390** | 20.295398 |
+| Boundary | 2.999249 | 20.070465 | 20.168807 |
+| Legacy Greedy | 3.010950 | 20.306679 | 19.884610 |
+| Multi-start Greedy | 2.982032 | 19.727861 | 20.117655 |
+| Multi-start Beam/Swap — selected | 2.985034 | 19.787172 | 19.905564 |
+| Uniform LM K6/V2 | 3.031423 | 20.726705 | **19.844793** |
+
+Uniform-Odd's historical four **per-document NLL sums are exactly unchanged**
+from the preceding `uniform_k8_baseline_20261020` Structured run.
+The selected Beam allocation has the following paired new-test differences;
+negative delta NLL means improvement:
+
+| Reference | Selected minus reference NLL | Selected PPL reduction | Improved / worsened documents |
+|---|---:|---:|---:|
+| Uniform-Odd | -0.235823 | 21.008% | 8 / 0 |
+| Early | +0.007038 | -0.706% | 3 / 5 |
+| Boundary | -0.014215 | 1.411% | 5 / 3 |
+| Legacy Greedy | -0.025916 | 2.558% | 7 / 1 |
+| Multi-start Greedy | +0.003002 | -0.301% | 3 / 5 |
+| Uniform LM K6/V2 | -0.046389 | 4.533% | 6 / 2 |
+
+Against Legacy Greedy, the largest single document accounts for 26.53% of
+the selected allocation's positive document gains; the observed improvement
+is not confined to one document. Nevertheless, only eight independent test
+documents were evaluated. These descriptive differences do not establish
+statistical significance or general superiority.
+
+**Interpretation:** the selected candidate improves on the original Odd-start
+Greedy on this independent test, but Beam's added search is not supported as
+an efficiency/accuracy win over Multi-start Greedy or static Early.
+Beam uses about 8.95 times Legacy's observed incremental offline time, and
+more time than Multi-start Greedy while producing worse new-test NLL.
+Early is the best tested Structured allocation on this test, but it is
+**not retrospectively selected or promoted using test results**.
+The historical WikiText ranking differs: uniform K6/V2 is slightly better
+than the selected candidate there. Neither dataset is silently substituted
+for the other.
+
+### Three crossed HTP performance rounds
+
+897 prompt tokens + 128 generated tokens, CL1024, uninstrumented runs on
+the same S26 Ultra. Values below are **mean ± sample standard deviation**.
+All 21 scheduled sessions are retained; no outlier is removed.
+
+| Configuration | TTFT ms | Prefill tok/s | Decode tok/s |
+|---|---:|---:|---:|
+| Uniform-Odd | 510.14 ± 25.25 | 1763.1 ± 83.9 | 37.099 ± 0.127 |
+| Early | 491.01 ± 2.72 | 1828.4 ± 10.2 | 37.391 ± 0.029 |
+| Boundary | 490.69 ± 3.33 | 1829.5 ± 12.2 | 37.860 ± 0.349 |
+| Legacy Greedy | 503.11 ± 28.62 | 1788.6 ± 97.5 | 37.309 ± 0.009 |
+| Multi-start Greedy | 510.99 ± 20.81 | 1759.4 ± 69.0 | 37.270 ± 0.135 |
+| Multi-start Beam/Swap — selected | 508.78 ± 26.64 | 1768.2 ± 89.1 | 37.272 ± 0.012 |
+| Uniform LM K6/V2 | 626.00 ± 13.43 | 1434.6 ± 29.9 | 34.777 ± 0.163 |
+
+Observed minima/maxima, not confidence intervals:
+
+| Configuration | TTFT ms range | Prefill tok/s range | Decode tok/s range |
+|---|---:|---:|---:|
+| Uniform-Odd | 495.46–539.30 | 1666.3–1811.9 | 37.005–37.243 |
+| Early | 488.07–493.43 | 1819.4–1839.5 | 37.365–37.423 |
+| Boundary | 487.08–493.64 | 1818.6–1842.7 | 37.457–38.069 |
+| Legacy Greedy | 485.26–536.13 | 1676.2–1850.0 | 37.300–37.317 |
+| Multi-start Greedy | 498.49–535.00 | 1679.8–1801.0 | 37.124–37.391 |
+| Multi-start Beam/Swap — selected | 489.99–539.26 | 1666.4–1832.1 | 37.261–37.284 |
+| Uniform LM K6/V2 | 617.41–641.48 | 1400.1–1453.8 | 34.596–34.909 |
+
+The selected candidate's mean decode is 7.17% higher and mean TTFT 18.73%
+lower than uniform K6/V2 in these runs. Decode is essentially unchanged
+relative to Legacy Greedy (37.272 versus 37.309 tok/s); this experiment does
+not demonstrate a speed gain from the search itself. Three crossed runs
+describe variability, not statistical superiority.
+
+Every run reports **28.875 MiB host KV** and **96.9292 MiB I/O buffers**.
+These allocations are distinct from process RSS/HWM; none is a measurement
+of total accelerator memory. The following process values are three-run
+means, and binary sizes sum all four context parts:
+
+| Configuration | End VmRSS MiB | Process VmHWM MiB | Binary MiB |
+|---|---:|---:|---:|
+| Uniform-Odd | 149.055 | 605.215 | 1621.328 |
+| Early | 147.816 | 605.100 | 1621.160 |
+| Boundary | 150.008 | 605.112 | 1621.332 |
+| Legacy Greedy | 150.355 | 605.254 | 1621.355 |
+| Multi-start Greedy | 147.983 | 605.090 | 1621.309 |
+| Multi-start Beam/Swap — selected | 149.964 | 605.160 | 1621.309 |
+| Uniform LM K6/V2 | 152.159 | 605.109 | 1627.500 |
+
+### Full local-swap check and evidence
+
+The frozen selected mask **fails the full offline single-swap local-optimality
+check**: 19 of 196 neighbors reduce search-12 NLL beyond `1e-6`.
+The best checked swap demotes **layer 9 from K8 to K4** and promotes
+**layer 22 from K4 to K8**:
+
+```text
+Selected offline search NLL: 3.136664700679
+Best checked neighbor NLL:   3.128829304168
+Delta:                     -0.007835396511
+```
+
+This neighbor is not substituted into the frozen selection, built, or measured
+on HTP/test. Its offline improvement does not establish a device/test benefit.
+The result, together with the screening false negatives, shows that the bounded
+Beam/proxy procedure did not even establish local optimality for its full
+offline search objective. No global-optimum claim is made.
+
+The check requests **197 masks including the center x 12 documents = 2,364**
+full document evaluations. It reuses 192 cached results and performs **2,172**
+new evaluations. Synchronized scoring consumes 1,870.37 s; complete certificate
+stage wall time is **2,002.31 s = 33.37 minutes**, including initialization and
+bookkeeping. This is additional to the method search times above.
+The raw certificate's `cost.attempts` is empty and its
+`completed_attempt_wall_seconds` is therefore zero: that field is **not**
+the certificate duration. The reported stage wall time comes from its start/end
+events; `physical_evaluation_seconds` is the separately measured scoring sum.
+
+Completed evidence includes:
+
+- 24 eager/replay bit-exact logit cases; numerical evaluator sources remain frozen.
+- Seven compiled-graph/allocation audits and seven identical-output two-session
+  reset checks; all device scoring/generation uses the same HTP backend and
+  Native package.
+- 21 uninstrumented performance sessions, 56 new-test document scores,
+  28 historical-reference scores, and 64 HTP calibration document scores.
+- 723 passing regression tests; unchanged historical Odd NLL; no tolerance
+  relaxation or claim that the inherited standalone V4 AR128 scale failure
+  has been resolved.
+- `comparison.json`/CSV, per-document NLL, per-start finals and histories,
+  layer-mask/search-history/local-swap SVGs, immutable configuration plans,
+  and a standalone cache snapshot containing **43,482** physical document
+  score records (28,170 short + 15,312 full).
+
+`verify_allocation_v2.py` audits hashes, prior profiles/artifacts, data separation,
+selection ordering, device conditions, metrics and unchanged base commit;
+`final_verification.json` is the release evidence ledger. No default promotion,
+additional training, 4B experiment or automatic commit is performed.
+
+The parallel certificate/evaluation stage-start messages exposed a mounted-drive
+append race: one journal line was lost, while pipeline stdout retained both
+events. `pipeline_journal_observation.json` records the exact original event.
+Existing logs are preserved; future `EventJournal` writes are thread-serialized
+and concurrency-tested. Neither running measurement was restarted or changed.
+
+### Reproduction
+
+Use a fresh root; resume only with unchanged protocol/scorer/algorithm sources.
+Existing results refuse overwrite. Static HTP builds can run while the offline
+search runs; selection and test stages remain ordered.
+Plot reporting requires `matplotlib`; its test is optional in minimal test
+environments. Tokenizer/model-specific dependencies are loaded only when
+preparing new documents, not when importing orchestration or report helpers.
+
+```bash
+TQ_SEARCH_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/structured_k8_layer_search_v2_repro
+mkdir "$TQ_SEARCH_ROOT"
+venv/bin/python scripts/llm/turboquant/allocation_v2_replay.py \
+  --preflight-report "$TQ_SEARCH_ROOT/replay_preflight_v2.json"
+venv/bin/python scripts/llm/turboquant/prepare_allocation_v2.py --root "$TQ_SEARCH_ROOT" \
+  --data-manifest /mnt/d/ai-hub-models/binaries/turboquant/structured_k8_layer_search_v2_20261020/data_manifest.json
+venv/bin/python -m pytest -q src/qai_hub_models/test/test_models/test_turboquant*.py
+venv/bin/python scripts/llm/turboquant/search_allocation_v2.py search --root "$TQ_SEARCH_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_allocation_v2.py static --root "$TQ_SEARCH_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_allocation_v2.py probe --root "$TQ_SEARCH_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_allocation_v2.py candidates --root "$TQ_SEARCH_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_allocation_v2.py calibrate --root "$TQ_SEARCH_ROOT"
+venv/bin/python scripts/llm/turboquant/search_allocation_v2.py certificate --root "$TQ_SEARCH_ROOT"
+venv/bin/python scripts/llm/turboquant/benchmark_allocation_v2.py evaluate --root "$TQ_SEARCH_ROOT"
+venv/bin/python -m pytest -q src/qai_hub_models/test/test_models/test_turboquant*.py \
+  --junitxml="$TQ_SEARCH_ROOT/regression_final.xml"
+venv/bin/python scripts/llm/turboquant/report_allocation_v2.py summary --root "$TQ_SEARCH_ROOT"
+venv/bin/python scripts/llm/turboquant/verify_allocation_v2.py --root "$TQ_SEARCH_ROOT"
+```
+
+After static builds, `run_allocation_v2.py --root "$TQ_SEARCH_ROOT"` orders
+the remaining stages, overlaps the GPU swap certificate with HTP evaluation,
+and stops on errors without reducing search budgets. With an already-running
+search, `--wait-for-search-pid <PID>` waits for that exact process instead of
+launching duplicate inference. It finishes at the comparison report; README
+interpretation and the final evidence audit remain explicit review steps.
+`report_allocation_v2.py progress --root "$TQ_SEARCH_ROOT"` is a read-only
+status check and does not consume a calibration or test window.
+
+Optional build overlap while the GPU search is running:
+
+```bash
+# Only after greedy_uniform_odd.json is complete:
+venv/bin/python scripts/llm/turboquant/benchmark_allocation_v2.py prebuild-legacy --root "$TQ_SEARCH_ROOT"
+# Only after all six greedy_<start>.json files are complete:
+venv/bin/python scripts/llm/turboquant/benchmark_allocation_v2.py prebuild-greedy --root "$TQ_SEARCH_ROOT"
+```
+
+These commands require completed, hash-matched results and use the same frozen
+nomination rule. They do not build provisional winners, add candidates, consume
+validation/test data or change the search budget. Later nomination serialization
+must match the prebuilt plan exactly; the ordinary candidate stage reuses it.
+
 ## Uniform K8 versus Structured K8 (opt-in, 2026-10-20)
 
 Branch `exp/uniform-k8-baseline`, based on `exp/lloyd-max-k8-convergence`
