@@ -10,6 +10,72 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## ICEIC2027: Odd/Boundary PPL follow-up (2026-10-27)
+
+The four **unchanged binaries from the repeated-performance experiment below**
+are evaluated again on the original four WikiText-2 windows. No rebuild,
+quantizer/kernel/runner/default change, new allocation search, or automatic
+commit. This is a separate quality experiment, not additional timing samples.
+
+Artifact root:
+`/mnt/d/ai-hub-models/binaries/turboquant/iceic2027_k8_ppl_20261027`.
+`protocol.json` records the four input hashes, configuration hashes, masks,
+source freeze manifest and scoring script hash. `reports/` retains all 16
+raw runner JSONs, runner logs, invocation logs and checked-result records.
+`window_nll.csv` contains every window; `summary.json` / `summary.csv` contain
+token-weighted aggregates. `preflight.json` / `measurement_complete.json`
+record the before/after verification against the original frozen host/device
+binaries, runtime libraries, configuration and input files.
+
+Conditions: Qwen3-1.7B W4A16, Galaxy S26 Ultra/SM8850, QAIRT 2.48.0.260626,
+CL1024, K8 × 14 + K4 × 14, V2 throughout, **28.875 MiB host KV**. Odd K8 layers
+are `[1,3,5,7,9,11,13,15,17,19,21,23,25,27]`; Boundary K8 layers are
+`[0,1,2,3,4,5,6,21,22,23,24,25,26,27]`. Each matched pair uses the same mask.
+Structured uses its existing arithmetic decoder; **converged** LM8 uses LUT.
+
+Each configuration runs the existing AR128 teacher-forced scorer **once per
+window**, in a fresh process/session: 1024 input tokens and 1023 next-token
+targets per window, **4092 targets per configuration**. No warm-up, repeated
+scoring, logit dump or profiling is added. PPL is
+`exp(sum(window_nll_sum) / sum(scored_tokens))`, not mean window PPL. These
+scoring runs are not the 897+128 generation-throughput benchmark.
+
+| Layer placement | K8 quantizer | Mean NLL | PPL ↓ |
+|---|---|---:|---:|
+| Odd | Structured | 3.161762996 | 23.61218745 |
+| Odd | Converged Lloyd–Max | 3.143864147 | 23.19331631 |
+| Boundary | Structured | 3.004137187 | 20.16880668 |
+| Boundary | Converged Lloyd–Max | 3.008651478 | 20.26006037 |
+
+Structured's PPL is **1.8060% higher** than converged LM in Odd, but
+**0.4504% lower** in Boundary. Boundary reduces PPL versus Odd by **14.5831%**
+for Structured and **12.6470%** for converged LM. Thus, the quantizer quality
+ordering is allocation-dependent in these windows. Converged LM has lower
+NLL in three of four Odd windows; Boundary has two wins for each quantizer.
+Do not generalize the small Boundary aggregate advantage to other documents.
+
+All per-window NLL sums and token hashes exactly match the historical results
+for Odd Structured, Odd converged LM and Boundary Structured (at stored JSON
+precision). Boundary converged LM is the new matched quality comparison.
+These are previously used WikiText windows, **not an independent held-out
+test or the entire WikiText test split**. No new held-out result or statistical
+significance is claimed. Earlier encoder numerical-tolerance limitations
+remain unchanged. The original performance results and paper PDF are retained.
+
+Reproduction reuses the existing, already-deployed frozen bundles; use a
+fresh output directory. Existing results are never overwritten or retried:
+
+```bash
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/benchmark_k8_ppl.py run \
+  --source /mnt/d/ai-hub-models/binaries/turboquant/iceic2027_k8_repeat_20261027 \
+  --root /mnt/d/ai-hub-models/binaries/turboquant/iceic2027_k8_ppl_REPRO_NEW
+PYTHONPATH=src venv/bin/python -m pytest -q \
+  src/qai_hub_models/test/test_models/test_turboquant_k8_ppl.py \
+  src/qai_hub_models/test/test_models/test_turboquant_repeat.py \
+  src/qai_hub_models/test/test_models/test_turboquant_lm8_convergence.py \
+  src/qai_hub_models/test/test_models/test_turboquant_allocation.py
+```
+
 ## ICEIC2027: repeated Structured K8 vs converged LM8 (2026-10-27)
 
 Branch `exp/structured-k8-lm8-repeat`, based on `exp/structured-k8-profiling`.
