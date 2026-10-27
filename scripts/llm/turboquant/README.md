@@ -10,6 +10,160 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## ICEIC2027: repeated Structured K8 vs converged LM8 (2026-10-27)
+
+Branch `exp/structured-k8-lm8-repeat`, based on `exp/structured-k8-profiling`.
+**Completed: 40 measured sessions (10 per configuration), plus 40 excluded
+warm-up sessions. No failed, discarded, replaced, or thermally flagged samples.**
+The quantizer, codebooks, encoder/decoder kernels, runner and defaults are
+unchanged. The only codec configuration addition is the opt-in fixed-mask
+`mixed_k6_v2_boundary_lm8_converged` control. No automatic commit.
+
+Artifacts are preserved separately in
+`/mnt/d/ai-hub-models/binaries/turboquant/iceic2027_k8_repeat_20261027`:
+
+- `raw.csv`: all 40 measurements, warm-up diagnostics, order, host UTC times,
+  temperature summaries, Android thermal severity and explicit unknown HTP
+  throttling status.
+- `attempts/*/`: original runner JSON/log, exact launch command, raw thermal
+  JSONL, start/end records and per-attempt validation. No additional PPL runs.
+- `summary.csv`, `summary.json`, `report.txt`: mean, sample SD, median/min/max,
+  improvement, historical comparison, order/temperature diagnostics, and
+  supplemental paired-round bootstrap intervals.
+- `paper_revision.tex`: English Table I, Methodology and Results replacements,
+  with Abstract/Limitations update suggestions. The supplied PDF is unchanged.
+- `protocol.json`, `measurement_freeze.json`, `measurement_complete.json`,
+  `audits/`: schedule, masks, SHA-256 identities and pre/post execution checks.
+
+### Matched conditions and validation
+
+Qwen3-1.7B W4A16, S26 Ultra/SM8850, QAIRT **2.48.0.260626**, HTP burst mode,
+CL1024, **897 prompt + 128 generated tokens**. Odd K8 layers are
+`[1,3,5,7,9,11,13,15,17,19,21,23,25,27]`; Boundary K8 layers are
+`[0,1,2,3,4,5,6,21,22,23,24,25,26,27]`. Both methods use the same mask within
+each placement: K8x14/K4x14, all V2, Dense K42/V542, norm correction, FP16
+effective scales, compressed current/past KV, and Tile256.
+
+The paper's Odd binaries and the original same-native-library Boundary
+Structured binary are reused. Only the missing Boundary converged-LM control
+was built, **before measurement**. All four use the same runner and Native
+package (HVX library SHA-256
+`3e69cc4df58568307cee841f13c78092c6a490dc2ab57fc0111805550cd271a0`).
+All 24 compiled AR1/AR128 graphs pass the I/O/rotation/FP16-attention audit;
+paired non-codec initializers and activation encodings match. Converged K8
+LUTs and all 255 source boundaries match the existing frozen codebook.
+Host and device hash checks pass before and after measurement. The 32 CPU
+regression/orchestration tests pass; **historical HTP encoder numerical-tolerance
+failures are unchanged and are not re-certified by this experiment**.
+
+Each invocation uses the existing `--sessions 2`: full warm-up, KV reset, then
+one measured session, with identical token IDs. All warm-up/measured generated
+sequences match within their invocation. Model loading and warm-up are excluded
+from reported timing. The first generated token is produced during prefill:
+decode throughput counts **127 AR1 iterations**, and actual cached tokens are
+`897 + 127 = 1024` in every session. Host KV is **28.875 MiB**, with separate
+runtime I/O buffers of **96.929 MiB**, for every configuration.
+
+Ten rounds each contain all four configurations. Two Williams blocks plus two
+reversed orders give every pair 5/5 execution precedence and every configuration
+2 or 3 occurrences per position (perfect positional balance is impossible with
+10 runs and 4 positions). The order is frozen before any timing, with a fixed
+10-second pause after each invocation. No QNN optrace or detailed profiling is
+enabled. External HAL telemetry is sampled identically across configurations.
+
+### Repeated results
+
+Values are **mean ± sample SD**, n=10. Improvements are ratios of group means,
+not averages of per-run ratios. Positive means lower TTFT or higher throughput.
+
+| Odd placement | Converged LM8 | Structured K8 | Improvement |
+|---|---:|---:|---:|
+| TTFT (ms) | 745.990 ± 11.668 | 502.653 ± 12.595 | 32.62% lower |
+| Prefill (tok/s) | 1203.854 ± 19.009 | 1787.642 ± 44.911 | 48.49% higher |
+| Decode (tok/s) | 33.249 ± 0.053 | 37.775 ± 0.232 | 13.61% higher |
+
+| Boundary placement | Converged LM8 | Structured K8 | Improvement |
+|---|---:|---:|---:|
+| TTFT (ms) | 726.580 ± 13.099 | 500.487 ± 9.512 | 31.12% lower |
+| Prefill (tok/s) | 1236.104 ± 22.874 | 1795.119 ± 34.854 | 45.22% higher |
+| Decode (tok/s) | 33.101 ± 0.051 | 37.870 ± 0.121 | 14.41% higher |
+
+| Improvement | Odd | Boundary | Boundary minus Odd |
+|---|---:|---:|---:|
+| TTFT reduction | 32.62% | 31.12% | −1.50 percentage points |
+| Prefill increase | 48.49% | 45.22% | −3.27 percentage points |
+| Decode increase | 13.61% | 14.41% | +0.80 percentage points |
+
+The performance advantage persists under **both tested masks**. It is not a
+claim about every placement or model/device. TTFT coefficients of variation
+are 1.56–2.51%; decode coefficients are 0.15–0.61%. All samples, including
+the slowest Odd Structured decode (37.150 tok/s), remain in the statistics.
+Supplemental paired-round bootstrap 95% intervals are Odd TTFT reduction
+[31.51,33.71]% and decode increase [13.23,13.91]%; Boundary [30.01,32.23]%
+and [14.23,14.57]%, respectively. These small-n intervals do not establish
+independent-device/day/workload generalization and may be affected by shared
+thermal drift.
+
+### Temperature, execution order, and historical comparison
+
+Current HAL temperatures span AP **26.0–44.4°C**, battery **25.8–36.3°C**, and
+skin **27.8–38.7°C**. Android thermal status and reported sensor severity remain
+0 at every sample. This is **not proof that HTP never throttled**: available
+devfreq interfaces expose UFS/GPU, not HTP, and no direct HTP clock/throttle
+counter was available. Stale HAL `Cached temperatures` are excluded. Samples
+span model load, warm-up and measured execution, not only timed kernels.
+
+Mean per-invocation AP temperatures averaged over each group are close
+(39.10–39.41°C), but temperature/order effects are not fully eliminated.
+For example, Odd LM decode correlates negatively with round (r=−0.744) and
+AP temperature (r=−0.569), despite its small 0.16% decode CV. Odd Structured
+TTFT correlates with round (r=0.580), and Structured decode correlates with
+position (Odd r=−0.490, Boundary r=−0.509). There are only 2–3 samples at each
+position; these are descriptive associations, not causal throttling estimates.
+No adjustment or sample filtering is used to produce the primary tables.
+
+Host UTC timestamps define chronology (2026-10-27 07:14:41–07:28:53 UTC for
+runner invocations). Device wall-clock values are also preserved but were not
+synchronized to the host; no device clock/settings were changed.
+
+| Historical single session → new warmed mean | Historical | New |
+|---|---:|---:|
+| Odd LM TTFT (ms) | 786.002 | 745.990 |
+| Odd Structured TTFT (ms) | 539.143 | 502.653 |
+| Odd LM decode (tok/s) | 32.867 | 33.249 |
+| Odd Structured decode (tok/s) | 37.169 | 37.775 |
+| Boundary Structured TTFT (ms) | 535.336 | 500.487 |
+| Boundary Structured decode (tok/s) | 37.243 | 37.870 |
+
+The paper's historical Odd improvements **31.41% TTFT / 13.09% decode** are
+replaced by **32.62% / 13.61%** for current performance claims. The earlier
+single-run experiment lacked the same-process warm-up, so changes in absolute
+times are not evidence of a new algorithm optimization. No historical matched
+Boundary converged-LM timing existed. PPL was not rerun: keep historical Odd
+quality findings separately labeled and do not infer Boundary quality.
+This comparison changes **both quantizer and decoder**, not only the decoder.
+
+### Reproduction (fresh output directory required)
+
+```bash
+export PYTHONPATH=src
+EXPERIMENT_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/iceic2027_k8_repeat_REPRO_NEW
+for stage in prepare build audit deploy freeze measure analyze; do
+  venv/bin/python scripts/llm/turboquant/benchmark_k8_repeat.py "$stage" \
+    --root "$EXPERIMENT_ROOT" || break
+done
+venv/bin/python scripts/llm/turboquant/report_k8_repeat.py --root "$EXPERIMENT_ROOT"
+venv/bin/python -m pytest -q \
+  src/qai_hub_models/test/test_models/test_turboquant_repeat.py \
+  src/qai_hub_models/test/test_models/test_turboquant_lm8_convergence.py \
+  src/qai_hub_models/test/test_models/test_turboquant_allocation.py
+```
+
+The harness refuses to overwrite result files, rebuild after freeze, or retry
+incomplete/failed attempts. It can resume completed attempts without
+executing them again; failed attempts require explicit investigation, not
+silent replacement. Existing code, artifacts and the original paper are retained.
+
 ## Structured K8 seven-stage profiling (2026-10-21)
 
 Branch `exp/structured-k8-profiling`, based on the committed layer-search-v2

@@ -257,7 +257,12 @@ class TurboQuantConfig:
                 raise ValueError(
                     "Mixed-bit requires scaled PolarQuant K/V without QJL."
                 )
-            if self.layer_policy not in ("uniform", "attention_mse", "nll_allocation"):
+            if self.layer_policy not in (
+                "uniform",
+                "attention_mse",
+                "nll_allocation",
+                "boundary",
+            ):
                 raise ValueError(
                     "Mixed-bit requires a recorded layer selection policy."
                 )
@@ -576,6 +581,14 @@ PROFILES["mixed_k6_v2_uniform_lm8_converged"] = replace(
     PROFILES["mixed_k6_v2_uniform"],
     profile="mixed_k6_v2_uniform_lm8_converged",
     converged_k8=True,
+)
+# Matched-mask performance control only: preserve the converged codebook and
+# every codec setting, changing just the fixed K8 placement. No default change.
+PROFILES["mixed_k6_v2_boundary_lm8_converged"] = replace(
+    PROFILES["mixed_k6_v2_uniform_lm8_converged"],
+    profile="mixed_k6_v2_boundary_lm8_converged",
+    layer_policy="boundary",
+    layer_bits=tuple((8 if layer < 7 or layer >= 21 else 4, 2) for layer in range(28)),
 )
 PROFILES["lm8_converged_v4_scaled"] = replace(
     PROFILES["k8_v4_scaled"],
