@@ -10,6 +10,273 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## NIAH: frozen four-profile evaluation (in progress, 2026-11-02)
+
+Branch: `exp/structured-k8-niah`. Artifact root:
+`/mnt/d/ai-hub-models/binaries/turboquant/niah_20261102`.
+**Current scope (user amendment, 2026-11-03): 1K/2K/4K/8K, 800 main
+generations across four profiles.** The user stopped the 16K restart before
+conversion began. The original 16K protocol/data and build failures below
+remain historical records; they are not the active evaluation scope. The
+subsequently requested 2K condition is added in an isolated supplement.
+This is an opt-in retrieval-quality experiment, not a new quantizer or a
+generation-throughput benchmark. Existing defaults, weights, calibration,
+rotation, codebooks, current-KV policy and per-profile Native packages remain
+unchanged. No automatic commit is performed.
+
+The four profiles are FP16 KV with FP16 attention, LM K4/V4, Boundary
+converged-LM K8/K4 with V2, and Boundary Structured K8/K4 with V2 and its
+arithmetic decoder. Both Boundary profiles retain K8 layers
+`[0,1,2,3,4,5,6,21,22,23,24,25,26,27]`; Odd is not evaluated.
+
+The user approved a common maximum **16K**, after the 32K FP16 estimate showed
+about **10.55 GiB for host KV plus AR1/AR128 I/O alone**, excluding weights and
+QNN temporary memory. Capacities are 1024/4096/8192/16384; longer capacities
+must pass operational probes in order, 4K → 8K → 16K. A failure does not
+authorize an automatic context reduction, CPU fallback or discarded run.
+
+`data/data_manifest.json` freezes ten base cases crossed with five insertion
+depths (0/25/50/75/100%) and four capacities: **200 main inputs per profile,
+800 planned generations**. Two separate short FP16 prompt-format pilots and
+one separate smoke input per capacity are not main evaluation cases.
+Natural WikiText train documents form the background; each needle assigns
+a random six-digit code to a random project name. Documents are disjoint
+between base cases and pilot/smoke cases, but are not claimed to be absent
+from model pretraining. The same base cases across depth/capacity are
+correlated; reporting resamples base cases, not individual cells.
+
+Each input uses the frozen non-thinking chat template and a final prompt
+budget of `capacity - 64`; greedy generation stops at EOS or 64 new tokens.
+Actual main prompt lengths are 958–960, 4030–4032, 8123–8128 and
+16317–16320 tokens, respectively. Primary accuracy is exact generated-answer
+equality after whitespace stripping; the secondary metric requires exactly
+one matching standalone six-digit code. Leading zeros are preserved.
+`results/`, `attempts/`, `deployments/`, `audits/` and `stage_completion/`
+retain raw outputs, commands, validation gates and binary/input hashes.
+
+On resumption, the frozen input manifest and all 206 input files passed
+hash/token checks. Including the recovery/controller tests, 140 related tests
+passed. The two FP16 pilots and the FP16/K4V4 CL1024 smoke cases passed exact
+match and execution-contract validation. These checks are **not** the main NIAH result;
+the 800-case evaluation and final heatmaps are still pending.
+
+Individual stages (run only after their preceding validation gates):
+
+```bash
+export PYTHONPATH=src
+NIAH_ROOT=/mnt/d/ai-hub-models/binaries/turboquant/niah_20261102
+venv/bin/python scripts/llm/turboquant/benchmark_niah.py assets --root "$NIAH_ROOT" --capacity 1024
+venv/bin/python scripts/llm/turboquant/benchmark_niah.py deploy --root "$NIAH_ROOT" --capacity 1024 --group fp16
+venv/bin/python scripts/llm/turboquant/benchmark_niah.py pilot --root "$NIAH_ROOT" --capacity 1024 --group fp16
+venv/bin/python scripts/llm/turboquant/benchmark_niah.py probe --root "$NIAH_ROOT" --capacity 1024 --group fp16
+```
+
+Do not rerun `niah_build.py prepare` or regenerate the frozen dataset in this
+root. Completed measurements are verified and skipped, not repeated;
+incomplete/error attempts are retained and require explicit investigation.
+The original two-worker launch was (historical; do not use after the OOM
+recovery described below):
+
+```bash
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/niah_continue.py \
+    --root /mnt/d/ai-hub-models/binaries/turboquant/niah_20261102 --workers 2 --detach
+```
+
+The controller uses an exclusive process lock, records its launch PID/log in
+`continuation_launches/`, and maintains a per-run `status.json` and stage logs
+in `continuation_runs/`. All 16 profile/capacity smoke runs must pass their
+execution contracts before any main test starts. `niah_resume_build.py` waits
+for existing matching converter/QNN processes, reuses completed parts and
+stops on inactive partial output without overwriting it. Host PID visibility
+is required for this recovery check.
+
+To limit device storage, `niah_device_copies.py` releases only exact files in
+this experiment's own device bundle after verifying PC backups and device
+hashes; it restores them from the unchanged deployment manifest when needed.
+Shared runtime/input files, raw reports, old experiments and PC model files
+are never deleted. `device_copy_audits/` records every deletion and restore
+path. A mismatched or unknown file stops the operation.
+
+### 16K host OOM and approved serial recovery (2026-11-03)
+
+All four profiles completed operational probes at 1K, 4K and 8K. At 16K,
+FP16 and K4/V4 part4 compiled, but K4/V4 part2 and part3 converters were
+terminated by the **WSL host OOM killer**, not by the phone. Kernel events at
+11:14:27 and 11:21:29 KST show exhausted 24 GiB swap; the controller reported
+failure at 14:25:05 after its remaining queued work finished. No main test
+cases had run. Logs and completed outputs remain preserved.
+
+The user explicitly approved one retry with **one build worker** while
+retaining 16K and all scientific conditions. `niah_oom_resume.py` preserves
+the original workers=2 contract and adds a separate, hashed recovery
+amendment. Its one-shot `prepare` archives only failed K4/V4 part2/part3
+directories and their two parent logs under `recovery_oom_*/preserved/`.
+External weight symlinks retain their original targets; no source weight or
+completed part is deleted. `run` consumes this authorization once and uses
+the unchanged controller with workers=1. Another failed attempt stops;
+there is no automatic further retry, context reduction or CPU fallback.
+
+A single converter previously reached about 72.6 GiB resident-plus-swap
+usage, so serial execution reduces contention but does not guarantee that
+the 16K conversion will fit. This recovery changes build scheduling, not
+the model, graph algorithm, measurement conditions or default profiles.
+
+The prepared archive is
+`recovery_oom_20261103T070729_621977Z_263768`. Its `intent.json`, `prepared.json`,
+move records, launch record and `controller.log` identify the preserved files
+and approved restart. Do not rerun the one-shot preparation or original
+workers=2 launcher. Recovery and monitoring tests bring the related regression
+suite to **182 passing tests**.
+
+### Expanded-swap serial recovery (2026-11-03)
+
+The first serial retry also stopped at **17:15:19 KST** during 16K K4/V4
+conversion. The previous-boot kernel journal records a global OOM at
+17:15:13 with zero free swap out of 24 GiB. This was a host build failure,
+not a phone inference failure. The WSL restart at 17:24:19 ended the previous
+health watcher. The new environment exposes approximately 74 GiB RAM and
+**128 GiB swap**; the user explicitly approved resumption with one build
+worker and the same 16K ceiling. More swap does not guarantee completion
+and can substantially increase conversion time.
+
+`niah_swap_resume.py` adds a separate one-shot recovery amendment without
+editing the original controller, scientific freeze or earlier recovery
+helper. Only the second failed K4/V4 part2/part3 outputs and parent logs are
+moved to a new `recovery_swap_*/preserved/` archive after hash verification.
+The previous `recovery_oom_*` archive and completed parts remain untouched.
+The new intent records approval, prior failure provenance, host memory and
+boot ID. The controller reuses verified completed measurements; it still
+requires all 16 operational probes before any main NIAH case. No automatic
+further retry, context fallback or inference repetition is enabled.
+
+### User-approved 8K ceiling and 2K supplement (2026-11-03)
+
+At 17:38 KST, the user changed the plan to stop 16K builds and evaluate only
+through 8K. The swap-recovery preparation received SIGINT and stopped before
+launching any converter. Its partially completed preservation is retained at
+`recovery_swap_20261103T083835_933876Z_6478`: K4/V4 part2 was already moved
+under `preserved/`, while part3 and the parent logs remain at their original
+paths. `intent.json` and `prepare_failed.json` retain the interrupted history;
+no rollback or deletion was performed. Do not resume that superseded retry.
+
+The user then requested 2K as well. `niah_8k_continue.py` uses a separate
+authorized scope amendment for **200 test inputs per profile, 800 generations
+total**, at 1024/2048/4096/8192. Existing 1K/4K/8K inputs and binaries are
+reused unchanged. `niah_2k_supplement.py` creates the isolated
+`niah_supplement_cl2048_20261103/` directory, deriving 50 test inputs, two
+short FP16 pilots and one smoke input from the **same twelve frozen bases**,
+tokenizer, seeds, insertion-depth rules and generation budget. It does not
+reselect documents or regenerate existing inputs.
+
+Only 2K is built, with one worker. A private instance of the unchanged build
+module admits CL2048; graph conversion, quantizers, masks, Native packages,
+source preservation and compiled-I/O audits are unchanged. The separate
+`niah_2k_device_copies.py` adapter admits only this exact 2K sidecar and reuses
+the original idle/hash/exact-file release/restore operations with the same
+strict path and backup checks. The original helpers and frozen contracts are
+not edited. All twelve preserved probes, the original pilots and the new 2K
+pilots/four probes must pass before any main evaluation.
+
+Results from the original root and 2K sidecar are combined with explicit
+source-root provenance in `report_8k/`, using the unchanged scoring and
+heatmap code. The report must not be presented as a 16K evaluation. The local
+watcher is rebound to the combined controller, not to either stopped recovery.
+
+The 2K manifest contains 50 main inputs (ten at each of the five depths), two
+pilots and one smoke. Main prompt lengths are 1981–1984 tokens; adding the
+64-token generation allowance never exceeds 2048. Frozen base metadata and
+tokenizer identity match the original manifest exactly. The complete NIAH
+regression selection, including the new scope and 2K safety adapters, passed
+**251 tests** before launch. This is software/input validation, not a completed
+retrieval benchmark result.
+
+The authorized combined launch (one-shot; do not rerun in an existing scope):
+
+```bash
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/niah_8k_continue.py \
+    --root /mnt/d/ai-hub-models/binaries/turboquant/niah_20261102 \
+    --supplement-root /mnt/d/ai-hub-models/binaries/turboquant/niah_20261102/niah_supplement_cl2048_20261103 \
+    --authorization '16K 중단, 2K 추가, 1K/2K/4K/8K 단회 평가 진행' --detach
+```
+
+`scope_8k_20261103/` retains the authorization, merged input manifest, source
+hashes and launch records. `continuation_runs/` retains live stage status and
+logs; `report_8k/` is created only by final aggregation. A planning estimate
+from prior 4K build/probe logs was 8–12 hours including the 2K build and 800
+main runs, not an execution-time measurement or guaranteed completion time.
+
+### Pre-runner ADB disconnect and approved continuation (2026-11-04)
+
+The 2K builds, pilots and all 16 capacity/profile probes completed. Main
+evaluation then stopped at **22:46:44 KST on November 3** after 241 successful
+executions: all 200 at 1K and 41 FP16 cases at 2K. These counts describe
+execution completion, not retrieval accuracy. The next case,
+`fp16_test_08_cl2048_d025`, failed with `adb.exe: no devices/emulators found`
+on the initial bundle-directory listing, **before model inference**. The
+original failed controller and logs remain unchanged.
+
+After the user's explicit resume request, the read-only November 4 preflight
+confirmed an idle connected device, no remote report for the failed case, and
+matching host/device SHA-256 for all 64 files in the existing 2K FP16 deployment.
+`niah_adb_resume.py` permits one narrowly scoped continuation: preserve the
+failed result and attempt under a new `recovery_adb_*/preserved/` directory,
+verify all completed results/raw logs and operational gates, and run only the
+**559 remaining cases** through the unchanged runtime. Completed cases are
+skipped; no build, audit regeneration, pilot/probe repeat, data change, 16K
+work, or automatic retry after a new failure is allowed.
+
+The one-shot recovery commands are:
+
+```bash
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/niah_adb_resume.py prepare \
+    --root /mnt/d/ai-hub-models/binaries/turboquant/niah_20261102 \
+    --authorization '2026-11-04 사용자 재개 요청: 완료 241건 보존, 실행 전 ADB 오류 1건 보존 후 잔여 559건 계속'
+# Use the exact prepared_archive path printed above; never prepare twice.
+PYTHONPATH=src venv/bin/python scripts/llm/turboquant/niah_adb_resume.py run \
+    --root /mnt/d/ai-hub-models/binaries/turboquant/niah_20261102 \
+    --archive "$NIAH_ADB_ARCHIVE" --detach
+```
+
+On completion, `report_8k/infrastructure_recovery.json` explicitly records the
+original infrastructure failure, approved retry and preserved-result hashes;
+`continuation_report_8k_adb_recovery.json` links it to the original aggregate
+completion marker. The failure is not silently dropped or scored as a model
+wrong answer, and no successful run is selected or repeated based on quality.
+
+The actual recovery archive is `recovery_adb_20261104T063203_825186Z_902868`;
+controller PID 903966 was launched at 15:33 KST, with live stage records in
+`continuation_runs/20261104T063357_535789Z_903966`. The two-hour Windows watcher
+was rebound to that PID at 15:34 KST. The NIAH regression suite passed
+**276 tests**. Based on prior per-case wall times and copy/hash transitions,
+the remaining work is estimated at 2.5–4 hours if USB stays connected; 8K
+estimates use single smoke executions, not completed main-run measurements.
+
+### Hourly health checks and Windows notifications
+
+On November 4, 2026, the user requested changing the original two-hour
+monitoring interval to **one hour**, while retaining Windows notifications.
+`niah_health.py` can watch the current controller with
+`--controller-pid PID --interval-seconds 3600 --windows-notify --detach`.
+It checks immediately and every hour, binding the PID, start time and
+command line to avoid confusing a reused PID with the experiment. It records
+controller status, child-process CPU activity, latest log changes and host
+RAM/swap in its own `health_runs/` directory (`latest.json`, `samples.jsonl`,
+`monitor.log`). A static stage alone is not called a failure. A terminal
+complete/failed/stopped state is recorded and ends the watcher at the next
+check; it never restarts or kills an experiment.
+
+`--windows-notify` submits a local Windows notification via PowerShell/WinRT
+(with a NotifyIcon fallback), without installing software or changing system
+settings. Notification submission and visible display are distinct: Windows
+focus/notification settings may suppress it. Notification errors are retained
+and do not terminate the monitor. **This is not an automatic chat message.**
+The PC/WSL must remain running for the local monitor and experiment to continue.
+
+After all operational gates and main cases complete, `niah_report.py --root
+"$NIAH_ROOT"` writes CSV/JSON tables and shared-scale accuracy/difference
+heatmaps into a new `report/` directory. Missing/failed executions are marked
+as incomplete, not silently counted as wrong answers or dropped.
+
 ## ICEIC2027: Odd/Boundary PPL follow-up (2026-10-27)
 
 The four **unchanged binaries from the repeated-performance experiment below**
