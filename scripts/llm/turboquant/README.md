@@ -12,6 +12,10 @@ and current results are in
 
 ## Cross-model PU-K8 budget comparison (2026-11-20)
 
+The [follow-up on budget exchanges and layer placement](experiments/cross_model_pu_refinement/README.md)
+starts from each model's Early allocation and scores 35 local candidates on four new
+calibration documents. Eight separate documents evaluate the frozen choices.
+
 The [offline report and reproduction commands](experiments/cross_model_pu_budget/offline_report.md)
 cover Qwen3-1.7B, 4B and 8B W4A16 on the same four CL1024 WikiText windows.
 Each model has one all-LM K4/V4 control and five matched placements for each of
