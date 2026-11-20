@@ -183,14 +183,22 @@ class Attention:
         return (torch.round(x / scale - offset).clamp(0, 65535) + offset) * scale
 
     def __call__(
-        self, values: list[torch.Tensor], layers: set[int]
+        self,
+        values: list[torch.Tensor],
+        layers: set[int],
+        v4_layers: set[int] | None = None,
     ) -> list[torch.Tensor]:
-        q = torch.cat(values[:16], dim=0).squeeze(1)
-        k, v = values[16].squeeze(1), values[17].squeeze(1)
+        query_heads = len(self.inputs) - 2
+        q = torch.cat(values[:query_heads], dim=0).squeeze(1)
+        k, v = values[-2].squeeze(1), values[-1].squeeze(1)
+        if query_heads % k.shape[0]:
+            raise ValueError("Offline GQA query/KV head count mismatch")
+        groups = query_heads // k.shape[0]
         k = codec(
             k, 8 if self.layer in layers else 4, 42, self.layer in layers
-        ).repeat_interleave(2, 0)
-        v = codec(v, 2, 542).repeat_interleave(2, 0)
+        ).repeat_interleave(groups, 0)
+        v_bits = 4 if v4_layers is not None and self.layer in v4_layers else 2
+        v = codec(v, v_bits, 542).repeat_interleave(groups, 0)
         outputs = []
         # This matches HTP's 896 past + 128 current layout for every AR128 call,
         # including empty left padding and sequential FP16 partial AV sums.
@@ -209,7 +217,7 @@ class Attention:
             # Affine probability quantization includes the (masked) zero padding.
             if end < 1024:
                 padding = torch.full(
-                    (16, end - start, 1024 - end), -100.0, device=q.device
+                    (query_heads, end - start, 1024 - end), -100.0, device=q.device
                 )
                 padding = self.affine(padding, 1)
                 masked = torch.cat((padding, masked), -1)
@@ -237,8 +245,9 @@ class Attention:
 
 
 class Part:
-    def __init__(self, path: Path, device: str) -> None:
+    def __init__(self, path: Path, device: str, *, stream_weights: bool = False) -> None:
         self.device = device
+        self.streamed_weights: set[str] = set()
         model = onnx.load(path, load_external_data=False)
         data = json.loads(path.with_suffix(".encodings").read_text())
         activations = {v["name"]: v for v in data["activation_encodings"]}
@@ -254,27 +263,37 @@ class Part:
         )
         for layer in layers:
             inputs, outputs, grids = [], [], []
-            for head in range(8):
-                for group in range(2):
-                    prefix = f"tq_attn_{layer}_tile0_head{head}_q{group}_"
-                    inputs.append(f"tq_attn_{layer}_head{head}_q{group}_rotated")
-                    prob = producer[prefix + "prob"].input[0]
-                    masked = producer[prob].input[0]
-                    grids.append(
-                        [
-                            activations[prefix + "score"],
-                            activations[masked],
-                            activations[prob],
-                        ]
+            head_groups = sorted(
+                (int(m[1]), int(m[2]))
+                for name in producer
+                if (
+                    m := re.fullmatch(
+                        rf"tq_attn_{layer}_head(\d+)_q(\d+)_rotated", name
                     )
-                    total = f"tq_attn_{layer}_tile768_head{head}_q{group}_sum"
-                    candidates = [
-                        n
-                        for n in model.graph.node
-                        if n.op_type == "MatMul" and n.input[0] == total
+                )
+            )
+            if not head_groups:
+                raise ValueError(f"Missing query rotations for layer {layer}")
+            for head, group in head_groups:
+                prefix = f"tq_attn_{layer}_tile0_head{head}_q{group}_"
+                inputs.append(f"tq_attn_{layer}_head{head}_q{group}_rotated")
+                prob = producer[prefix + "prob"].input[0]
+                masked = producer[prob].input[0]
+                grids.append(
+                    [
+                        activations[prefix + "score"],
+                        activations[masked],
+                        activations[prob],
                     ]
-                    assert len(candidates) == 1
-                    outputs.append(candidates[0].output[0])
+                )
+                total = f"tq_attn_{layer}_tile768_head{head}_q{group}_sum"
+                candidates = [
+                    n
+                    for n in model.graph.node
+                    if n.op_type == "MatMul" and n.input[0] == total
+                ]
+                assert len(candidates) == 1
+                outputs.append(candidates[0].output[0])
             inputs += [f"tq_key_{layer}_present_tokens_last", f"past_value_{layer}_out"]
             macro = Attention(layer, inputs, outputs, grids, device)
             self.macros[layer] = macro
@@ -314,9 +333,11 @@ class Part:
                 continue
             array = numpy_helper.to_array(tensor, base_dir=str(path.parent)).copy()
             self.cpu_constants[tensor.name] = array if array.size < 10000 else None
-            value = torch.from_numpy(array).to(
-                device=device if array.dtype.kind == "f" else "cpu"
-            )
+            weight_device = device if array.dtype.kind == "f" else "cpu"
+            if stream_weights and array.dtype.kind == "f" and array.size >= 10000:
+                self.streamed_weights.add(tensor.name)
+                weight_device = "cpu"
+            value = torch.from_numpy(array).to(weight_device)
             if tensor.name in parameters:
                 consumers = parameter_consumers[tensor.name]
                 axis = (
@@ -331,7 +352,9 @@ class Part:
                     1,
                     value.shape[axis],
                 ), tensor.name
-                value = Grid(parameters[tensor.name], device, value.ndim, axis)(value)
+                value = Grid(parameters[tensor.name], weight_device, value.ndim, axis)(
+                    value
+                )
             self.constants[tensor.name] = value
         for key, node in list(nodes.items()):
             if node.op_type == "Constant":
@@ -406,20 +429,54 @@ class Part:
             "layers": layers,
         }
 
+    def to(self, device: str) -> None:
+        """Move replay state without changing arithmetic/weight dtype.
+
+        Optional part streaming is for the offline search only; deployment has
+        no CPU fallback. Integer shape constants intentionally stay on CPU.
+        """
+        self.device = device
+        for name, tensor in self.constants.items():
+            if tensor.is_floating_point() and name not in self.streamed_weights:
+                self.constants[name] = tensor.to(device)
+        for grid in self.grids.values():
+            grid.scale, grid.offset = grid.scale.to(device), grid.offset.to(device)
+        for macro in self.macros.values():
+            macro.device = device
+            macro.grids = [
+                (scale.to(device), offset.to(device)) for scale, offset in macro.grids
+            ]
+
     @torch.inference_mode()
     def __call__(
-        self, incoming: dict[str, torch.Tensor], k8_layers: set[int]
+        self,
+        incoming: dict[str, torch.Tensor],
+        k8_layers: set[int],
+        v4_layers: set[int] | None = None,
     ) -> dict[str, torch.Tensor]:
         values = dict(self.constants)
         uses = self.uses.copy()
+        # Legacy prepared replay objects predate operator-level streaming.
+        streamed_weights = getattr(self, "streamed_weights", ())
         for name in self.inputs:
             value = incoming[name]
             values[name] = self.grids[name](value) if name in self.grids else value
         for op, inputs, outputs, attrs in self.nodes:
             x = [values[name] for name in inputs]
             if op == "OfflineAttention":
-                results = self.macros[attrs["layer"]](x, k8_layers)
+                macro = self.macros[attrs["layer"]]
+                # Existing accelerated K-only replay macros accept two arguments.
+                results = macro(x, k8_layers, v4_layers) if v4_layers else macro(x, k8_layers)
+            elif op == "Gather" and inputs[0] in streamed_weights:
+                # Select token rows on the host before transferring the embedding.
+                rows = self.operation(op, [x[0], x[1].cpu()], attrs)
+                results = [rows.to(self.device)]
             else:
+                if streamed_weights:
+                    x = [
+                        tensor.to(self.device) if name in streamed_weights else tensor
+                        for name, tensor in zip(inputs, x, strict=True)
+                    ]
                 results = [self.operation(op, x, attrs)]
             for name, value in zip(outputs, results, strict=True):
                 if value.is_floating_point():
@@ -518,22 +575,50 @@ class Part:
 
 
 class Model:
-    def __init__(self, bundle: Path, assets: Path, device: str = "cuda") -> None:
+    def __init__(
+        self,
+        bundle: Path,
+        assets: Path,
+        device: str = "cuda",
+        *,
+        stream_parts: bool = False,
+        split_dir: Path | None = None,
+        stream_weights: bool = False,
+    ) -> None:
         self.device = device
+        self.stream_parts = stream_parts
         torch.set_num_threads(4)
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.parts = []
-        for i in range(1, 5):
-            path = bundle / f"prompt_ar128_cl1024_{i}_of_4.onnx"
+        report = bundle / "convert_report.json"
+        total = (
+            len(json.loads(report.read_text())["parts"])
+            if report.exists()
+            else len(
+                json.loads((split_dir / "split_manifest.json").read_text())["parts"]
+            )
+            if split_dir is not None
+            else 4
+        )
+        for i in range(1, total + 1):
+            path = bundle / f"prompt_ar128_cl1024_{i}_of_{total}.onnx"
             if i == 1 and not path.exists():
-                path = next(
-                    (
-                        bundle.parent.parent
-                        / "qwen3_1_7b_w4a16_split/Qwen3_1_7B_Part1_Of_4_w4a16.aimet"
-                    ).glob("*.onnx")
-                )
-            part = Part(path, device)
+                if split_dir is not None:
+                    entry = json.loads((split_dir / "split_manifest.json").read_text())[
+                        "parts"
+                    ][f"part1_of_{total}"]
+                    path = Path(entry["bundle_dir"]) / (entry["class"] + ".onnx")
+                else:
+                    path = next(
+                        (
+                            bundle.parent.parent
+                            / "qwen3_1_7b_w4a16_split/Qwen3_1_7B_Part1_Of_4_w4a16.aimet"
+                        ).glob("*.onnx")
+                    )
+            part = Part(
+                path, "cpu" if stream_parts else device, stream_weights=stream_weights
+            )
             self.parts.append(part)
             print("loaded", part.identity, flush=True)
         manifest = json.loads((assets / "assets.json").read_text())
@@ -541,7 +626,9 @@ class Model:
         self.rope = torch.tensor(rope, device=device)
 
     @torch.inference_mode()
-    def logits(self, tokens: np.ndarray, layers: list[int]) -> torch.Tensor:
+    def logits(
+        self, tokens: np.ndarray, layers: list[int], *, v4_layers: list[int] | None = None
+    ) -> torch.Tensor:
         assert len(tokens) == 1024
         values = {
             "input_ids": torch.tensor(tokens.astype(np.int64), device=self.device)[
@@ -550,14 +637,25 @@ class Model:
             "position_ids_cos": self.rope[0][None, None],
             "position_ids_sin": self.rope[1][None, None],
         }
+        k8_mask = set(layers)
+        v4_mask = set(v4_layers) if v4_layers else None
+        stream_parts = getattr(self, "stream_parts", False)
         for part in self.parts:
-            values.update(part(values, set(layers)))
+            if stream_parts:
+                part.to(self.device)
+            try:
+                values.update(part(values, k8_mask, v4_mask))
+            finally:
+                if stream_parts:
+                    part.to("cpu")
         value = values[self.parts[-1].outputs[0]]
         return value.reshape(1024, -1)
 
-    def score(self, tokens: np.ndarray, layers: list[int]) -> tuple[dict, torch.Tensor]:
+    def score(
+        self, tokens: np.ndarray, layers: list[int], *, v4_layers: list[int] | None = None
+    ) -> tuple[dict, torch.Tensor]:
         start = time.monotonic()
-        logits = self.logits(tokens, layers)[:-1]
+        logits = self.logits(tokens, layers, v4_layers=v4_layers)[:-1]
         target = torch.tensor(tokens[1:].astype(np.int64), device=self.device)
         loss = F.cross_entropy(logits, target, reduction="none")
         if not torch.isfinite(loss).all():

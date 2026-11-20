@@ -8,10 +8,13 @@ import copy
 
 import pytest
 
+from qai_hub_models.models.templates.llm.turboquant.cache import TurboQuantKVCache
 from qai_hub_models.models.templates.llm.turboquant.config import (
+    MIXED_KV_ALLOCATION_PROFILE,
     STRUCTURED_ALLOCATION_PROFILE,
     Rotation,
     get_profile,
+    mixed_kv_allocation_plan,
     structured_allocation_plan,
 )
 
@@ -60,6 +63,43 @@ def test_allocation_quota_hash(layers: list[int]) -> None:
 def test_invalid_allocations(layers: object) -> None:
     with pytest.raises(ValueError, match="exactly 14"):
         structured_allocation_plan(layers)
+
+
+@pytest.mark.parametrize("layers", [28, 36])
+def test_joint_allocation_resolves_pu_keys_and_lm_values(layers: int) -> None:
+    bits = [[8, 4], [4, 2], [4, 4], [4, 2]] * (layers // 4)
+    plan = mixed_kv_allocation_plan(bits)
+    config = get_profile(MIXED_KV_ALLOCATION_PROFILE, layer_plan=plan)
+    assert config.config_hash() == plan["config_hash"]
+    assert config.to_dict()["layer_plan"]["average_payload_bits"] == 8
+    cache = TurboQuantKVCache(config, layers, 1, 128, 1)
+    assert cache.memory_report().allocated_bytes == layers * (128 + 4)
+    for (key, value), (k, v) in zip(cache.layers, bits, strict=True):
+        assert (key.spec.bits, value.spec.bits) == (k, v)
+        assert key.spec.quantizer == (
+            "structured_k8_two_region_v1" if k == 8 else "lloyd_max"
+        )
+        assert value.spec.quantizer == "lloyd_max"
+    with pytest.raises(ValueError, match="layer count"):
+        config.validate_for_model(layers + 1, 1, 128)
+    with pytest.raises(ValueError, match="mismatch"):
+        get_profile(MIXED_KV_ALLOCATION_PROFILE, layer_plan={**plan, "bits": bits[::-1]})
+
+
+@pytest.mark.parametrize(
+    "bits",
+    [
+        [[4, 4]] * 27,
+        [[8, 2]] * 36,
+        [[6, 2]] * 28,
+        [[4, 4.0]] * 28,
+        [[4, 3]] * 36,
+        [[8]] * 28,
+    ],
+)
+def test_joint_allocation_rejects_invalid_widths_and_budgets(bits: object) -> None:
+    with pytest.raises(ValueError):
+        mixed_kv_allocation_plan(bits)
 
 
 def test_allocation_hash_rejects_mixed_caches_and_tampering() -> None:

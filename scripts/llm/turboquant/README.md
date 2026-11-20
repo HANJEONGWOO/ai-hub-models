@@ -10,6 +10,17 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Cross-model PU-K8 budget comparison (2026-11-20)
+
+The [offline report and reproduction commands](experiments/cross_model_pu_budget/offline_report.md)
+cover Qwen3-1.7B, 4B and 8B W4A16 on the same four CL1024 WikiText windows.
+Each model has one all-LM K4/V4 control and five matched placements for each of
+two average budgets, K5/V3 and K6/V2. Keys use LM-K4 or PU-K8 and values
+use LM-V2 or LM-V4. The [device comparison](experiments/cross_model_pu_budget/htp_agreement.md)
+checks offline rankings against the [12 matching archived HTP runs](experiments/cross_model_pu_budget/htp_reference.csv).
+The [weight checksums](experiments/cross_model_pu_budget/weights.csv) identify the
+exported split checkpoints used for replay.
+
 ## NIAH: frozen four-profile evaluation (in progress, 2026-11-02)
 
 Branch: `exp/structured-k8-niah`. Artifact root:

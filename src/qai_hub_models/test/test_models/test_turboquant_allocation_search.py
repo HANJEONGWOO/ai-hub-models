@@ -5,10 +5,12 @@
 """Offline search rules, budget safety and checkpoint quantization replay."""
 
 import importlib
+import json
 from pathlib import Path
 from types import ModuleType
 
 import numpy as np
+import onnx
 import pytest
 import torch
 
@@ -98,3 +100,72 @@ def test_offline_per_channel_weight_axis(search: ModuleType) -> None:
     )
     expected = torch.tensor([[0.25, 0.5, 1.0], [0.125, 0.25, 0.5]])
     torch.testing.assert_close(grid(x), expected)
+
+
+def test_offline_gqa_and_value_layer_mask(search: ModuleType) -> None:
+    replay = importlib.import_module("allocation_offline_model")
+    heads, kv_heads = 8, 2
+    score = {"bw": 16, "dtype": "INT", "scale": [1 / 128], "offset": [-32768]}
+    prob = {"bw": 16, "dtype": "INT", "scale": [1 / 65535], "offset": [0]}
+    macro = replay.Attention(
+        35, ["q"] * heads + ["k", "v"], [], [[score, score, prob]] * heads, "cpu"
+    )
+    generator = torch.Generator().manual_seed(42)
+    k, v = [torch.randn(kv_heads, 1, 1, 128, generator=generator) for _ in range(2)]
+    values = [torch.zeros(1, 1, 1, 128)] * heads + [k, v]
+    results = []
+    for bits, mask in [(2, None), (2, {34}), (4, {35})]:
+        actual = torch.cat(macro(values, {35}, mask)).squeeze(1)
+        expected = replay.rounded(
+            replay.codec(v.squeeze(1), bits, 542) @ replay.rotation(542, "cpu")
+        )
+        torch.testing.assert_close(
+            actual, expected.repeat_interleave(heads // kv_heads, 0), rtol=0, atol=0
+        )
+        results.append(actual)
+    assert not torch.equal(results[0], results[-1])
+
+
+def test_streamed_embedding_and_projection_match_dense(
+    search: ModuleType, tmp_path: Path
+) -> None:
+    replay = importlib.import_module("allocation_offline_model")
+    rng = np.random.default_rng(81)
+    helper = onnx.helper
+    weights = [
+        onnx.numpy_helper.from_array(rng.normal(size=shape).astype("float32"), name)
+        for name, shape in [("embedding", (100, 128)), ("projection", (128, 80))]
+    ]
+    graph = helper.make_graph(
+        [
+            helper.make_node("Gather", ["embedding", "ids"], ["hidden"]),
+            helper.make_node("MatMul", ["hidden", "projection"], ["logits"]),
+        ],
+        "stream",
+        [helper.make_tensor_value_info("ids", onnx.TensorProto.INT64, [3])],
+        [helper.make_tensor_value_info("logits", onnx.TensorProto.FLOAT, [3, 80])],
+        weights,
+    )
+    path = tmp_path / "graph.onnx"
+    onnx.save(helper.make_model(graph), path)
+    grid = {"dtype": "INT", "bw": 4, "scale": [0.25], "offset": [-8]}
+    path.with_suffix(".encodings").write_text(
+        json.dumps(
+            {
+                "activation_encodings": [],
+                "param_encodings": [{"name": t.name, **grid} for t in weights],
+            }
+        )
+    )
+    streamed = replay.Part(path, "cpu", stream_weights=True)
+    resident = replay.Part(path, "cpu")
+    assert streamed.streamed_weights == {"embedding", "projection"}
+    assert not resident.streamed_weights
+    streamed.to("cpu")
+    inputs = {"ids": torch.tensor([11, 0, 78])}
+    torch.testing.assert_close(
+        streamed(inputs, set())["logits"],
+        resident(inputs, set())["logits"],
+        rtol=0,
+        atol=0,
+    )

@@ -261,6 +261,7 @@ class TurboQuantConfig:
                 "uniform",
                 "attention_mse",
                 "nll_allocation",
+                "joint_kv_allocation",
                 "boundary",
             ):
                 raise ValueError(
@@ -622,11 +623,46 @@ PROFILES["uniform_k8_v4_scaled"] = replace(
 )
 
 STRUCTURED_ALLOCATION_PROFILE = "mixed_k6_v2_structured_k8_allocation"
+MIXED_KV_ALLOCATION_PROFILE = "mixed_pu_k8_lm_k4_v2_v4_allocation"
 _STRUCTURED_ALLOCATION_BASE = replace(
     PROFILES["mixed_k6_v2_uniform_structured_k8"],
     profile=STRUCTURED_ALLOCATION_PROFILE,
     layer_policy="nll_allocation",
 )
+_MIXED_KV_ALLOCATION_BASE = replace(
+    _STRUCTURED_ALLOCATION_BASE,
+    profile=MIXED_KV_ALLOCATION_PROFILE,
+    layer_policy="joint_kv_allocation",
+)
+
+
+def mixed_kv_allocation_plan(bits: object) -> dict[str, Any]:
+    """Freeze absolute-layer PU-K8/LM-K4 and LM-V2/V4 widths."""
+    if not isinstance(bits, (list, tuple)) or len(bits) not in (28, 36):
+        raise ValueError("Joint K/V allocation requires 28 or 36 ordered layer pairs.")
+    for pair in bits:
+        if (
+            not isinstance(pair, (list, tuple))
+            or len(pair) != 2
+            or any(type(bit) is not int for bit in pair)
+            or pair[0] not in (4, 8)
+            or pair[1] not in (2, 4)
+        ):
+            raise ValueError(
+                "Each allocation pair requires integer K4/K8 and V2/V4 widths."
+            )
+    if sum(k + v for k, v in bits) != 8 * len(bits):
+        raise ValueError("Joint K/V allocation must average exactly 8 payload bits.")
+    config = replace(
+        _MIXED_KV_ALLOCATION_BASE, layer_bits=tuple((k, v) for k, v in bits)
+    )
+    return {
+        "profile": config.profile,
+        "policy": config.layer_policy,
+        "bits": [list(pair) for pair in config.layer_bits],
+        "config_hash": config.config_hash(),
+        "config": config.to_dict(),
+    }
 
 
 def structured_allocation_plan(k8_layers: object) -> dict[str, Any]:
@@ -673,31 +709,32 @@ def get_profile(
             "the default path is QJL-off PolarQuant."
         )
     lookup = name.replace("_mse", "_uniform") if name.startswith("mixed_") else name
-    if lookup not in PROFILES and name != STRUCTURED_ALLOCATION_PROFILE:
-        raise ValueError(
-            f"Unknown TurboQuant profile '{name}'. Choose from {sorted(PROFILES)}."
-        )
-    config = (
-        _STRUCTURED_ALLOCATION_BASE
-        if name == STRUCTURED_ALLOCATION_PROFILE
-        else PROFILES[lookup]
-    )
-    if name == STRUCTURED_ALLOCATION_PROFILE:
+    if name in (STRUCTURED_ALLOCATION_PROFILE, MIXED_KV_ALLOCATION_PROFILE):
         if rotation is not None and rotation != Rotation.DENSE_QR:
             raise ValueError("Structured allocation requires Dense QR")
         if layer_plan is None:
             raise ValueError(
                 "Structured allocation requires its frozen layer-plan JSON"
             )
-        expected = structured_allocation_plan(layer_plan.get("k8_layers"))
+        if name == STRUCTURED_ALLOCATION_PROFILE:
+            config = _STRUCTURED_ALLOCATION_BASE
+            expected = structured_allocation_plan(layer_plan.get("k8_layers"))
+        else:
+            config = _MIXED_KV_ALLOCATION_BASE
+            expected = mixed_kv_allocation_plan(layer_plan.get("bits"))
         if any(layer_plan.get(key) != value for key, value in expected.items()):
             raise ValueError(
                 "Allocation plan/config/codebook hash or bit budget mismatch"
             )
-        config = replace(
+        return replace(
             config, layer_bits=tuple(tuple(pair) for pair in expected["bits"])
         )
-    elif name.endswith("_mse"):
+    if lookup not in PROFILES:
+        raise ValueError(
+            f"Unknown TurboQuant profile '{name}'. Choose from {sorted(PROFILES)}."
+        )
+    config = PROFILES[lookup]
+    if name.endswith("_mse"):
         if rotation is not None and rotation != config.rotation:
             raise ValueError(
                 "MSE-selected layer plans are fixed to their Dense rotation."
