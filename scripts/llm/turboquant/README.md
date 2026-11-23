@@ -10,6 +10,13 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Qwen3-1.7B layerwise K/V allocation (2026-11-23)
+
+The [experiment report](experiments/local_kv_scores/README.md) compares Early
+with layer allocations ranked by K and V promotion gains at the same cache
+capacity. Each calibration document supplies all 28 layer scores in one
+W4A16 FP16-KV reference pass.
+
 ## Cross-model PU-K8 budget comparison (2026-11-20)
 
 The [follow-up on budget exchanges and layer placement](experiments/cross_model_pu_refinement/README.md)

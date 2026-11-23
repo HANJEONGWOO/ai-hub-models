@@ -1,0 +1,14 @@
+{
+  "model": "qwen3_1_7b",
+  "context_length": 1024,
+  "windows_per_split": {"calibration": 8, "validation": 8, "test": 8},
+  "tokens_per_nll_window": 1023,
+  "calibration": "Single unchanged W4A16 FP16-KV reference path per document. Use all causal positions and heads. At each layer compute mean squared attention-output errors for (4,2), (8,2), (4,4) on identical Q/K/V. Average document MSE with equal weights. Use Structured K8 and Lloyd-Max K4/V2/V4 with the current codec policy.",
+  "gain": "g_K = E(4,2) - E(8,2); g_V = E(4,2) - E(4,4). Sort independently by descending gain, breaking ties by lower layer number.",
+  "budgets": "Enumerate k = 0..14. Assign K8 to the k highest K gains, V4 to the 28-2k highest V gains. Choose the greatest sum of selected gains; smaller k wins an exact tie.",
+  "candidates": "Evaluate predicted k, its feasible immediate neighbors, and the historical K5/V3 Early anchor. Deduplicate by exact deployment config hash.",
+  "selection": "Minimize total NLL divided by all validation targets. Exact ties favor Early, then lexical plan ID. Freeze before scoring test.",
+  "test": "Evaluate only the validation winner and Early once each on the independent test. If the winner equals Early, reuse that one measurement.",
+  "uncertainty": "Paired document bootstrap for test NLL (10000 resamples, seed 20261123); descriptive only.",
+  "timing": "Record calibration capture and three local states including setup and IO; rank and validation; report evaluation and test separately. No 64-mask reference search."
+}
