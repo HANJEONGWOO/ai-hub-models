@@ -1,0 +1,15 @@
+{
+  "model": "qwen3_1_7b",
+  "weights": "original W4A16",
+  "context_length": 1024,
+  "candidates": ["early_07", "dp_07", "early_06", "dp_06", "early_08", "dp_08"],
+  "formats": "K4 Lloyd-Max or two-region Structured K8 arithmetic; V2 or V4 Lloyd-Max; existing rotation, scale, and current-token policy",
+  "source_quota_table_sha256": "6547d93c8d1e10a989597e557868d668d2699e4964ad4a1cfe0ecf6a526a3211",
+  "placement": "Early uses the lowest-numbered k layers for K8 and the lowest-numbered 28-2k for V4. DP uses the exact historical quota row for k.",
+  "allocated_cache_bytes": 30277632,
+  "cohort": "All eight validation inputs from relative_kv_20261124/data_manifest.json. Score 1023 next-token targets per input using the same offline evaluator.",
+  "prior_manifest_sha256": "db726e9ff1b32bc182e48dfc1e3c6cd6d92cb0f4edc833e768d794cff3b90810",
+  "selection": "Score every candidate on all eight documents. Rank by unrounded pooled token NLL, then prefer early_07 on an exact tie, then lexical plan ID. Freeze the validation winner.",
+  "reuse": "Prior raw validation score requires matching model, scorer, runtime, deployment config, source tokens and raw score hash in the historical report.",
+  "scope": "Validation selection only. 48 document scores, 8184 targets per candidate."
+}

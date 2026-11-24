@@ -1,0 +1,323 @@
+{
+  "allocated_cache_bytes": 30277632,
+  "bits": [
+    [
+      8,
+      4
+    ],
+    [
+      8,
+      4
+    ],
+    [
+      8,
+      4
+    ],
+    [
+      8,
+      4
+    ],
+    [
+      8,
+      4
+    ],
+    [
+      8,
+      4
+    ],
+    [
+      8,
+      4
+    ],
+    [
+      4,
+      4
+    ],
+    [
+      4,
+      4
+    ],
+    [
+      4,
+      4
+    ],
+    [
+      4,
+      4
+    ],
+    [
+      4,
+      4
+    ],
+    [
+      4,
+      4
+    ],
+    [
+      4,
+      4
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ],
+    [
+      4,
+      2
+    ]
+  ],
+  "config": {
+    "bit_order": "msb_first",
+    "block_size": 128,
+    "format": "qaihm-turboquant-kv",
+    "format_version": 2,
+    "key": {
+      "bits": 4,
+      "codebook_sha256": "2260ac9861ecc11872763ac359673e54e76be620463948dfaa105f97c1a07740",
+      "kind": "polar",
+      "rotation_f32_sha256": "7e76eadbc9e5aec69be63829c8068ca5618b203ee09d3eaf4918ee6be9e0d016",
+      "seed": 42
+    },
+    "layer_plan": {
+      "average_payload_bits": 8.0,
+      "bits": [
+        [
+          8,
+          4
+        ],
+        [
+          8,
+          4
+        ],
+        [
+          8,
+          4
+        ],
+        [
+          8,
+          4
+        ],
+        [
+          8,
+          4
+        ],
+        [
+          8,
+          4
+        ],
+        [
+          8,
+          4
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ],
+        [
+          4,
+          2
+        ]
+      ],
+      "codebook_sha256": {
+        "2": "88258c1b2f4f5053aed4482e59c0ad6d35d9e081130d9829cdc6540b055c7b9a",
+        "4": "2260ac9861ecc11872763ac359673e54e76be620463948dfaa105f97c1a07740",
+        "8": "c407f658ea5293ea6ba13c741534cf813d3f9ee363f8020479caa387fbcd4181"
+      },
+      "packing": "msb_first;8bit=uint8_index",
+      "policy": "joint_kv_allocation"
+    },
+    "norm_correction": true,
+    "norm_dtype": "float16",
+    "norm_representation": "effective_scale",
+    "profile": "mixed_pu_k8_lm_k4_v2_v4_allocation",
+    "qjl": false,
+    "reference_commit": "ba52ad107d1fdd02bc9be8fd85308226b75c905b",
+    "rotation": "dense_qr",
+    "scalar_indexing": "lloyd_tree_except_structured_k8_arithmetic",
+    "structured_k8": {
+      "centroid": "FP16(FP16(local*step[r])+offset[r]); symmetric signed LUT",
+      "codebook_sha256": "c407f658ea5293ea6ba13c741534cf813d3f9ee363f8020479caa387fbcd4181",
+      "coefficient_hex": [
+        "0x1.d400000000000p-11",
+        "0x1.0080000000000p-9",
+        "0x1.03c0000000000p-3",
+        "0x1.ed00000000000p-9"
+      ],
+      "distribution": "N(0,1/128)",
+      "index": "j=64*r+clip(floor((abs(y)-offset[r])/step[r]+0.5),0,63); y>=0?128+j:127-j",
+      "negative_fields": "region/local complemented to retain ascending LUT ABI",
+      "optimizer": "nine fixed initializations; analytic Gaussian scalar MSE; no real-data tuning",
+      "quantizer": "structured_k8_two_region_v1",
+      "region_boundary": 0.125518798828125
+    },
+    "value": {
+      "bits": 2,
+      "codebook_sha256": "88258c1b2f4f5053aed4482e59c0ad6d35d9e081130d9829cdc6540b055c7b9a",
+      "kind": "polar",
+      "rotation_f32_sha256": "a89dbff3a12d727d4b9decbc82e1e81490165fde94a1efc12f649bf11b054309",
+      "seed": 542
+    }
+  },
+  "config_hash": "47a050d4c0849404e6b2e8dc4a07d0b6d19b0c20b2b15d26b91b85cc3c1f3f4d",
+  "evaluation_sha256": "3eff8d17d24897d17fb2ba832f2b0d7987353a3fadc347f828d029ec948556ca",
+  "k8_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+  ],
+  "key_average_bits": 5.0,
+  "model_id": "qwen3_1_7b",
+  "num_layers": 28,
+  "plan_id": "early_07",
+  "policy": "joint_kv_allocation",
+  "profile": "mixed_pu_k8_lm_k4_v2_v4_allocation",
+  "scored_tokens": 8184,
+  "selected_mean_nll": 2.802460171978261,
+  "selected_ppl": 16.48515323628073,
+  "v4_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13
+  ],
+  "validation_result_sha256": "7f23ea55f9ccac1e8e3206f8f0c14a08e7c210d2d4d0a0ff5fb1dccd30a51f16",
+  "value_average_bits": 3.0
+}

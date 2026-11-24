@@ -10,6 +10,12 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Qwen3-1.7B adjacent K/V budgets (2026-11-24)
+
+The [six-plan validation comparison](experiments/adjacent_kv/README.md)
+evaluates Early and dynamic-programming placements for six, seven and eight K8
+layers at equal KV capacity on the same eight validation articles.
+
 ## Qwen3-1.7B relative attention error allocation (2026-11-24)
 
 The [four-state experiment](experiments/relative_kv/README.md) jointly assigns
