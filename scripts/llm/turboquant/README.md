@@ -10,6 +10,13 @@ Developer tools for the opt-in TurboQuant KV-cache codec in
 and current results are in
 [`tutorials/llm/turboquant_design.md`](../../../tutorials/llm/turboquant_design.md).
 
+## Qwen3-1.7B relative attention error allocation (2026-11-24)
+
+The [four-state experiment](experiments/relative_kv/README.md) jointly assigns
+K and V widths using measured attention output distortions normalized by each
+layer's FP16-KV output energy. Fresh validation and test articles compare it
+with the previous layer-placement controls at matched cache capacity.
+
 ## Qwen3-1.7B layerwise K/V allocation (2026-11-23)
 
 The [experiment report](experiments/local_kv_scores/README.md) compares Early

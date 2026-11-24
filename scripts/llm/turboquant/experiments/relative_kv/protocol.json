@@ -1,0 +1,15 @@
+{
+  "model": "qwen3_1_7b",
+  "context": 1024,
+  "calibration": "Reuse the eight byte-identical calibration inputs of local_kv_scores_20261123; one unchanged W4A16 FP16-KV reference forward per input, all 28 layers, 16 query heads, 1024 causal query positions and 128 coordinates.",
+  "windows": "Eight new article-disjoint validation and eight new independent test windows; exclude previously used articles/spans, prioritize official split if eight eligible; deterministic disjoint train reserves otherwise. Score 1023 targets/window.",
+  "states": [[4,2],[4,4],[8,2],[8,4]],
+  "distortion": "For each layer and exact joint state pool squared output differences over all documents and all elements in FP64. Divide by the pooled squared FP16 reference output energy for that layer plus 1e-12 once.",
+  "fixed": "First evaluate Early K5/V3, frozen original absolute-MSE ranked_07 plan, and new minimum sum(D_i) plan with exactly 7 K8 and 14 V4 layers.",
+  "gate": "Only if new fixed validation pooled NLL is strictly lower than historical absolute ranked_07 on the same new documents, expand to k=0..14; V4 count is 28-2k. Select minimum pooled local distortion among these DP optima (lower k on exact tie).",
+  "dp_ties": "Lexicographically smallest bit-pair sequence in layer order on exact cost ties.",
+  "selection": "Freeze best NEW candidate by pooled validation token NLL before scoring any test NLL; exact tie favors the fixed k=7. Select among new relative plans, irrespective of Early or absolute results. Deduplicate identical deployment config hashes in each split.",
+  "test": "Compare only the frozen new candidate and Early on eight independent test articles.",
+  "uncertainty": "Paired document bootstrap NLL difference, 10000 replicates, seed 20261124, percentile 95% interval.",
+  "timing": "Log actual local-score, assignment, validation and test stages; existing W4A16 weights, codecs, rotation, rounding, scale metadata, current-KV and default profile unchanged."
+}
