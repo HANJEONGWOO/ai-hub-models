@@ -372,6 +372,9 @@ int main(int argc, char** argv) {
             const size_t target = start + i + 1;
             if (target >= promptCount) break;
             session.logitsRow(static_cast<int>(i), row);
+            // Optional teacher-forced logits for offline KL diagnostics. This
+            // does not execute an additional graph or affect no-dump benchmarks.
+            if (dump && first) std::fwrite(row.data(), sizeof(float), row.size(), dump);
             nllSum -= logSoftmaxAt(row, tokens[target]);
             top1Match += argmax(row) == tokens[target];
             ++scored;

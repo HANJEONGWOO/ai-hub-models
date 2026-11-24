@@ -30,6 +30,8 @@ from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
 from qai_hub_models.models.templates.llm.turboquant.native_decoder import (
     NATIVE_DOMAIN,
     NATIVE_OP,
+    native_op,
+    native_table,
 )
 from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
     _head_concat,
@@ -95,11 +97,17 @@ def quantize_current_attention(
     acts = {e["name"]: e for e in result.encodings["activation_encodings"]}
 
     def native(
-        packed: str, scale: str, table: str, prefix: str, heads: int, seq: int
+        packed: str,
+        scale: str,
+        table: str,
+        prefix: str,
+        heads: int,
+        seq: int,
+        op: str = NATIVE_OP,
     ) -> str:
         sg.node("Cast", [scale], [prefix + "scale16"], to=TensorProto.FLOAT16)
         sg.node(
-            NATIVE_OP,
+            op,
             [packed, prefix + "scale16", table],
             [prefix + "native_fp16"],
             domain=NATIVE_DOMAIN,
@@ -121,6 +129,7 @@ def quantize_current_attention(
 
     for io in result.codec_io:
         layer, kind, heads, seq = io.layer, io.kind, io.num_kv_heads, io.new_tokens
+        layer_config = config.for_layer(layer)
         info = layers.get(layer)
         rotated = bool(info and info["strategy"] == "rotated_precomputed_scale")
         use_native = bool(info and info.get("decoder") == "native_unpack_lut_v1")
@@ -129,12 +138,11 @@ def quantize_current_attention(
             restored = native(
                 io.packed_out,
                 io.norm_out,
-                "tq_native_key3_centroids_fp16"
-                if config.qjl and kind == "key"
-                else "tq_native_centroids_fp16",
+                native_table(layer_config, kind),
                 prefix,
                 heads,
                 seq,
+                native_op(layer_config, kind),
             )
         else:
             scale = io.norm_out
@@ -152,7 +160,7 @@ def quantize_current_attention(
             sg.extend(
                 decode_subgraph(
                     config,
-                    getattr(config, kind),
+                    config.codec_for(kind, layer),
                     io.packed_out,
                     scale,
                     restored,

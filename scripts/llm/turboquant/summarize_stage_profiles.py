@@ -47,7 +47,7 @@ def semantic_stage(name: str) -> tuple[str, int | None, str]:
             # Retain old event names for historical reports, not an export path.
             elif sub in {"above", "above_i32", "index"} or sub.startswith("scalar_"):
                 stage = "encode.scalar_index"
-            elif sub.startswith(("index_hi", "index_lo", "byte_")):
+            elif sub.startswith(("index_hi", "index_lo", "byte_", "pack_")):
                 stage = "encode.pack"
             elif sub.startswith("scale_") or sub == "effective_scale":
                 stage = "encode.scale_correction"

@@ -311,7 +311,13 @@ def test_scalar_indexing_identity_is_fixed_for_compressed_profiles(name: str) ->
     config = get_profile(name)
     data = config.to_dict()
     if config.enabled:
-        assert data["scalar_indexing"] == "lloyd_tree"
+        assert data["scalar_indexing"] == (
+            "lloyd_tree_except_structured_k8_arithmetic"
+            if config.structured_k8
+            else "lloyd_tree_except_uniform_k8_arithmetic"
+            if config.uniform_k8
+            else "lloyd_tree"
+        )
     else:
         assert "scalar_indexing" not in data
 
@@ -354,8 +360,8 @@ def test_dense_accepts_seed_without_frozen_fwht_signs() -> None:
 
 
 def test_config_rejects_unsupported_settings() -> None:
-    with pytest.raises(ValueError, match="3 or 4"):
-        KVCodecSpec(CodecKind.POLAR, bits=2, seed=42)
+    with pytest.raises(ValueError, match="2 through 8"):
+        KVCodecSpec(CodecKind.POLAR, bits=9, seed=42)
     with pytest.raises(ValueError, match="no bits"):
         KVCodecSpec(CodecKind.BASELINE, bits=4)
     with pytest.raises(ValueError, match="no bits"):

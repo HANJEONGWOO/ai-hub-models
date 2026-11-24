@@ -61,13 +61,34 @@ class KVCodecSpec:
     kind: CodecKind
     bits: int = 0
     seed: int = 0
+    quantizer: str = "lloyd_max"
+    codebook_variant: str = ""
 
     def __post_init__(self) -> None:
+        if self.codebook_variant and (
+            self.codebook_variant != "lloyd_max_k8_converged_v1"
+            or self.quantizer != "lloyd_max"
+            or self.kind != CodecKind.POLAR
+            or self.bits != 8
+        ):
+            raise ValueError(
+                "Converged codebook requires the opt-in LM Polar K8 variant"
+            )
+        if self.quantizer not in (
+            "lloyd_max",
+            "structured_k8_two_region_v1",
+            "uniform_k8_gaussian_v1",
+        ):
+            raise ValueError("Unknown scalar quantizer")
+        if self.quantizer != "lloyd_max" and (
+            self.kind != CodecKind.POLAR or self.bits != 8
+        ):
+            raise ValueError("Structured quantizer requires Polar K8")
         if self.kind != CodecKind.POLAR and (self.bits != 0 or self.seed != 0):
             raise ValueError(f"{self.kind.name} codec takes no bits or seed.")
-        if self.kind == CodecKind.POLAR and self.bits not in (3, 4):
+        if self.kind == CodecKind.POLAR and self.bits not in range(2, 9):
             raise ValueError(
-                f"PolarQuant bit width must be 3 or 4, got {self.bits}. "
+                f"PolarQuant bit width must be 2 through 8, got {self.bits}. "
                 "Other widths have no frozen codebook."
             )
 
@@ -88,7 +109,12 @@ class KVCodecSpec:
         return self.kind != CodecKind.BASELINE
 
     def to_dict(self) -> dict[str, Any]:
-        return {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
+        result = {"kind": self.kind.value, "bits": self.bits, "seed": self.seed}
+        if self.quantizer != "lloyd_max":
+            result["quantizer"] = self.quantizer
+        if self.codebook_variant:
+            result["codebook_variant"] = self.codebook_variant
+        return result
 
 
 BASELINE = KVCodecSpec(CodecKind.BASELINE)
@@ -112,8 +138,138 @@ class TurboQuantConfig:
     precomputed_norm: bool = False
     qjl: bool = False
     reference_commit: str = field(default=REFERENCE_COMMIT)
+    # Empty retains every legacy profile's serialization/hash. Layer indices
+    # are absolute model layer IDs, not part-local IDs.
+    layer_bits: tuple[tuple[int, int], ...] = ()
+    layer_policy: str = ""
+    structured_k8: bool = False
+    converged_k8: bool = False
+    uniform_k8: bool = False
+
+    def codec_for(self, kind: str, layer: int) -> KVCodecSpec:
+        if kind not in ("key", "value"):
+            raise ValueError(f"Unknown KV kind: {kind}")
+        spec = getattr(self, kind)
+        if not self.layer_bits:
+            return spec
+        if not 0 <= layer < len(self.layer_bits):
+            raise ValueError(f"Layer {layer} is outside the mixed-bit plan.")
+        bits = self.layer_bits[layer][kind == "value"]
+        return replace(
+            spec,
+            bits=bits,
+            quantizer=(
+                "structured_k8_two_region_v1"
+                if self.structured_k8 and kind == "key" and bits == 8
+                else "uniform_k8_gaussian_v1"
+                if self.uniform_k8 and kind == "key" and bits == 8
+                else "lloyd_max"
+            ),
+            codebook_variant=(
+                "lloyd_max_k8_converged_v1"
+                if self.converged_k8 and kind == "key" and bits == 8
+                else ""
+            ),
+        )
+
+    def for_layer(self, layer: int) -> TurboQuantConfig:
+        if not self.layer_bits:
+            return self
+        return replace(
+            self,
+            key=self.codec_for("key", layer),
+            value=self.codec_for("value", layer),
+            layer_bits=(),
+            layer_policy="",
+        )
 
     def __post_init__(self) -> None:
+        if self.uniform_k8 and (
+            self.structured_k8
+            or self.converged_k8
+            or self.block_size != 128
+            or self.qjl
+            or not self.precomputed_norm
+            or not self.norm_correction
+            or self.norm_dtype != "float16"
+            or self.rotation != Rotation.DENSE_QR
+        ):
+            raise ValueError(
+                "Uniform K8 requires exclusive scaled Dense D128 K-only profile"
+            )
+        if self.converged_k8 and (
+            self.structured_k8
+            or self.block_size != 128
+            or self.qjl
+            or not self.precomputed_norm
+            or not self.norm_correction
+            or self.norm_dtype != "float16"
+            or self.rotation != Rotation.DENSE_QR
+        ):
+            raise ValueError("Converged K8 requires scaled Dense D128 LM without QJL")
+        if self.value.codebook_variant or (
+            self.key.codebook_variant and not self.converged_k8
+        ):
+            raise ValueError("Converged codebook is opt-in K-only")
+        if self.converged_k8 and (
+            self.value.bits == 8
+            or any(len(pair) == 2 and pair[1] == 8 for pair in self.layer_bits)
+        ):
+            raise ValueError(
+                "Converged K8 cannot share encoder constants with legacy V8"
+            )
+        if self.structured_k8 and (
+            self.block_size != 128
+            or self.qjl
+            or not self.precomputed_norm
+            or not self.norm_correction
+            or self.norm_dtype != "float16"
+            or self.rotation != Rotation.DENSE_QR
+        ):
+            raise ValueError(
+                "Structured K8 requires Dense D128, norm-corrected FP16 scales, no QJL"
+            )
+        if self.value.quantizer != "lloyd_max" or (
+            self.key.quantizer != "lloyd_max"
+            and not (self.structured_k8 or self.uniform_k8)
+        ):
+            raise ValueError("Structured quantizer is opt-in K-only")
+        if (self.key.quantizer == "uniform_k8_gaussian_v1" and not self.uniform_k8) or (
+            self.key.quantizer == "structured_k8_two_region_v1"
+            and not self.structured_k8
+        ):
+            raise ValueError(
+                "K8 arithmetic quantizer does not match the opt-in profile"
+            )
+        if self.layer_bits:
+            if not isinstance(self.layer_bits, tuple) or any(
+                not isinstance(pair, tuple) or any(type(bit) is not int for bit in pair)
+                for pair in self.layer_bits
+            ):
+                raise ValueError(
+                    "Layer plan must be an immutable tuple of integer bit pairs."
+                )
+            if (
+                self.qjl
+                or not self.precomputed_norm
+                or not all(s.is_polar for s in (self.key, self.value))
+            ):
+                raise ValueError(
+                    "Mixed-bit requires scaled PolarQuant K/V without QJL."
+                )
+            if self.layer_policy not in (
+                "uniform",
+                "attention_mse",
+                "nll_allocation",
+                "boundary",
+            ):
+                raise ValueError(
+                    "Mixed-bit requires a recorded layer selection policy."
+                )
+            if any(len(pair) != 2 for pair in self.layer_bits):
+                raise ValueError("Each layer requires exactly K and V bit widths.")
+        elif self.layer_policy:
+            raise ValueError("A layer policy requires a layer plan.")
         if any(s.is_fp16 for s in self.codecs) and not all(
             s.is_fp16 for s in self.codecs
         ):
@@ -159,8 +315,14 @@ class TurboQuantConfig:
                 )
 
     @property
-    def codecs(self) -> tuple[KVCodecSpec, KVCodecSpec]:
-        return (self.key, self.value)
+    def codecs(self) -> tuple[KVCodecSpec, ...]:
+        if not self.layer_bits:
+            return (self.key, self.value)
+        return tuple(
+            self.codec_for(kind, layer)
+            for layer in range(len(self.layer_bits))
+            for kind in ("key", "value")
+        )
 
     @property
     def enabled(self) -> bool:
@@ -182,6 +344,10 @@ class TurboQuantConfig:
         """Reject model shapes this format version cannot store without truncation."""
         if num_layers <= 0 or num_kv_heads <= 0:
             raise ValueError("num_layers and num_kv_heads must be positive.")
+        if self.layer_bits and len(self.layer_bits) != num_layers:
+            raise ValueError(
+                "Mixed-bit layer plan length differs from model layer count."
+            )
         if not self.enabled:
             return
         if head_dim & (head_dim - 1) or head_dim <= 0:
@@ -212,10 +378,54 @@ class TurboQuantConfig:
         }
         if self.precomputed_norm:
             data["norm_representation"] = "effective_scale"
+        if self.layer_bits:
+            data["layer_plan"] = {
+                "bits": [list(pair) for pair in self.layer_bits],
+                "policy": self.layer_policy,
+                "codebook_sha256": {
+                    str(bits): CODEBOOK_SHA256[(bits, self.block_size)]
+                    for bits in sorted({s.bits for s in self.codecs})
+                },
+                "average_payload_bits": sum(sum(pair) for pair in self.layer_bits)
+                / len(self.layer_bits),
+                "packing": "msb_first;8bit=uint8_index",
+            }
         if self.enabled:
             # Fixed implementation, not a selectable strategy. Invalidate old
             # broadcast bundles even though the codebook/cache ABI is unchanged.
             data["scalar_indexing"] = "lloyd_tree"
+        if self.structured_k8:
+            from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+                metadata,
+            )
+
+            data["structured_k8"] = metadata()
+            data["scalar_indexing"] = "lloyd_tree_except_structured_k8_arithmetic"
+            if self.layer_bits:
+                data["layer_plan"]["codebook_sha256"]["8"] = metadata()[
+                    "codebook_sha256"
+                ]
+        if self.converged_k8:
+            from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import (
+                metadata,
+            )
+
+            data["converged_k8"] = metadata()
+            if self.layer_bits:
+                data["layer_plan"]["codebook_sha256"]["8"] = metadata()[
+                    "codebook_sha256"
+                ]
+        if self.uniform_k8:
+            from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+                metadata,
+            )
+
+            data["uniform_k8"] = metadata()
+            data["scalar_indexing"] = "lloyd_tree_except_uniform_k8_arithmetic"
+            if self.layer_bits:
+                data["layer_plan"]["codebook_sha256"]["8"] = metadata()[
+                    "codebook_sha256"
+                ]
         if self.fp16_attention:
             data["attention"] = {
                 "kv_storage": "float16",
@@ -248,6 +458,24 @@ class TurboQuantConfig:
                 data[name]["codebook_sha256"] = CODEBOOK_SHA256[
                     (spec.bits, self.block_size)
                 ]
+                if spec.quantizer == "structured_k8_two_region_v1":
+                    from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+                        CODEBOOK_SHA256 as structured_hash,
+                    )
+
+                    data[name]["codebook_sha256"] = structured_hash
+                if spec.quantizer == "uniform_k8_gaussian_v1":
+                    from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+                        CODEBOOK_SHA256 as uniform_hash,
+                    )
+
+                    data[name]["codebook_sha256"] = uniform_hash
+                if spec.codebook_variant:
+                    from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import (
+                        CODEBOOK_SHA256 as converged_hash,
+                    )
+
+                    data[name]["codebook_sha256"] = converged_hash
                 if self.rotation == Rotation.FWHT:
                     # Preserve the FWHT sign hashes; indexing identity is separate.
                     data[name]["signs_sha256"] = FWHT_SIGNS_SHA256[
@@ -278,7 +506,7 @@ def _polar(bits: int, seed: int) -> KVCodecSpec:
 
 
 # "k8" names the repo's affine int8 K path, not an 8-bit TurboQuant codec.
-# 3-bit profiles have a host oracle only (no HTP graph).
+# Unscaled legacy 3-bit profiles have a host oracle only (no HTP graph).
 PROFILES: dict[str, TurboQuantConfig] = {
     # Baselines do not rotate; retain their historical metadata/hash.
     "baseline_int8": TurboQuantConfig(
@@ -298,6 +526,20 @@ PROFILES: dict[str, TurboQuantConfig] = {
         format_version=2,
         precomputed_norm=True,
     ),
+    "k5_v3_scaled": TurboQuantConfig(
+        "k5_v3_scaled",
+        _polar(5, KEY_SEED),
+        _polar(3, VALUE_SEED),
+        format_version=2,
+        precomputed_norm=True,
+    ),
+    "k6_v2_scaled": TurboQuantConfig(
+        "k6_v2_scaled",
+        _polar(6, KEY_SEED),
+        _polar(2, VALUE_SEED),
+        format_version=2,
+        precomputed_norm=True,
+    ),
     "k3qjl_v4_scaled": TurboQuantConfig(
         "k3qjl_v4_scaled",
         _polar(3, KEY_SEED),
@@ -311,16 +553,175 @@ PROFILES: dict[str, TurboQuantConfig] = {
 }
 
 
-def get_profile(name: str, rotation: Rotation | None = None) -> TurboQuantConfig:
+for _budget, _period in ((5, 4), (6, 2)):
+    _name = f"mixed_k{_budget}_v{8 - _budget}_uniform"
+    PROFILES[_name] = TurboQuantConfig(
+        _name,
+        _polar(4, KEY_SEED),
+        _polar(2, VALUE_SEED),
+        format_version=2,
+        precomputed_norm=True,
+        layer_policy="uniform",
+        layer_bits=tuple(
+            (
+                8 if (layer + 1) % _period == 0 else 4,
+                4 if _budget == 5 and layer % 2 else 2,
+            )
+            for layer in range(28)
+        ),
+    )
+PROFILES["k8_v4_scaled"] = TurboQuantConfig(
+    "k8_v4_scaled",
+    _polar(8, KEY_SEED),
+    _polar(4, VALUE_SEED),
+    format_version=2,
+    precomputed_norm=True,
+)
+PROFILES["mixed_k6_v2_uniform_lm8_converged"] = replace(
+    PROFILES["mixed_k6_v2_uniform"],
+    profile="mixed_k6_v2_uniform_lm8_converged",
+    converged_k8=True,
+)
+# Matched-mask performance control only: preserve the converged codebook and
+# every codec setting, changing just the fixed K8 placement. No default change.
+PROFILES["mixed_k6_v2_boundary_lm8_converged"] = replace(
+    PROFILES["mixed_k6_v2_uniform_lm8_converged"],
+    profile="mixed_k6_v2_boundary_lm8_converged",
+    layer_policy="boundary",
+    layer_bits=tuple((8 if layer < 7 or layer >= 21 else 4, 2) for layer in range(28)),
+)
+PROFILES["lm8_converged_v4_scaled"] = replace(
+    PROFILES["k8_v4_scaled"],
+    profile="lm8_converged_v4_scaled",
+    converged_k8=True,
+    key=KVCodecSpec(
+        CodecKind.POLAR, 8, KEY_SEED, codebook_variant="lloyd_max_k8_converged_v1"
+    ),
+)
+PROFILES["mixed_k6_v2_uniform_structured_k8"] = replace(
+    PROFILES["mixed_k6_v2_uniform"],
+    profile="mixed_k6_v2_uniform_structured_k8",
+    structured_k8=True,
+)
+PROFILES["structured_k8_v4_scaled"] = replace(
+    PROFILES["k8_v4_scaled"],
+    profile="structured_k8_v4_scaled",
+    structured_k8=True,
+    key=KVCodecSpec(CodecKind.POLAR, 8, KEY_SEED, "structured_k8_two_region_v1"),
+)
+PROFILES["mixed_k6_v2_uniform_uniform_k8"] = replace(
+    PROFILES["mixed_k6_v2_uniform"],
+    profile="mixed_k6_v2_uniform_uniform_k8",
+    uniform_k8=True,
+)
+PROFILES["uniform_k8_v4_scaled"] = replace(
+    PROFILES["k8_v4_scaled"],
+    profile="uniform_k8_v4_scaled",
+    uniform_k8=True,
+    key=KVCodecSpec(CodecKind.POLAR, 8, KEY_SEED, "uniform_k8_gaussian_v1"),
+)
+
+STRUCTURED_ALLOCATION_PROFILE = "mixed_k6_v2_structured_k8_allocation"
+_STRUCTURED_ALLOCATION_BASE = replace(
+    PROFILES["mixed_k6_v2_uniform_structured_k8"],
+    profile=STRUCTURED_ALLOCATION_PROFILE,
+    layer_policy="nll_allocation",
+)
+
+
+def structured_allocation_plan(k8_layers: object) -> dict[str, Any]:
+    """Create a canonical, hash-checked K8x14/K4x14/V2 allocation artifact.
+
+    The policy describes this opt-in experiment, not its selection objective;
+    fixed masks and NLL-selected masks use the same inference identity scheme.
+    Diagnostic single-layer flips are deliberately not deployable here.
+    """
+    if (
+        not isinstance(k8_layers, list)
+        or len(k8_layers) != 14
+        or any(type(layer) is not int or not 0 <= layer < 28 for layer in k8_layers)
+        or len(set(k8_layers)) != 14
+    ):
+        raise ValueError(
+            "Allocation requires exactly 14 distinct integer layers in [0,27]"
+        )
+    layers = sorted(k8_layers)
+    config = replace(
+        _STRUCTURED_ALLOCATION_BASE,
+        layer_bits=tuple((8 if layer in layers else 4, 2) for layer in range(28)),
+    )
+    return {
+        "profile": STRUCTURED_ALLOCATION_PROFILE,
+        "policy": "nll_allocation",
+        "k8_layers": layers,
+        "bits": [list(pair) for pair in config.layer_bits],
+        "config_hash": config.config_hash(),
+        "config": config.to_dict(),
+    }
+
+
+def get_profile(
+    name: str,
+    rotation: Rotation | None = None,
+    *,
+    layer_plan: dict[str, Any] | None = None,
+) -> TurboQuantConfig:
     """Get a profile; an explicit rotation selects the legacy FWHT rotation."""
     if name == "qjl_reference":
         raise NotImplementedError(
             "qjl_reference is a research option outside the first milestone; "
             "the default path is QJL-off PolarQuant."
         )
-    if name not in PROFILES:
+    lookup = name.replace("_mse", "_uniform") if name.startswith("mixed_") else name
+    if lookup not in PROFILES and name != STRUCTURED_ALLOCATION_PROFILE:
         raise ValueError(
             f"Unknown TurboQuant profile '{name}'. Choose from {sorted(PROFILES)}."
         )
-    config = PROFILES[name]
+    config = (
+        _STRUCTURED_ALLOCATION_BASE
+        if name == STRUCTURED_ALLOCATION_PROFILE
+        else PROFILES[lookup]
+    )
+    if name == STRUCTURED_ALLOCATION_PROFILE:
+        if rotation is not None and rotation != Rotation.DENSE_QR:
+            raise ValueError("Structured allocation requires Dense QR")
+        if layer_plan is None:
+            raise ValueError(
+                "Structured allocation requires its frozen layer-plan JSON"
+            )
+        expected = structured_allocation_plan(layer_plan.get("k8_layers"))
+        if any(layer_plan.get(key) != value for key, value in expected.items()):
+            raise ValueError(
+                "Allocation plan/config/codebook hash or bit budget mismatch"
+            )
+        config = replace(
+            config, layer_bits=tuple(tuple(pair) for pair in expected["bits"])
+        )
+    elif name.endswith("_mse"):
+        if rotation is not None and rotation != config.rotation:
+            raise ValueError(
+                "MSE-selected layer plans are fixed to their Dense rotation."
+            )
+        if (
+            layer_plan is None
+            or layer_plan.get("profile") != name
+            or layer_plan.get("policy") != "attention_mse"
+        ):
+            raise ValueError(
+                "MSE profile requires its frozen, matching layer-plan JSON."
+            )
+        pairs = tuple(tuple(pair) for pair in layer_plan["bits"])
+        if sorted(p[0] for p in pairs) != sorted(
+            p[0] for p in config.layer_bits
+        ) or sorted(p[1] for p in pairs) != sorted(p[1] for p in config.layer_bits):
+            raise ValueError("Layer plan violates the exact mixed-bit budget/quotas.")
+        config = replace(
+            config, profile=name, layer_bits=pairs, layer_policy="attention_mse"
+        )
+        if layer_plan.get("config_hash") != config.config_hash():
+            raise ValueError("Layer plan/config/codebook hash mismatch.")
+    elif layer_plan is not None:
+        raise ValueError(
+            "External layer plans are only accepted for mixed MSE profiles."
+        )
     return replace(config, rotation=rotation) if rotation is not None else config

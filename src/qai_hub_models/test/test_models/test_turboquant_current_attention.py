@@ -25,6 +25,7 @@ from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
 )
 from qai_hub_models.models.templates.llm.turboquant.native_decoder import (
     use_native_decoder,
+    use_structured_arithmetic_decoder,
     with_reference_decoder,
 )
 from qai_hub_models.models.templates.llm.turboquant.packing import (
@@ -42,7 +43,22 @@ from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
 from qai_hub_models.test.test_models import test_turboquant_tiled_attention as fixture
 
 
-@pytest.mark.parametrize("mode", ["full", "tiled", "rotated", "native", "qjl", "fwht"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "full",
+        "tiled",
+        "rotated",
+        "native",
+        "qjl",
+        "fwht",
+        "k5_v3_scaled",
+        "k6_v2_scaled",
+        "k8_v4_scaled",
+        "structured_k8_v4_scaled",
+        "structured_k8_arithmetic",
+    ],
+)
 @pytest.mark.parametrize(("seq", "valid"), [(1, 0), (3, 13), (128, 0)])
 @pytest.mark.parametrize("key_divisor", [None, float(np.sqrt(128))])
 def test_current_cache_values_feed_attention(
@@ -59,12 +75,25 @@ def test_current_cache_values_feed_attention(
         if mode in ("full", "tiled")
         else "k3qjl_v4_scaled"
         if mode == "qjl"
+        else "structured_k8_v4_scaled"
+        if mode == "structured_k8_arithmetic"
+        else mode
+        if mode.startswith(("k", "structured_"))
         else "k4_v4_scaled",
         Rotation.FWHT if mode == "fwht" else Rotation.DENSE_QR,
     )
     model, enc = fixture.attention_part(seq, key_divisor)
     before = apply_kv_profile(model, enc, config, seq, context)
-    native = mode in ("native", "qjl", "fwht")
+    native = mode in (
+        "native",
+        "qjl",
+        "fwht",
+        "k5_v3_scaled",
+        "k6_v2_scaled",
+        "k8_v4_scaled",
+        "structured_k8_v4_scaled",
+        "structured_k8_arithmetic",
+    )
     if mode != "full":
         before = tile_kv_attention(before, config, 7, rotated=mode != "tiled")
     if native:
@@ -73,6 +102,8 @@ def test_current_cache_values_feed_attention(
         before = add_qjl_attention(before, config)
     serialized = before.model.SerializeToString()
     result = quantize_current_attention(before, config)
+    if mode == "structured_k8_arithmetic":
+        result = use_structured_arithmetic_decoder(result, config)
     assert before.model.SerializeToString() == serialized
     assert before.encodings["param_encodings"] == result.encodings["param_encodings"]
     for side in ("input", "output"):
@@ -104,7 +135,7 @@ def test_current_cache_values_feed_attention(
             past_kv[kind] = qref.decode(packed, scale, qscale)
         else:
             indices, scale = ref.encode(x)
-            packed = pack_indices(indices, 4)
+            packed = pack_indices(indices, getattr(config, kind).bits)
             scale = scale.astype(np.float16)
             past_kv[kind] = (
                 ref.rotation.inverse(
@@ -133,7 +164,7 @@ def test_current_cache_values_feed_attention(
                 packed, scale, actual["tq_key_0_qjlscale_out"].astype(np.float16)
             )
         else:
-            indices = unpack_indices(packed, 4, 128)
+            indices = unpack_indices(packed, getattr(config, kind).bits, 128)
             current_kv[kind] = (
                 ref.rotation.inverse(
                     (ref.centroids[indices].astype(np.float16) * scale).astype(

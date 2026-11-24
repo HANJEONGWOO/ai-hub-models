@@ -131,8 +131,11 @@ class PackedPastCache(Cache):
                 "Use the QJL graph/Native oracle; this HF cache does not implement QJL."
             )
 
-        def make(spec_name: str) -> PolarQuantReference | None:
-            spec = getattr(config, spec_name)
+        if config.layer_bits and len(config.layer_bits) != num_layers:
+            raise ValueError("Mixed-bit layer plan differs from the model.")
+
+        def make(spec_name: str, layer: int) -> PolarQuantReference | None:
+            spec = config.codec_for(spec_name, layer)
             if not spec.is_polar:
                 return None
             return PolarQuantReference(
@@ -146,9 +149,12 @@ class PackedPastCache(Cache):
         super().__init__(
             layers=[
                 PackedPastLayer(
-                    make("key"), make("value"), config.norm_dtype, quantize_current_kv
+                    make("key", layer),
+                    make("value", layer),
+                    config.norm_dtype,
+                    quantize_current_kv,
                 )
-                for _ in range(num_layers)
+                for layer in range(num_layers)
             ]
         )
 
@@ -183,20 +189,20 @@ def kv_statistics(cache: Cache, config: TurboQuantConfig) -> dict[str, Any]:
     """Codec quality and float16 risk on the exact KV of one window."""
     stats: dict[str, Any] = {}
     for name in ("key", "value"):
-        spec = getattr(config, name)
-        codec = PolarQuantReference(
-            spec,
-            config.block_size,
-            config.rotation,
-            config.norm_correction,
-            config.precomputed_norm,
-        )
         per_layer = []
         max_norm = 0.0
         near_boundary = 0
         total = 0
         attr = "keys" if name == "key" else "values"
         for layer_idx, layer in enumerate(cache.layers):
+            spec = config.codec_for(name, layer_idx)
+            codec = PolarQuantReference(
+                spec,
+                config.block_size,
+                config.rotation,
+                config.norm_correction,
+                config.precomputed_norm,
+            )
             states = getattr(layer, attr)
             x = states.to("cpu", torch.float64).numpy()
             y, norms = codec.rotate_normalized(x)
@@ -206,6 +212,8 @@ def kv_statistics(cache: Cache, config: TurboQuantConfig) -> dict[str, Any]:
             stored = to_storage_norms(scalars, config.norm_dtype if fits else "float32")
             row = reconstruction_stats(x, codec.decode(indices, stored))
             row["layer"] = layer_idx
+            if config.layer_bits:
+                row["bits"] = spec.bits
             row["max_norm"] = float(norms.max())
             row["min_norm"] = float(norms.min())
             per_layer.append(row)
@@ -214,7 +222,9 @@ def kv_statistics(cache: Cache, config: TurboQuantConfig) -> dict[str, Any]:
             near_boundary += int(np.sum(distance <= HTP_FP16.boundary_distance))
             total += distance.size
         stats[name] = {
-            "bits": spec.bits,
+            "bits": [config.codec_for(name, i).bits for i in range(len(cache.layers))]
+            if config.layer_bits
+            else getattr(config, name).bits,
             "per_layer": per_layer,
             "rel_mse_mean": float(np.mean([r["rel_mse_mean"] for r in per_layer])),
             "cosine_mean": float(np.mean([r["cosine_mean"] for r in per_layer])),

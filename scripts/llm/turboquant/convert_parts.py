@@ -45,6 +45,7 @@ from qai_hub_models.models.templates.llm.turboquant.graph_surgery import (
 )
 from qai_hub_models.models.templates.llm.turboquant.native_decoder import (
     use_native_decoder,
+    use_structured_arithmetic_decoder,
 )
 from qai_hub_models.models.templates.llm.turboquant.qjl import add_qjl_attention
 from qai_hub_models.models.templates.llm.turboquant.tiled_attention import (
@@ -123,7 +124,11 @@ def apply_profile(
 ) -> tuple[Path, Path, dict[str, Any]]:
     """Apply the profile to this graph; baseline graphs are converted as exported."""
     config = get_profile(
-        args.profile, Rotation(args.rotation) if args.rotation else None
+        args.profile,
+        Rotation(args.rotation) if args.rotation else None,
+        layer_plan=json.loads(args.layer_plan.read_text())
+        if getattr(args, "layer_plan", None)
+        else None,
     )
     model = onnx.load(str(onnx_path), load_external_data=False)
     if not config.modifies_graph or not any(
@@ -145,6 +150,8 @@ def apply_profile(
         result = add_qjl_attention(result, config)
     if config.enabled and args.quantize_current_kv:
         result = quantize_current_attention(result, config)
+    if getattr(args, "structured_k8_decoder", "lut") == "arithmetic":
+        result = use_structured_arithmetic_decoder(result, config)
     # Initializers keep their external-data location, so expose the weights file here.
     for data in onnx_path.parent.glob("*.data"):
         link = out / data.name
@@ -342,6 +349,11 @@ def main() -> None:
     parser.add_argument("--context-length", type=int, default=1024)
     parser.add_argument("--profile", default="baseline_int8")
     parser.add_argument(
+        "--layer-plan",
+        type=Path,
+        help="Frozen MSE or Structured K8 allocation JSON (hash checked).",
+    )
+    parser.add_argument(
         "--rotation",
         choices=[r.value for r in Rotation],
         help="PolarQuant rotation (default: dense_qr); fwht reproduces old bundles.",
@@ -384,6 +396,12 @@ def main() -> None:
     )
     parser.add_argument("--parts", type=int, nargs="*", default=[])
     parser.add_argument(
+        "--structured-k8-decoder",
+        choices=("lut", "arithmetic"),
+        default="lut",
+        help="Opt-in HVX arithmetic kernel for Structured K8 only; cache identity is unchanged.",
+    )
+    parser.add_argument(
         "--sequence-lengths", type=int, nargs="+", default=list(SEQUENCE_LENGTHS)
     )
     parser.add_argument("--skip-context", action="store_true")
@@ -395,15 +413,29 @@ def main() -> None:
     parser.add_argument("--sdk", type=Path, default=DEFAULT_SDK)
     parser.add_argument("--qnn-python", type=Path, default=DEFAULT_QNN_PYTHON)
     args = parser.parse_args()
-    scaled = args.profile in ("k4_v4_scaled", "k3qjl_v4_scaled")
+    config = get_profile(
+        args.profile,
+        Rotation(args.rotation) if args.rotation else None,
+        layer_plan=json.loads(args.layer_plan.read_text()) if args.layer_plan else None,
+    )
+    scaled = config.precomputed_norm
     if args.native_decoder is None:
         args.native_decoder = scaled
     if args.native_decoder and not scaled:
-        parser.error("Native Decode4 requires k4_v4_scaled or k3qjl_v4_scaled")
+        parser.error("Native decoder requires a supported scaled profile")
     if args.attention_tile is None:
         args.attention_tile = 256 if scaled else 0
     if args.rotated_attention is None:
         args.rotated_attention = scaled
+    if args.structured_k8_decoder == "arithmetic" and not (
+        config.structured_k8
+        and args.native_decoder
+        and args.rotated_attention
+        and args.attention_tile
+    ):
+        parser.error(
+            "Arithmetic decoder requires Structured K8 with Native rotated tiled attention"
+        )
     if args.native_decoder_package and (not args.native_decoder or not scaled):
         parser.error(
             "--native-decoder-package requires a supported scaled profile "
@@ -417,12 +449,8 @@ def main() -> None:
         parser.error("--context-only and --skip-context are mutually exclusive")
     if args.attention_tile < 0:
         parser.error("--attention-tile must be nonnegative")
-    if args.attention_tile and args.profile not in (
-        "k4_v4",
-        "k4_v4_scaled",
-        "k3qjl_v4_scaled",
-    ):
-        parser.error("--attention-tile requires a k4_v4 or k3qjl_v4_scaled profile")
+    if args.attention_tile and not (scaled or args.profile == "k4_v4"):
+        parser.error("--attention-tile requires k4_v4 or a supported scaled profile")
     if args.rotated_attention and (not scaled or not args.attention_tile):
         parser.error(
             "--rotated-attention requires a supported scaled profile and --attention-tile"
@@ -448,6 +476,20 @@ def main() -> None:
             parser.error(
                 f"Missing native decoder manifest in {args.native_decoder_package}"
             )
+        package_manifest = json.loads(
+            (args.native_decoder_package / "manifest.json").read_text()
+        )
+        required = (
+            {"Decode4"} if config.qjl else {f"Decode{s.bits}" for s in config.codecs}
+        )
+        if args.structured_k8_decoder == "arithmetic":
+            required.add("Decode8Structured")
+        if config.uniform_k8:
+            required.add("Decode8Uniform")
+        if not required.issubset(package_manifest.get("operations", ["Decode4"])):
+            parser.error(
+                "Native package lacks the selected bit widths; build the updated package and pass --native-decoder-package"
+            )
     buckets = sorted({*args.context_buckets, args.context_length})
     if any(c <= 1 or c > args.context_length for c in buckets):
         parser.error("context buckets must be in [2, context-length]")
@@ -456,12 +498,32 @@ def main() -> None:
     out = args.out.expanduser()
     out.mkdir(parents=True, exist_ok=True)
     manifest = json.loads((split_dir / "split_manifest.json").read_text())
+    if config.layer_bits:
+        layer_ids = {
+            int(m.group(1))
+            for part in manifest["parts"].values()
+            for value in part["inputs"]
+            if (m := re.fullmatch(r"past_key_(\d+)_in", value["name"]))
+        }
+        if layer_ids != set(range(len(config.layer_bits))):
+            raise ValueError(
+                "Mixed layer plan does not cover exactly the split model's KV layers."
+            )
     env = qairt_env(args.sdk, args.qnn_python)
     num_parts = len(manifest["parts"])
     report_path = out / "convert_report.json"
     report = json.loads(report_path.read_text()) if report_path.exists() else {}
+    if (
+        report
+        and report.get("structured_k8_decoder", "lut") != args.structured_k8_decoder
+    ):
+        raise ValueError(
+            "Existing bundle decoder selection mismatch; use a fresh output directory"
+        )
     config = get_profile(
-        args.profile, Rotation(args.rotation) if args.rotation else None
+        args.profile,
+        Rotation(args.rotation) if args.rotation else None,
+        layer_plan=json.loads(args.layer_plan.read_text()) if args.layer_plan else None,
     )
     current_kv = bool(config.enabled and args.quantize_current_kv)
     if report or args.context_only:
@@ -511,6 +573,8 @@ def main() -> None:
         }
     )
     report.setdefault("parts", {})
+    if args.structured_k8_decoder == "arithmetic":
+        report["structured_k8_decoder"] = "arithmetic"
     if "model" in manifest:
         report["model"] = manifest["model"]
         report["split_manifest_sha256"] = sha256_file(split_dir / "split_manifest.json")

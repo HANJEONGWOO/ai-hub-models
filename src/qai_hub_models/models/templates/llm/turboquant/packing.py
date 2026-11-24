@@ -36,6 +36,8 @@ def pack_indices(indices: np.ndarray, bits: int) -> np.ndarray:
         raise TypeError(f"Indices must be integers, got {indices.dtype}.")
     if indices.size and (indices.min() < 0 or indices.max() >= 1 << bits):
         raise ValueError(f"Index out of range for {bits}-bit packing.")
+    if bits == 8:
+        return indices.astype(np.uint8, copy=True)
     shifts = np.arange(bits - 1, -1, -1, dtype=np.uint8)
     bit_planes = (indices.astype(np.uint8)[..., np.newaxis] >> shifts) & 1
     stream = bit_planes.reshape(*indices.shape[:-1], indices.shape[-1] * bits)
@@ -56,6 +58,8 @@ def unpack_indices(
             f"Expected {expected} bytes for {num_values} {bits}-bit values, "
             f"got {packed.shape[-1]}."
         )
+    if bits == 8:
+        return packed.copy()
     stream = np.unpackbits(packed, axis=-1, bitorder="big")
     if strict and np.any(stream[..., num_values * bits :]):
         raise ValueError("Non-zero padding bits; packed data is corrupt or mislabeled.")

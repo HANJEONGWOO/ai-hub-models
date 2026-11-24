@@ -29,6 +29,7 @@ from htp_codec_validation import (
 from onnx import TensorProto, helper, numpy_helper
 
 from qai_hub_models.models.templates.llm.turboquant.constants import CODEBOOK_HEX
+from qai_hub_models.models.templates.llm.turboquant.packing import unpack_indices
 
 
 def build(args: argparse.Namespace) -> None:
@@ -37,27 +38,69 @@ def build(args: argparse.Namespace) -> None:
     sdkbin = args.sdk / "bin/x86_64-linux-clang"
     env = qairt_env(args.sdk, args.qnn_python)
     centroids = np.array(
-        [float.fromhex(x) for x in CODEBOOK_HEX[3 if args.lut == "mse3" else 4, 128]],
+        [
+            float.fromhex(x)
+            for x in CODEBOOK_HEX[3 if args.lut == "mse3" else args.bits, 128]
+        ],
         dtype=np.float16,
     )
     if args.lut == "mse3":
         centroids = np.tile(centroids, 2)
+    elif args.lut == "structured_k8":
+        from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+            codebook,
+        )
+
+        if args.bits != 8:
+            raise ValueError("Structured K8 LUT requires 8 bits")
+        centroids = codebook().astype(np.float16)
+    elif args.lut == "uniform_k8":
+        from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import codebook
+
+        if args.bits != 8:
+            raise ValueError("Uniform K8 requires 8 bits")
+        centroids = codebook().astype(np.float16)
+    elif args.lut == "lm8_converged":
+        from qai_hub_models.models.templates.llm.turboquant.lloyd_max_k8 import codebook
+
+        if args.bits != 8:
+            raise ValueError("Converged LM8 requires 8 bits")
+        centroids = codebook().astype(np.float16)
     elif args.lut == "qjl_sign":
         centroids = np.repeat(np.array([-1, 1], dtype=np.float16), 8)
+    arithmetic = getattr(args, "structured_arithmetic", False)
+    params = centroids
+    if arithmetic:
+        from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+            coefficients,
+        )
+
+        params = coefficients().astype(np.float16)
+    op = "Decode8Structured" if arithmetic else f"Decode{args.bits}"
+    if getattr(args, "uniform_arithmetic", False):
+        from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+            coefficients,
+        )
+
+        params = coefficients().astype(np.float16)
+        arithmetic = True
+        op = "Decode8Uniform"
+    parameter_name = "coefficients" if arithmetic else "centroids"
     (work / "lut.json").write_text(
-        json.dumps({"kind": args.lut, "values": centroids.tolist()}) + "\n"
+        json.dumps({"kind": args.lut, "bits": args.bits, "values": centroids.tolist()})
+        + "\n"
     )
     for tokens in args.tokens:
         name = f"native_t{tokens}"
-        packed_shape, scale_shape = [8, 1, tokens, 64], [8, 1, tokens, 1]
+        packed_shape, scale_shape = [8, 1, tokens, 16 * args.bits], [8, 1, tokens, 1]
         graph = helper.make_graph(
             [
                 helper.make_node(
-                    "Decode4",
-                    ["packed", "scale", "centroids"],
+                    op,
+                    ["packed", "scale", parameter_name],
                     ["decoded"],
                     domain="turboquant",
-                    name="decode4",
+                    name=op.lower(),
                 )
             ],
             name,
@@ -74,7 +117,7 @@ def build(args: argparse.Namespace) -> None:
                     "decoded", TensorProto.FLOAT16, [8, 1, tokens, 128]
                 )
             ],
-            [numpy_helper.from_array(centroids.reshape(1, 1, 1, 16), "centroids")],
+            [numpy_helper.from_array(params.reshape(1, 1, 1, -1), parameter_name)],
         )
         model = helper.make_model(
             graph,
@@ -94,9 +137,36 @@ def build(args: argparse.Namespace) -> None:
         )
         scale = np.exp(rng.uniform(-5, 8, scale_shape)).astype(np.float16)
         scale.flat[:6] = [0, 1, 2**-14, 2**-10, 32, 65504]
-        indices = np.stack((packed >> 4, packed & 15), axis=-1).reshape(
-            8, 1, tokens, 128
-        )
+        if getattr(args, "scale_edges", False):
+            # Pair rows so every byte code is checked under every edge scale.
+            special = np.array(
+                [
+                    0,
+                    0x8000,
+                    1,
+                    0x03FF,
+                    0x0400,
+                    0x0401,
+                    0x3BFF,
+                    0x3C00,
+                    0x3C01,
+                    0x4000,
+                    0x5000,
+                    0x7BFF,
+                    0x8001,
+                    0x83FF,
+                    0x8400,
+                    0xBC00,
+                    0xFBFF,
+                ],
+                np.uint16,
+            ).view(np.float16)
+            for row in range(min(scale.size, 2 * special.size)):
+                scale.flat[row] = special[row // 2]
+                packed.reshape(-1, 128)[row] = (
+                    np.arange(128) + 128 * (row % 2)
+                ).astype(np.uint8)
+        indices = unpack_indices(packed, args.bits, 128)
         expected = (
             centroids[indices].astype(np.float32) * scale.astype(np.float32)
         ).astype(np.float16)
@@ -177,9 +247,15 @@ def build(args: argparse.Namespace) -> None:
                 str(backend),
                 "--log_level",
                 "verbose",
+                *(
+                    ["--profiling_level", "detailed", "--profiling_option", "optrace"]
+                    if getattr(args, "optrace", False)
+                    else []
+                ),
             ],
             work / f"{name}.ctxgen.log",
             env,
+            cwd=work,
         )
         print(f"Built {name}", flush=True)
 
@@ -200,13 +276,19 @@ def run(args: argparse.Namespace) -> None:
     for path in work.iterdir():
         if path.suffix in (".bin", ".raw", ".txt"):
             adb(args, "push", windows_path(path), remote + "/")
-    prefix = f"cd {shlex.quote(remote)} && export LD_LIBRARY_PATH={shlex.quote(remote)}:/vendor/lib64 && export ADSP_LIBRARY_PATH={shlex.quote(remote)}:/vendor/dsp/cdsp:/vendor/lib/rfsa/adsp:/system/lib/rfsa/adsp:/dsp"
+    adsp_paths = (
+        f"{remote};/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp"
+    )
+    prefix = f"cd {shlex.quote(remote)} && export LD_LIBRARY_PATH={shlex.quote(remote)}:/vendor/lib64 && export ADSP_LIBRARY_PATH={shlex.quote(adsp_paths)}"
     (work / "device").mkdir(exist_ok=True)
     for tokens in args.tokens:
         name = f"native_t{tokens}"
         rc, log = adb_shell_rc(
             args,
-            f"{prefix} && ./qnn-net-run --backend libQnnHtp.so --retrieve_context {name}.bin --op_packages libTurboQuantNative.so:TurboQuantInterfaceProvider --input_list {name}_inputs.txt --use_native_input_files --use_native_output_files --output_dir out_{name} --profiling_level detailed --log_level verbose",
+            f"{prefix} && ./qnn-net-run --backend libQnnHtp.so --retrieve_context {name}.bin --op_packages libTurboQuantNative.so:TurboQuantInterfaceProvider --input_list {name}_inputs.txt --use_native_input_files --use_native_output_files --output_dir out_{name} --profiling_level detailed --log_level verbose"
+            + (
+                " --profiling_option optrace" if getattr(args, "optrace", False) else ""
+            ),
         )
         (work / f"{name}.device.log").write_text(log)
         if rc:
@@ -227,6 +309,10 @@ def compare(args: argparse.Namespace) -> None:
         actual = np.fromfile(paths[0], dtype=np.float16).reshape(expected.shape)
         diff = np.abs(actual.astype(np.float64) - expected.astype(np.float64))
         passed = bool(np.allclose(actual, expected, rtol=0.001, atol=2**-24))
+        if getattr(args, "strict_bit_exact", False):
+            passed = bool(
+                np.array_equal(actual.view(np.uint16), expected.view(np.uint16))
+            )
         reports[name] = {
             "passed": passed,
             "max_abs_error": float(diff.max()),
@@ -249,7 +335,28 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=[3])
-    parser.add_argument("--lut", choices=["mse4", "mse3", "qjl_sign"], default="mse4")
+    parser.add_argument("--bits", type=int, choices=list(range(2, 9)), default=4)
+    parser.add_argument("--structured-arithmetic", action="store_true")
+    parser.add_argument("--uniform-arithmetic", action="store_true")
+    parser.add_argument("--scale-edges", action="store_true")
+    parser.add_argument("--strict-bit-exact", action="store_true")
+    parser.add_argument(
+        "--optrace",
+        action="store_true",
+        help="Separate diagnostic execution with physical HVX trace",
+    )
+    parser.add_argument(
+        "--lut",
+        choices=[
+            "mse4",
+            "mse3",
+            "qjl_sign",
+            "structured_k8",
+            "lm8_converged",
+            "uniform_k8",
+        ],
+        default="mse4",
+    )
     parser.add_argument(
         "--device-dir", default="/data/local/tmp/qaihm_turboquant/native_smoke_20260918"
     )
@@ -258,6 +365,25 @@ def main() -> None:
     parser.add_argument("--ndk", type=Path, default=DEFAULT_NDK)
     parser.add_argument("--adb", type=Path, default=DEFAULT_ADB)
     args = parser.parse_args()
+    # Context generation runs inside the probe directory to contain schematics.
+    # Resolve CLI paths before changing cwd, including user-supplied relative ones.
+    for name in ("work_dir", "package", "sdk"):
+        setattr(args, name, getattr(args, name).resolve())
+    # Resolving a venv interpreter symlink selects /usr/bin/python and loses
+    # the SDK virtualenv. Make it absolute without dereferencing the executable.
+    args.qnn_python = args.qnn_python.expanduser().absolute()
+    if args.bits != 4 and args.lut in ("mse3", "qjl_sign"):
+        parser.error("QJL nibble LUT variants require --bits 4")
+    if args.structured_arithmetic and (args.bits != 8 or args.lut != "structured_k8"):
+        parser.error("Arithmetic decoder requires --bits 8 --lut structured_k8")
+    if args.uniform_arithmetic and (
+        args.structured_arithmetic or args.bits != 8 or args.lut != "uniform_k8"
+    ):
+        parser.error(
+            "Uniform arithmetic requires --bits 8 --lut uniform_k8 exclusively"
+        )
+    if args.scale_edges and args.bits != 8:
+        parser.error("Edge-scale probe requires byte indices")
     for stage in ("build", "run", "compare"):
         if args.stage in (stage, "all"):
             globals()[stage](args)

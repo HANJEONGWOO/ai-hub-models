@@ -83,6 +83,24 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
     info = parse_dlcinfo(bundle / f"{name}.dlcinfo.txt")
     if not info.ops or not all(info.io_tables.values()):
         raise ValueError("Missing/incomplete DLC op or I/O tables.")
+    conversion = json.loads((bundle / "convert_report.json").read_text())
+    config = conversion["config"]
+
+    def expected_decoder(kind: str, layer: int) -> str:
+        bits = 4 if config.get("qjl") and kind == "key" else config[kind]["bits"]
+        if plan := config.get("layer_plan"):
+            bits = plan["bits"][layer][kind == "value"]
+        if config.get("uniform_k8") and kind == "key" and bits == 8:
+            return "Decode8Uniform"
+        if (
+            conversion.get("structured_k8_decoder") == "arithmetic"
+            and kind == "key"
+            and bits == 8
+            and config.get("structured_k8")
+        ):
+            return "Decode8Structured"
+        return f"Decode{bits}"
+
     errors: list[str] = []
     sizes: list[int] = []
     for io in manifest["codec_io"]:
@@ -220,7 +238,7 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                     native = info.producer.get(prefix + "native_fp16")
                     if (
                         native is None
-                        or native.op_type != "Decode4"
+                        or native.op_type != expected_decoder(kind, number)
                         or [t.dtype for t in native.inputs]
                         != ["Uint_8", "Float_16", "Float_16"]
                         or [t.dtype for t in native.outputs] != ["Float_16"]
@@ -261,8 +279,6 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                     if elements > layer["kv_heads"] * layer["tile_tokens"] * 128:
                         errors.append(f"Oversized rotated KV tile: {t.name}")
     graph = onnx.load(bundle / f"{name}.onnx", load_external_data=False).graph
-    conversion = json.loads((bundle / "convert_report.json").read_text())
-    config = conversion["config"]
     current_entries = manifest.get("current_kv_attention", [])
     if conversion.get("quantize_current_kv", False):
         if len(current_entries) != len(manifest["codec_io"]):
@@ -279,7 +295,8 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                 decoder = info.producer.get(prefix + "native_fp16")
                 if (
                     decoder is None
-                    or decoder.op_type != "Decode4"
+                    or decoder.op_type
+                    != expected_decoder(entry["kind"], entry["layer"])
                     or [t.dtype for t in decoder.inputs]
                     != ["Uint_8", "Float_16", "Float_16"]
                     or decoder.inputs[0].name != entry["packed"]
@@ -313,7 +330,20 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
                     errors.append(f"Current QJL correction is missing: {prefix}")
     elif current_entries:
         errors.append("Current-token policy disagrees with graph manifest.")
-    current = get_profile(conversion["profile"], Rotation(config["rotation"]))
+    plan = config.get("layer_plan")
+    current = get_profile(
+        conversion["profile"],
+        Rotation(config["rotation"]),
+        layer_plan={
+            **plan,
+            "profile": conversion["profile"],
+            "config_hash": conversion["config_hash"],
+            "k8_layers": [i for i, pair in enumerate(plan["bits"]) if pair[0] == 8],
+            "config": config,
+        }
+        if plan and plan["policy"] in ("attention_mse", "nll_allocation")
+        else None,
+    )
     if current.config_hash() != conversion["config_hash"]:
         errors.append("Bundle rotation/config hash does not match current constants.")
     errors.extend(verify_rotations(graph, config))
@@ -371,7 +401,9 @@ def verify_graph(bundle: Path, name: str) -> dict[str, Any]:
         "past_tokens": layers[0]["past_tokens"],
         "new_tokens": layers[0]["new_tokens"],
         "max_rotated_intermediate_bytes": max(sizes, default=0),
-        "native_decoder_ops": sum(op.op_type == "Decode4" for op in info.ops),
+        "native_decoder_ops": sum(
+            op.op_type in {f"Decode{b}" for b in range(2, 9)} for op in info.ops
+        ),
         "rotation": config["rotation"],
         "quantize_current_kv": conversion.get("quantize_current_kv", False),
         "current_kv_decoders": len(current_entries),

@@ -29,7 +29,6 @@ def main() -> None:
     parser.add_argument(
         "--groups",
         nargs="+",
-        choices=("fp16", "turboquant"),
         default=["fp16", "turboquant"],
     )
     parser.add_argument("--adb", type=Path, default=Path("/mnt/c/adb/adb.exe"))
@@ -37,6 +36,12 @@ def main() -> None:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.root.name):
         raise ValueError("Root basename must be safe for a device directory")
     reference = read(args.reference_reports / "experiment.json")
+    for group in args.groups:
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_-]+", group)
+            or group not in reference["groups"]
+        ):
+            raise ValueError("Unknown or unsafe group " + group)
 
     def adb(*command: str) -> str:
         return subprocess.check_output([str(args.adb), *command], text=True).strip()
@@ -74,7 +79,20 @@ def main() -> None:
         bundle = Path(record["bundle"])
         if digest(bundle / "convert_report.json") != record["conversion_sha256"]:
             raise ValueError("Changed source conversion")
-        return bundle, read(bundle / "convert_report.json")
+        source = read(bundle / "convert_report.json")
+        if override := record.get("native_runtime_package"):
+            from run_device_llm import native_runtime_package
+
+            manifest = Path(override) / "manifest.json"
+            if digest(manifest) != record["native_runtime_manifest_sha256"]:
+                raise ValueError("Runtime package manifest changed")
+            package, provenance = native_runtime_package(
+                source.get("native_decoder"),
+                Path(override),
+                Path(source["native_decoder"]["qairt_sdk"]),
+            )
+            source = {**source, **provenance, "native_decoder": package}
+        return bundle, source
 
     def checked_context(group: str, part: int) -> tuple[Path, dict]:
         path = args.root / group / f"part{part}_of_4"
@@ -160,6 +178,25 @@ def main() -> None:
                 "An inference was already attempted; inspect it, do not repeat"
             )
         bundle, source = source_for(group)
+        record = reference["groups"][group]
+        old_path = Path(
+            record.get(
+                "reference_report", args.reference_reports / f"{group}_long_once.json"
+            )
+        )
+        if (expected := record.get("reference_report_sha256")) and digest(
+            old_path
+        ) != expected:
+            raise ValueError("Unprofiled reference changed")
+        old = read(old_path)
+        if old.get("config_hash") != source.get("config_hash"):
+            raise ValueError("Reference configuration differs")
+        if (
+            source.get("native_decoder")
+            and old.get("native_decoder", {}).get("sha256")
+            != source["native_decoder"]["libraries"]["hexagon-v81"]["sha256"]
+        ):
+            raise ValueError("Reference and profiled runtime kernels differ")
         name = args.root.name + "_" + group
         remote = f"{DEVICE_ROOT}/bundles/{name}"
         adb("shell", f"test ! -e {remote} && mkdir -p {remote}")
@@ -183,6 +220,9 @@ def main() -> None:
         }
         if package := native(source, remote):
             runtime["native_decoder"] = package
+        for key in ("compiled_native_decoder", "native_runtime_override"):
+            if key in source:
+                runtime[key] = source[key]
         runtime_path = output / f"{group}_runtime_manifest.json"
         save_new(runtime_path, runtime)
         push(runtime_path, remote + "/runtime_manifest.json")
@@ -191,6 +231,8 @@ def main() -> None:
         )
         identity = {
             "diagnostic_only": True,
+            "reference_report": str(old_path),
+            "reference_report_sha256": digest(old_path),
             "source_bundle": str(bundle),
             "contexts": contexts,
             "device_bundle": name,
@@ -250,7 +292,6 @@ def main() -> None:
             or len(data["generated"]) != 128
         ):
             raise ValueError("Incomplete profiled session")
-        old = read(args.reference_reports / f"{group}_long_once.json")
         temperature = re.search(
             r"^\s*temperature:\s*(\d+)", adb("shell", "dumpsys battery"), re.MULTILINE
         )

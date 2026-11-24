@@ -59,6 +59,8 @@ def main() -> None:
     }
     manifest = {
         "package": "TurboQuantNative",
+        "operations": [f"Decode{bits}" for bits in range(2, 9)]
+        + ["Decode8Structured", "Decode8Uniform"],
         "interface": "TurboQuantInterfaceProvider",
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "source_files": {
@@ -80,6 +82,26 @@ def main() -> None:
         print(f"Built {output}", flush=True)
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     if args.test_hvx:
+        import numpy as np
+
+        from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+            codebook,
+            coefficients,
+        )
+
+        reference = args.out / "structured_reference.fp16"
+        np.r_[coefficients(), codebook()].astype("<f2").tofile(reference)
+        from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+            codebook as uniform_codebook,
+        )
+        from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import (
+            coefficients as uniform_coefficients,
+        )
+
+        uniform_reference = args.out / "uniform_reference.fp16"
+        np.r_[uniform_coefficients(), uniform_codebook()].astype("<f2").tofile(
+            uniform_reference
+        )
         libnative = args.hexagon_tools / "libnative"
         executable = args.out / "test_hvx"
         subprocess.run(
@@ -101,7 +123,9 @@ def main() -> None:
             ],
             check=True,
         )
-        subprocess.run([str(executable)], check=True)
+        subprocess.run(
+            [str(executable), str(reference), str(uniform_reference)], check=True
+        )
 
 
 if __name__ == "__main__":

@@ -2,20 +2,22 @@
 # Copyright (c) 2026 Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------
-"""ONNX lowering of 4-bit PolarQuant encode/decode (format version 1).
+"""ONNX lowering of PolarQuant encode/decode (4-bit legacy; scaled 2..8-bit).
 
 The subgraphs use only ops the QNN HTP backend implements for FP16/INT32 tensors
 (QAIRT 2.48 op-def supplement): HTP has no bitwise ops and no UINT_8 arithmetic,
-so indices use an exact Lloyd-Max comparison tree (four levels for 4-bit,
-three for QJL's 3-bit MSE stage), without an expanded threshold axis. They are
-packed as ``hi * 16 + lo`` in INT32 and only then cast to UINT8. Decode unpacks nibbles
+so indices use an exact Lloyd-Max comparison tree (one level per bit), without
+an expanded threshold axis. Four-bit uses ``hi * 16 + lo`` in INT32; asymmetric
+profiles pack continuous MSB-first streams with power-of-two fragment arithmetic.
+Both sum bytes in INT32 before casting to UINT8. Decode unpacks codes
 with exact float arithmetic and selects symmetric centroid pairs with small
 elementwise subgraphs. This avoids scalar ``Gather`` and the 15-fold expansion
 of the original threshold ladder. Tensors stay rank <= 4, with head_dim as
 the innermost axis of comparisons so HTP can vectorise them.
 
 Layout: float tensors are ``[lead0, lead1, tokens, head_dim]``; packed tensors
-``[lead0, lead1, tokens, head_dim // 2]`` uint8; norms ``[lead0, lead1, tokens, 1]``.
+``[lead0, lead1, tokens, head_dim * storage_bits // 8]`` uint8;
+norms ``[lead0, lead1, tokens, 1]``.
 Standalone graphs default to ``lead = (1, heads)``; ``head_major=True`` models
 the delta-KV layout ``(kv_heads, 1, tokens, head_dim)``. Internally both use
 one batch, with reshapes at the boundary preserving the external layout.
@@ -41,6 +43,7 @@ from qai_hub_models.models.templates.llm.turboquant.reference import (
     load_boundaries,
     load_codebook,
     make_rotation,
+    spec_codebook,
 )
 
 OPSET = 17
@@ -76,10 +79,12 @@ class Subgraph:
 
 
 def _check_supported(spec: KVCodecSpec, config: TurboQuantConfig) -> None:
-    if not spec.is_polar or (spec.bits != 4 and not (config.qjl and spec.bits == 3)):
-        raise NotImplementedError("ONNX lowering exists only for 4-bit PolarQuant.")
-    if config.block_size % 2:
-        raise ValueError("4-bit packing needs an even block size.")
+    if not spec.is_polar or (spec.bits != 4 and not config.precomputed_norm):
+        raise NotImplementedError(
+            "ONNX lowering requires 4-bit or scaled 2..8-bit PolarQuant."
+        )
+    if config.block_size % 8:
+        raise ValueError("Packed codecs require a block size divisible by eight.")
 
 
 def _scalars(sg: Subgraph) -> tuple[str, str, str]:
@@ -110,8 +115,122 @@ def byte_centroid_lut(bits: int, block_size: int) -> np.ndarray:
     return np.stack((centroids[values >> 4], centroids[values & 0xF]), axis=1)
 
 
+def _structured_arithmetic(
+    sg: Subgraph, src: str, prefix: str, *, centroid: bool = False
+) -> str:
+    """Two-region index/centroid without a boundary axis, tree or LUT search."""
+    from qai_hub_models.models.templates.llm.turboquant.structured_k8 import (
+        coefficients,
+        region_boundary,
+    )
+
+    a, h, b, t = coefficients()
+
+    def c(name: str, value: float) -> str:
+        return sg.const("tq_structured_k8_" + name, np.array(value, np.float32))
+
+    def n(op: str, inputs: list[str], name: str, **attrs: Any) -> str:
+        out = prefix + name
+        sg.node(op, inputs, [out], **attrs)
+        return out
+
+    def fp16(x: str, name: str) -> str:
+        half = n("Cast", [x], name + "16", to=TensorProto.FLOAT16)
+        return n("Cast", [half], name, to=TensorProto.FLOAT)
+
+    zero, one = c("zero", 0), c("one", 1)
+    if centroid:
+        center = n("Sub", [src, c("center", 127.5)], "centered")
+        mag = n("Sub", [n("Abs", [center], "abs"), c("half", 0.5)], "magnitude")
+        region = n("Greater", [mag, c("last_central", 63)], "region")
+        positive = n("GreaterOrEqual", [src, c("sign_edge", 128)], "positive")
+    else:
+        mag = n("Abs", [src], "magnitude")
+        region = n("Greater", [mag, c("region_boundary", region_boundary())], "region")
+        positive = n("GreaterOrEqual", [src, zero], "positive")
+    r = n("Cast", [region], "region_f", to=TensorProto.FLOAT)
+    inverse = n("Sub", [one, r], "region_inverse")
+
+    def choice(label: str, central: float, tail: float) -> str:
+        lo = n("Mul", [inverse, c(label + "0", central)], label + "_lo")
+        hi = n("Mul", [r, c(label + "1", tail)], label + "_hi")
+        return n("Add", [lo, hi], label)
+
+    offset = choice("offset", a, b)
+    region_code = n("Mul", [r, c("region_stride", 64)], "region_code")
+    if centroid:
+        local = n("Sub", [mag, region_code], "local")
+        step = choice("step", h, t)
+        product = fp16(n("Mul", [local, step], "local_product"), "rounded_product")
+        value = fp16(n("Add", [product, offset], "unsigned"), "rounded_unsigned")
+        negative = n("Neg", [value], "negative")
+        return n("Where", [positive, value, negative], "centroid")
+    reciprocal = choice("reciprocal", 1 / h, 1 / t)
+    shifted = n("Sub", [mag, offset], "shifted")
+    position = n("Mul", [shifted, reciprocal], "position")
+    nearest = n("Add", [position, c("half", 0.5)], "nearest")
+    floored = n("Floor", [nearest], "floor")
+    local = n("Clip", [floored, zero, c("last_central", 63)], "local")
+    magnitude_code = n("Add", [local, region_code], "magnitude_code")
+    pos = n("Add", [c("sign_edge", 128), magnitude_code], "positive_code")
+    neg = n("Sub", [c("negative_edge", 127), magnitude_code], "negative_code")
+    index = n("Where", [positive, pos, neg], "index_f")
+    return n("Cast", [index], "index_i32", to=TensorProto.INT32)
+
+
+def _quantizer_arithmetic(
+    sg: Subgraph, src: str, prefix: str, quantizer: str, *, centroid: bool = False
+) -> str:
+    if quantizer == "structured_k8_two_region_v1":
+        return _structured_arithmetic(sg, src, prefix, centroid=centroid)
+    if quantizer != "uniform_k8_gaussian_v1":
+        raise ValueError("Unknown arithmetic K8 quantizer")
+    from qai_hub_models.models.templates.llm.turboquant.uniform_k8 import coefficients
+
+    offset, step = coefficients()
+
+    def c(name: str, value: float) -> str:
+        return sg.const("tq_uniform_k8_" + name, np.array(value, np.float32))
+
+    def n(op: str, inputs: list[str], name: str, **attrs: Any) -> str:
+        out = prefix + name
+        sg.node(op, inputs, [out], **attrs)
+        return out
+
+    def half(value: str, name: str) -> str:
+        narrowed = n("Cast", [value], name + "16", to=TensorProto.FLOAT16)
+        return n("Cast", [narrowed], name, to=TensorProto.FLOAT)
+
+    if centroid:
+        center = n("Sub", [src, c("center", 127.5)], "centered")
+        local = n("Sub", [n("Abs", [center], "abs"), c("half", 0.5)], "magnitude")
+        positive = n("GreaterOrEqual", [src, c("sign_edge", 128)], "positive")
+        product = half(
+            n("Mul", [local, c("step", step)], "local_product"), "rounded_product"
+        )
+        value = half(
+            n("Add", [product, c("offset", offset)], "unsigned"), "rounded_unsigned"
+        )
+        return n("Where", [positive, value, n("Neg", [value], "negative")], "centroid")
+    magnitude = n("Abs", [src], "magnitude")
+    position = n("Mul", [magnitude, c("reciprocal", 1 / step)], "position")
+    local = n(
+        "Clip", [n("Floor", [position], "floor"), c("zero", 0), c("last", 127)], "local"
+    )
+    positive = n("GreaterOrEqual", [src, c("zero", 0)], "positive")
+    pos = n("Add", [c("sign_edge", 128), local], "positive_code")
+    neg = n("Sub", [c("last", 127), local], "negative_code")
+    index = n("Where", [positive, pos, neg], "index_f")
+    return n("Cast", [index], "index_i32", to=TensorProto.INT32)
+
+
 def _scalar_index_tree(
-    sg: Subgraph, src: str, bits: int, block_size: int, prefix: str
+    sg: Subgraph,
+    src: str,
+    bits: int,
+    block_size: int,
+    prefix: str,
+    codebook_override: np.ndarray | None = None,
 ) -> str:
     """Exact ``searchsorted(boundaries, src, side='left')``, same shape as src.
 
@@ -120,9 +239,13 @@ def _scalar_index_tree(
     Leaf selection uses bit*hi + (1-bit)*lo: static/static Where fails HTP
     detailed execution, while lo + bit*(hi-lo) can shift FP16 boundaries.
     """
-    if bits not in (3, 4):
-        raise ValueError("Scalar tree requires the frozen 3/4-bit codebook.")
-    boundaries = load_boundaries(bits, block_size).astype(np.float32)
+    if bits not in range(2, 9):
+        raise ValueError("Scalar tree requires a frozen 2..8-bit codebook.")
+    boundaries = (
+        load_boundaries(bits, block_size)
+        if codebook_override is None
+        else (codebook_override[:-1] + codebook_override[1:]) / 2
+    ).astype(np.float32)
 
     def constant(name: str, value: float) -> str:
         return sg.const(
@@ -179,6 +302,111 @@ def _scalar_index_tree(
     for level, term in enumerate(terms[1:], 1):
         index = node("Add", [index, term], f"sum{level}")
     return index
+
+
+def storage_bits(config: TurboQuantConfig, spec: KVCodecSpec) -> int:
+    """QJL's K3 base still occupies a nibble together with its sign bit."""
+    return 4 if config.qjl and spec == config.key else spec.bits
+
+
+def _repack(
+    sg: Subgraph,
+    src: str,
+    in_bits: int,
+    out_bits: int,
+    heads: int,
+    tokens: int,
+    d: int,
+    lead: tuple[int, int],
+    prefix: str,
+    *,
+    integer_output: bool = False,
+) -> str:
+    """MSB-first stream regrouping using exact small power-of-two arithmetic.
+
+    Groups cover eight scalar codes (bits bytes). No intermediate exceeds 255,
+    so FP16 arithmetic is exact. All tensors have rank <= 4. The 4-bit legacy
+    path deliberately retains its existing faster nibble implementation.
+    """
+    p = prefix
+    group_bits = in_bits * out_bits
+    in_count, out_count = group_bits // in_bits, group_bits // out_bits
+    groups = d // 8
+    sg.node("Cast", [src], [p + "float"], to=TensorProto.FLOAT)
+    sg.node(
+        "Reshape",
+        [p + "float", sg.shape([heads, tokens, groups * in_count])],
+        [p + "flat"],
+    )
+
+    def number(n: float) -> str:
+        return sg.const(f"tq_repack_f_{n:g}", np.array(n, np.float32))
+
+    inputs = []
+    for i in range(in_count):
+        name = p + f"input{i}"
+        sg.node(
+            "Slice",
+            [
+                p + "flat",
+                sg.shape([i]),
+                sg.shape([groups * in_count]),
+                sg.shape([2]),
+                sg.shape([in_count]),
+            ],
+            [name],
+        )
+        inputs.append(name)
+    columns = []
+    for o in range(out_count):
+        terms = []
+        for i in range(in_count):
+            lo, hi = (
+                max(i * in_bits, o * out_bits),
+                min((i + 1) * in_bits, (o + 1) * out_bits),
+            )
+            if lo >= hi:
+                continue
+            tag = p + f"o{o}_i{i}_"
+            term = inputs[i]
+            right = (i + 1) * in_bits - hi
+            if right:
+                sg.node("Mul", [term, number(2.0**-right)], [tag + "divide"])
+                sg.node("Floor", [tag + "divide"], [tag + "shift"])
+                term = tag + "shift"
+            if lo > i * in_bits:
+                sg.node("Mul", [term, number(2.0 ** -(hi - lo))], [tag + "upper_frac"])
+                sg.node("Floor", [tag + "upper_frac"], [tag + "upper"])
+                sg.node(
+                    "Mul",
+                    [tag + "upper", number(2 ** (hi - lo))],
+                    [tag + "upper_shift"],
+                )
+                sg.node("Sub", [term, tag + "upper_shift"], [tag + "masked"])
+                term = tag + "masked"
+            left = (o + 1) * out_bits - hi
+            if left:
+                sg.node("Mul", [term, number(2**left)], [tag + "left"])
+                term = tag + "left"
+            if integer_output:
+                sg.node("Cast", [term], [tag + "i32"], to=TensorProto.INT32)
+                term = tag + "i32"
+            terms.append(term)
+        total = terms[0]
+        for j, term in enumerate(terms[1:], 1):
+            output = p + f"o{o}_sum{j}"
+            sg.node("Add", [total, term], [output])
+            total = output
+        col = p + f"column{o}"
+        sg.node("Reshape", [total, sg.shape([heads, tokens, groups, 1])], [col])
+        columns.append(col)
+    sg.node("Concat", columns, [p + "columns"], axis=3)
+    sg.node(
+        "Reshape",
+        [p + "columns", sg.shape([*lead, tokens, groups * out_count])],
+        [p + "output"],
+    )
+    return p + "output"
 
 
 def encode_subgraph(
@@ -269,22 +497,58 @@ def encode_subgraph(
         "MatMul", [f"{p}unit", _rotation_name(sg, config, spec, True)], [f"{p}rotated"]
     )
     # Preserve head_dim as the vectorized innermost axis, without a boundary axis.
-    index = _scalar_index_tree(sg, f"{p}rotated", spec.bits, d, p + "scalar_")
+    index = (
+        _quantizer_arithmetic(sg, f"{p}rotated", p + "scalar_", spec.quantizer)
+        if spec.quantizer != "lloyd_max"
+        else _scalar_index_tree(
+            sg,
+            f"{p}rotated",
+            spec.bits,
+            d,
+            p + "scalar_",
+            spec_codebook(spec, d) if spec.codebook_variant else None,
+        )
+    )
     sg.node(
         "Reshape",
         [index, sg.shape([heads, num_tokens, d])],
         [f"{p}index"],
     )
-    sg.node("Slice", [f"{p}index", start0, end_d, axis2, step2], [f"{p}index_hi"])
-    sg.node("Slice", [f"{p}index", start1, end_d, axis2, step2], [f"{p}index_lo"])
-    sg.node("Mul", [f"{p}index_hi", sixteen], [f"{p}index_hi_shifted"])
-    sg.node("Add", [f"{p}index_hi_shifted", f"{p}index_lo"], [f"{p}byte_i32"])
-    sg.node("Cast", [f"{p}byte_i32"], [f"{p}byte_u8"], to=TensorProto.UINT8)
-    sg.node(
-        "Reshape",
-        [f"{p}byte_u8", sg.shape([*storage_lead, num_tokens, d // 2])],
-        [packed_out],
-    )
+    if storage_bits(config, spec) == 8:
+        # An 8-bit Lloyd-Max index IS the stored byte. No bit regrouping.
+        sg.node("Cast", [f"{p}index"], [f"{p}byte_u8"], to=TensorProto.UINT8)
+        sg.node(
+            "Reshape",
+            [f"{p}byte_u8", sg.shape([*storage_lead, num_tokens, d])],
+            [packed_out],
+        )
+    elif storage_bits(config, spec) == 4:
+        sg.node("Slice", [f"{p}index", start0, end_d, axis2, step2], [f"{p}index_hi"])
+        sg.node("Slice", [f"{p}index", start1, end_d, axis2, step2], [f"{p}index_lo"])
+        sg.node("Mul", [f"{p}index_hi", sixteen], [f"{p}index_hi_shifted"])
+        sg.node("Add", [f"{p}index_hi_shifted", f"{p}index_lo"], [f"{p}byte_i32"])
+        sg.node("Cast", [f"{p}byte_i32"], [f"{p}byte_u8"], to=TensorProto.UINT8)
+        sg.node(
+            "Reshape",
+            [f"{p}byte_u8", sg.shape([*storage_lead, num_tokens, d // 2])],
+            [packed_out],
+        )
+    else:
+        packed = _repack(
+            sg,
+            f"{p}index",
+            spec.bits,
+            8,
+            heads,
+            num_tokens,
+            d,
+            storage_lead,
+            p + "pack_",
+            integer_output=True,
+        )
+        # Integer fragment sums prevent converter folding of adjacent casts
+        # into an unsupported FP16 -> raw UINT8 conversion.
+        sg.node("Cast", [packed], [packed_out], to=TensorProto.UINT8)
     if config.precomputed_norm:
         effective = norm_target
         if config.norm_correction:
@@ -294,13 +558,19 @@ def encode_subgraph(
                 [f"{p}scale_index_f", sg.shape([*lead, num_tokens, d])],
                 [f"{p}scale_index"],
             )
-            y_hat = _select_centroid(
-                sg,
-                f"{p}scale_index",
-                load_codebook(spec.bits, d).astype(np.float32),
-                spec.bits,
-                d,
-                p + "scale_",
+            y_hat = (
+                _quantizer_arithmetic(
+                    sg, f"{p}scale_index", p + "scale_", spec.quantizer, centroid=True
+                )
+                if spec.quantizer != "lloyd_max"
+                else _select_centroid(
+                    sg,
+                    f"{p}scale_index",
+                    spec_codebook(spec, d).astype(np.float32),
+                    spec.bits,
+                    d,
+                    p + "scale_",
+                )
             )
             sg.node("Mul", [y_hat, y_hat], [f"{p}scale_sq"])
             sg.node("ReduceSum", [f"{p}scale_sq", axis3], [f"{p}scale_sum"], keepdims=1)
@@ -325,7 +595,7 @@ def _select_centroid(
     block_size: int,
     prefix: str,
 ) -> str:
-    """Exact 8/16-entry lookup on integer indices, using symmetric affine pairs.
+    """Symmetric affine-pair lookup for frozen 2..8-bit centroid tables.
 
     The frozen codebook is symmetric. Fold indices to magnitudes 0..7, then
     select one of four lines, each interpolating two adjacent centroids.
@@ -333,8 +603,8 @@ def _select_centroid(
     all elementwise operations keep head_dim innermost. Where leaves depend
     on the input (constant-only leaves fail HTP detailed profiling).
     """
-    if bits not in (3, 4) or not np.array_equal(centroids, -centroids[::-1]):
-        raise ValueError("Affine-pair lookup requires a symmetric 3/4-bit codebook.")
+    if bits not in range(2, 9) or not np.array_equal(centroids, -centroids[::-1]):
+        raise ValueError("Affine-pair lookup requires a symmetric 2..8-bit codebook.")
     p = prefix
 
     def scalar(name: str, value: float) -> str:
@@ -342,7 +612,7 @@ def _select_centroid(
 
     count = 1 << bits
     middle = scalar(
-        "tq_index_middle" if bits == 4 else "tq_index_middle_b3", count / 2 - 0.5
+        "tq_index_middle" if bits == 4 else f"tq_index_middle_b{bits}", count / 2 - 0.5
     )
     half = scalar("tq_half_f", 0.5)
     zero = scalar("tq_zero_f", 0.0)
@@ -373,6 +643,21 @@ def _select_centroid(
         if bits == 4
         else (("magnitude", 1.5, "pair1", "pair0"),)
     )
+    if bits not in (3, 4):
+        branches = []
+
+        def branch(start: int, stop: int, label: str) -> str:
+            if stop - start == 1:
+                return f"pair{start}"
+            mid = (start + stop) // 2
+            lo = branch(start, mid, label + "_lo")
+            hi = branch(mid, stop, label + "_hi")
+            branches.append((label, 2 * mid - 0.5, hi, lo))
+            return label
+
+        root = branch(0, count // 4, "magnitude")
+        if bits == 2:
+            sg.node("Identity", [p + root], [p + "magnitude"])
     for label, threshold, hi, lo in branches:
         sg.node(
             "Greater",
@@ -381,7 +666,7 @@ def _select_centroid(
                 scalar(
                     f"tq_pair_threshold_{label}"
                     if bits == 4
-                    else f"tq_pair_threshold_b3_{label}",
+                    else f"tq_pair_threshold_b{bits}_{label}",
                     threshold,
                 ),
             ],
@@ -427,7 +712,10 @@ def decode_subgraph(
         # Cast before reshaping: HTP cannot transpose raw UINT8 tensors.
         sg.node(
             "Reshape",
-            [byte_target, sg.shape([1, heads, num_tokens, d // 2])],
+            [
+                byte_target,
+                sg.shape([1, heads, num_tokens, d * storage_bits(config, spec) // 8]),
+            ],
             [f"{p}byte_f"],
         )
         sg.node(
@@ -436,24 +724,35 @@ def decode_subgraph(
             [f"{p}canonical_norm"],
         )
         norm_in = f"{p}canonical_norm"
-    sg.node("Mul", [f"{p}byte_f", inv16], [f"{p}byte_div16"])
-    sg.node("Floor", [f"{p}byte_div16"], [f"{p}nibble_hi"])
-    sg.node("Mul", [f"{p}nibble_hi", sixteen_f], [f"{p}nibble_hi16"])
-    sg.node("Sub", [f"{p}byte_f", f"{p}nibble_hi16"], [f"{p}nibble_lo"])
-    pair_shape = sg.shape([heads, num_tokens, d // 2, 1])
-    sg.node("Reshape", [f"{p}nibble_hi", pair_shape], [f"{p}nibble_hi_1"])
-    sg.node("Reshape", [f"{p}nibble_lo", pair_shape], [f"{p}nibble_lo_1"])
-    sg.node(
-        "Concat", [f"{p}nibble_hi_1", f"{p}nibble_lo_1"], [f"{p}nibble_pairs"], axis=3
-    )
-    sg.node(
-        "Reshape",
-        [f"{p}nibble_pairs", sg.shape([lead[0], lead[1], num_tokens, d])],
-        [f"{p}index_f"],
-    )
-    centroids = load_codebook(spec.bits, d).astype(np.float32)
+    if storage_bits(config, spec) == 8:
+        sg.node("Identity", [f"{p}byte_f"], [f"{p}index_f"])
+    elif storage_bits(config, spec) == 4:
+        sg.node("Mul", [f"{p}byte_f", inv16], [f"{p}byte_div16"])
+        sg.node("Floor", [f"{p}byte_div16"], [f"{p}nibble_hi"])
+        sg.node("Mul", [f"{p}nibble_hi", sixteen_f], [f"{p}nibble_hi16"])
+        sg.node("Sub", [f"{p}byte_f", f"{p}nibble_hi16"], [f"{p}nibble_lo"])
+        pair_shape = sg.shape([heads, num_tokens, d // 2, 1])
+        sg.node("Reshape", [f"{p}nibble_hi", pair_shape], [f"{p}nibble_hi_1"])
+        sg.node("Reshape", [f"{p}nibble_lo", pair_shape], [f"{p}nibble_lo_1"])
+        sg.node(
+            "Concat",
+            [f"{p}nibble_hi_1", f"{p}nibble_lo_1"],
+            [f"{p}nibble_pairs"],
+            axis=3,
+        )
+        sg.node(
+            "Reshape",
+            [f"{p}nibble_pairs", sg.shape([*lead, num_tokens, d])],
+            [f"{p}index_f"],
+        )
+    else:
+        unpacked = _repack(
+            sg, f"{p}byte_f", 8, spec.bits, heads, num_tokens, d, lead, p + "unpack_"
+        )
+        sg.node("Identity", [unpacked], [f"{p}index_f"])
+    centroids = spec_codebook(spec, d).astype(np.float32)
     index_f = f"{p}index_f"
-    if spec.bits == 3:
+    if config.qjl and spec == config.key:
         eight = sg.const("tq_eight_f", np.array(8, dtype=np.float32))
         sg.node("GreaterOrEqual", [index_f, eight], [f"{p}qjl_positive"])
         sg.node("Sub", [index_f, eight], [f"{p}index_minus8"])
@@ -463,7 +762,11 @@ def decode_subgraph(
             [f"{p}mse_index"],
         )
         index_f = f"{p}mse_index"
-    y_hat = _select_centroid(sg, index_f, centroids, spec.bits, d, p)
+    y_hat = (
+        _quantizer_arithmetic(sg, index_f, p, spec.quantizer, centroid=True)
+        if spec.quantizer != "lloyd_max"
+        else _select_centroid(sg, index_f, centroids, spec.bits, d, p)
+    )
     y_unit = y_hat
     if config.norm_correction and not config.precomputed_norm:
         sg.node("Mul", [y_hat, y_hat], [f"{p}sq"])
@@ -507,7 +810,9 @@ def build_encode_model(
         [helper.make_tensor_value_info("x", TensorProto.FLOAT, [*lead, num_tokens, d])],
         [
             helper.make_tensor_value_info(
-                "packed", TensorProto.UINT8, [*lead, num_tokens, d // 2]
+                "packed",
+                TensorProto.UINT8,
+                [*lead, num_tokens, d * storage_bits(config, spec) // 8],
             ),
             helper.make_tensor_value_info(
                 "norm", TensorProto.FLOAT, [*lead, num_tokens, 1]
@@ -540,7 +845,9 @@ def build_decode_model(
         graph_name,
         [
             helper.make_tensor_value_info(
-                "packed", TensorProto.UINT8, [*lead, num_tokens, d // 2]
+                "packed",
+                TensorProto.UINT8,
+                [*lead, num_tokens, d * storage_bits(config, spec) // 8],
             ),
             helper.make_tensor_value_info(
                 "norm", TensorProto.FLOAT, [*lead, num_tokens, 1]
